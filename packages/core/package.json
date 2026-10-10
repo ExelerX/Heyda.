@@ -1,5 +1,5 @@
 {
-  "name": "@social-app/core",
+  "name": "@fastda/core",
   "version": "0.1.0",
   "private": true,
   "description": "Platform-independent core: privacy levels, ETA, geofences, automations, protocol and transport interface.",

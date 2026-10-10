@@ -1,4 +1,4 @@
-import type { NodeState, RuleTemplate, SlotValues } from '@social-app/core';
+import type { NodeState, RuleTemplate, SlotValues } from '@fastda/core';
 
 export const CATEGORY_TEXT: Record<RuleTemplate['category'], string> = {
   ankunft: 'Ankommen',

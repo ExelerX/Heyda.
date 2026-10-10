@@ -1,4 +1,4 @@
-import { describeRule, type RuleTemplate } from '@social-app/core';
+import { describeRule, type RuleTemplate } from '@fastda/core';
 import { router } from 'expo-router';
 import { useMemo, useState } from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';

@@ -9,7 +9,7 @@ import type { Action, Trigger } from './schema';
  * importing user fills in; a plugin can never point at someone by itself.
  */
 export const Plugin = z.strictObject({
-  format: z.literal('socialapp.plugin'),
+  format: z.literal('fastda.plugin'),
   version: z.literal(1),
   id: z.string().regex(/^[a-z0-9-]+(\.[a-z0-9-]+)+$/).max(120),
   name: z.string().trim().min(1).max(60),

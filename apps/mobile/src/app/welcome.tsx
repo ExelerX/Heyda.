@@ -38,7 +38,9 @@ export default function Welcome() {
       <T variant="title" style={{ marginTop: spacing.xl }}>
         Hallo 👋
       </T>
-      <T variant="muted">Teile mit Familie und Freunden, wann du ankommst. Ohne dass jemand weiß, wo du gerade bist.</T>
+      <T variant="muted">
+        Willkommen bei Fastda. Teile mit Familie und Freunden, wann du ankommst, ohne dass jemand weiß, wo du gerade bist.
+      </T>
 
       <View style={{ gap: spacing.md, marginTop: spacing.lg }}>
         {POINTS.map((p) => (

@@ -1,4 +1,4 @@
-import type { ContactKey } from '@social-app/core';
+import type { ContactKey } from '@fastda/core';
 import * as Notifications from 'expo-notifications';
 import { AppState, Platform } from 'react-native';
 

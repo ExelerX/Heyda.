@@ -1,4 +1,4 @@
-import { describeRule, instantiateTemplate, type SlotDef, type SlotValues } from '@social-app/core';
+import { describeRule, instantiateTemplate, type SlotDef, type SlotValues } from '@fastda/core';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useState } from 'react';
 import { TextInput, View } from 'react-native';

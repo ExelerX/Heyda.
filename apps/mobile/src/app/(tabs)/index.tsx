@@ -1,4 +1,4 @@
-import type { Contact, ContactStatus } from '@social-app/core';
+import type { Contact, ContactStatus } from '@fastda/core';
 import { router } from 'expo-router';
 import { Linking, Platform, View } from 'react-native';
 import { Avatar, Button, Card, Chip, Empty, Pill, Row, Screen, Section, T } from '../../components/ui';

@@ -1,4 +1,4 @@
-import { CAPABILITY_TEXT, importPlugin, type ImportResult } from '@social-app/core';
+import { CAPABILITY_TEXT, importPlugin, type ImportResult } from '@fastda/core';
 import { router } from 'expo-router';
 import { useState } from 'react';
 import { TextInput, View } from 'react-native';

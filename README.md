@@ -1,6 +1,9 @@
-# Social App
+# Fastda
 
-Teile mit Familie und Freunden, **wann** du ankommst, ohne dass jemand weiß, **wo** du gerade bist.
+**Wann du ankommst, nicht wo du bist.**
+
+„Lisa ist fast da.“ Fastda teilt mit Familie und Freunden, **wann** du ankommst, ohne dass jemand weiß, **wo** du
+gerade bist.
 
 - „Lisa kommt in ca. 5 min an“, „Max hat den Supermarkt verlassen, beim Tragen helfen?“
 - Ende-zu-Ende-verschlüsselter Chat
@@ -95,7 +98,7 @@ Ein Plugin ist JSON mit Vorlagen. `{{slot:name}}` sind Lücken, die beim Einrich
 
 ```json
 {
-  "format": "socialapp.plugin",
+  "format": "fastda.plugin",
   "version": 1,
   "id": "beispiel.schule",
   "name": "Schulweg",

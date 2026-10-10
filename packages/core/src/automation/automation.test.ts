@@ -176,7 +176,7 @@ describe('describeRule', () => {
 
 describe('importPlugin', () => {
   const plugin = {
-    format: 'socialapp.plugin',
+    format: 'fastda.plugin',
     version: 1,
     id: 'exeler.einkauf',
     name: 'Einkaufs-Helfer',
