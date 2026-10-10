@@ -70,6 +70,20 @@ export class GeofenceTracker {
     return this.states.get(placeId)?.inside ?? false;
   }
 
+  /**
+   * Records a transition the OS already detected (native region monitoring),
+   * so conditions like "while I'm at home" stay correct. Returns false if nothing changed.
+   */
+  applyTransition(placeId: string, inside: boolean): boolean {
+    const state = this.states.get(placeId);
+    if (!state) return false;
+    const changed = !state.initialized || state.inside !== inside;
+    state.initialized = true;
+    state.inside = inside;
+    state.candidateSince = undefined;
+    return changed;
+  }
+
   update(fix: LocationFix): GeofenceEvent[] {
     const accuracy = fix.accuracyM ?? 0;
     if (!(accuracy <= this.opts.maxAccuracyM)) return [];

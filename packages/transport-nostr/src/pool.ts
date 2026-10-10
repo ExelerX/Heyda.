@@ -17,7 +17,7 @@ export class SimpleRelayPool implements RelayPool {
 
   async publish(relays: string[], event: NostrEvent): Promise<void> {
     if (relays.length === 0) throw new Error('no relays to publish to');
-    await Promise.any(this.pool.publish(relays, event));
+    await firstFulfilled(this.pool.publish(relays, event));
   }
 
   subscribe(relays: string[], filter: Filter, onEvent: (event: NostrEvent) => void): { close(): void } {
@@ -56,4 +56,19 @@ export class MemoryRelayPool implements RelayPool {
   close(): void {
     this.subs.clear();
   }
+}
+
+/** Promise.any without relying on it, since not every React Native runtime ships it. */
+function firstFulfilled<T>(promises: Promise<T>[]): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let failed = 0;
+    const reasons: unknown[] = [];
+    if (promises.length === 0) reject(new Error('no relays'));
+    promises.forEach((p, i) =>
+      p.then(resolve, (reason: unknown) => {
+        reasons[i] = reason;
+        if (++failed === promises.length) reject(new Error(`all relays failed: ${reasons.map(String).join('; ')}`));
+      }),
+    );
+  });
 }

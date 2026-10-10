@@ -128,4 +128,14 @@ describe('SocialNode', () => {
     expect(lisa.activeTrip?.level).toBe('eta');
     expect(max.getStatus(LISA).trip?.destinationName).toBe('Zuhause');
   });
+
+  it('handles arrive/leave reported natively by the OS', async () => {
+    const { lisa, max } = await pairedPair();
+    lisa.setPlaces([{ id: 'home', name: 'Zuhause', center: home, radiusM: 100 }]);
+    lisa.setGrants([{ contactKey: MAX, placeIds: ['home'] }]);
+    await lisa.onPlaceTransition('home', 'arrive');
+    await lisa.onPlaceTransition('home', 'arrive'); // duplicate from the OS is ignored
+    await flush();
+    expect(max.getStatus(LISA).lastPlace).toMatchObject({ kind: 'arrive', placeName: 'Zuhause' });
+  });
 });

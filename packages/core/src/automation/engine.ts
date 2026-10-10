@@ -182,7 +182,7 @@ export class AutomationEngine {
 
   private allowFire(ruleId: string, now: number): boolean {
     const recent = (this.fires.get(ruleId) ?? []).filter((t) => now - t < HOUR);
-    const last = recent.at(-1);
+    const last = recent[recent.length - 1];
     if (last !== undefined && now - last < this.limits.ruleCooldownMs) return false;
     if (recent.length >= this.limits.maxFiresPerRulePerHour) return false;
     recent.push(now);

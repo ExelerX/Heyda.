@@ -127,6 +127,16 @@ export class SocialNode {
 
   // ---- state edits ---------------------------------------------------------------
 
+  /** Changes my display name and tells all contacts. */
+  async setProfileName(name: string): Promise<void> {
+    const clean = name.trim().slice(0, 40);
+    if (!clean) throw new RangeError('name must not be empty');
+    this.update({ self: { ...this.state.self, name: clean } });
+    for (const c of this.state.contacts) {
+      await this.sendTo(c.key, { type: 'hello', name: clean, relays: this.state.self.relays }, TTL.chat);
+    }
+  }
+
   setGhost(ghost: boolean): void {
     this.update({ ghost });
   }
@@ -204,19 +214,27 @@ export class SocialNode {
 
   /** Feed every location fix from the OS here. */
   async onLocationFix(fix: LocationFix): Promise<void> {
-    for (const ev of this.geofence.update(fix)) {
-      const place = this.state.places.find((p) => p.id === ev.placeId);
-      if (!place) continue;
-      for (const to of this.policy.placeEventRecipients(place.id, this.now())) {
-        await this.sendTo(to, { type: 'place.event', kind: ev.type, placeName: place.name }, TTL.place);
-      }
-      await this.runAutomations({ type: ev.type === 'arrive' ? 'me.arrive' : 'me.leave', placeId: place.id, at: ev.at });
-    }
+    for (const ev of this.geofence.update(fix)) await this.handlePlaceEvent(ev.placeId, ev.type, ev.at);
 
     if (this.trip && !this.trip.isEnded) {
       for (const body of this.trip.onFix(fix)) await this.broadcastTrip(body);
       if (this.trip.isEnded) this.emit({ type: 'trip', session: undefined });
     }
+  }
+
+  /** For arrive/leave detected natively by the OS (region monitoring), not from raw fixes. */
+  async onPlaceTransition(placeId: string, type: 'arrive' | 'leave', at: number = this.now()): Promise<void> {
+    if (!this.geofence.applyTransition(placeId, type === 'arrive')) return;
+    await this.handlePlaceEvent(placeId, type, at);
+  }
+
+  private async handlePlaceEvent(placeId: string, type: 'arrive' | 'leave', at: number): Promise<void> {
+    const place = this.state.places.find((p) => p.id === placeId);
+    if (!place) return;
+    for (const to of this.policy.placeEventRecipients(place.id, this.now())) {
+      await this.sendTo(to, { type: 'place.event', kind: type, placeName: place.name }, TTL.place);
+    }
+    await this.runAutomations({ type: type === 'arrive' ? 'me.arrive' : 'me.leave', placeId: place.id, at });
   }
 
   // ---- chat -------------------------------------------------------------------------
