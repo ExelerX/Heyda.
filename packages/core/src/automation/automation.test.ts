@@ -159,6 +159,19 @@ describe('describeRule', () => {
       'Wenn ich „work“ verlasse: Teile deine Ankunftszeit nach „Zuhause“ mit Max.',
     );
   });
+
+  it('shows message variables the way they will read', () => {
+    const n = { contactName: (k: string) => names[k] ?? '?', placeName: (id: string) => (id === 'home' ? 'Zuhause' : id) };
+    expect(describeRule(fromTemplate('core.almost-there', { contact: LISA, minutes: 5 }), n)).toBe(
+      'Wenn Lisa weniger als 5 Minuten entfernt ist: Zeige „Lisa ist gleich da“ an.',
+    );
+    expect(describeRule(fromTemplate('core.arrival-alert', { contact: 'any', place: 'Schule' }), n)).toBe(
+      'Wenn jemand bei „Schule“ ankommt: Zeige „[Person] ist da“ an.',
+    );
+    expect(describeRule(fromTemplate('core.home-safe', { myplace: 'home', contact: MAX }), n)).toBe(
+      'Wenn ich bei „Zuhause“ ankomme: Schicke Max „Bin gut bei Zuhause angekommen ✅“.',
+    );
+  });
 });
 
 describe('importPlugin', () => {

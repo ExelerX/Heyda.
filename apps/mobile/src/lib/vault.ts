@@ -36,23 +36,36 @@ export class EncryptedFileVault implements Vault {
   private key: Promise<Uint8Array> | undefined;
 
   private storageKey(): Promise<Uint8Array> {
-    this.key ??= getOrCreate(STORAGE_KEY_ITEM);
+    this.key ??= getOrCreate(STORAGE_KEY_ITEM).catch((e: unknown) => {
+      this.key = undefined; // retry next time, e.g. once the phone has been unlocked
+      throw e;
+    });
     return this.key;
   }
 
-  private file(name: string): File {
+  private file(name: string, suffix = ''): File {
     if (!/^[a-z0-9-]{1,40}$/.test(name)) throw new Error('invalid vault entry name');
-    return new File(Paths.document, `${name}.bin`);
+    return new File(Paths.document, `${name}${suffix}.bin`);
   }
 
   async load<T>(name: string): Promise<T | undefined> {
-    const file = this.file(name);
-    if (!file.exists) return undefined;
+    // A crash between writing the temp file and renaming it leaves only the temp file.
+    const file = [this.file(name), this.file(name, '.tmp')].find((f) => f.exists);
+    if (!file) return undefined;
     const data = await file.bytes();
-    if (data[0] !== FORMAT_VERSION || data.length < 1 + 24 + 16) throw new Error(`${name}: unknown format`);
-    const nonce = data.subarray(1, 25);
-    const plain = xchacha20poly1305(await this.storageKey(), nonce).decrypt(data.subarray(25));
-    return JSON.parse(bytesToUtf8(plain)) as T;
+    // Outside the try: a keychain that is merely locked must not count as a lost key.
+    const key = await this.storageKey();
+    try {
+      if (data[0] !== FORMAT_VERSION || data.length < 1 + 24 + 16) throw new Error('unknown format');
+      const nonce = data.subarray(1, 25);
+      const plain = xchacha20poly1305(key, nonce).decrypt(data.subarray(25));
+      return JSON.parse(bytesToUtf8(plain)) as T;
+    } catch {
+      // Typically a backup restored onto a new phone: the key never leaves the old device,
+      // so the file can never be read again. Keep it aside instead of crashing at startup.
+      file.moveSync(this.file(name, '.unreadable'), { overwrite: true });
+      return undefined;
+    }
   }
 
   async save(name: string, value: unknown): Promise<void> {
@@ -62,7 +75,10 @@ export class EncryptedFileVault implements Vault {
     out[0] = FORMAT_VERSION;
     out.set(nonce, 1);
     out.set(sealed, 1 + nonce.length);
-    this.file(name).write(out);
+    // Write-then-rename so a crash mid-write never destroys the last good copy.
+    const tmp = this.file(name, '.tmp');
+    tmp.write(out);
+    tmp.moveSync(this.file(name), { overwrite: true });
   }
 
   secretKey(): Promise<Uint8Array> {
@@ -71,8 +87,9 @@ export class EncryptedFileVault implements Vault {
 
   async wipe(names: string[]): Promise<void> {
     for (const n of names) {
-      const f = this.file(n);
-      if (f.exists) f.delete();
+      for (const f of [this.file(n), this.file(n, '.tmp'), this.file(n, '.unreadable')]) {
+        if (f.exists) f.delete();
+      }
     }
     await SecureStore.deleteItemAsync(STORAGE_KEY_ITEM, KEYCHAIN);
     await SecureStore.deleteItemAsync(IDENTITY_ITEM, KEYCHAIN);

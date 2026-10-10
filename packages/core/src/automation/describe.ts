@@ -13,7 +13,7 @@ const WEEKDAYS = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
  */
 export function describeRule(rule: Rule, names: DescribeNames): string {
   const conds = rule.conditions.map((c) => describeCondition(c, names));
-  const actions = rule.actions.map((a) => describeAction(a, names));
+  const actions = rule.actions.map((a) => describeAction(a, names, rule.trigger));
   const when = describeTrigger(rule.trigger, names) + (conds.length ? `, ${conds.join(' und ')}` : '');
   return `${when}: ${capitalize(actions.join(' und '))}.`;
 }
@@ -69,15 +69,26 @@ function describeCondition(c: Condition, n: DescribeNames): string {
   }
 }
 
-function describeAction(a: Action, n: DescribeNames): string {
+/** Shows `{{contact}}` etc. the way they will read when the rule fires. */
+function fillVariables(text: string, t: Trigger, n: DescribeNames): string {
+  return text.replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (_, name: string) => {
+    if (name === 'contact' && 'contact' in t) return t.contact === 'any' ? '[Person]' : n.contactName(t.contact);
+    if (name === 'place' && 'place' in t && t.place) return t.on.startsWith('me.') ? n.placeName(t.place) : t.place;
+    if (name === 'eta') return 'in X min';
+    const label: Record<string, string> = { place: 'Ort', destination: 'Ziel', text: 'Nachricht' };
+    return `[${label[name] ?? '…'}]`;
+  });
+}
+
+function describeAction(a: Action, n: DescribeNames, t: Trigger): string {
   switch (a.do) {
     case 'notify':
-      return `zeige „${a.title}“ an`;
+      return `zeige „${fillVariables(a.title, t, n)}“ an`;
     case 'send_ping': {
       const to = n.contactName(a.to);
       if (a.kind === 'help-carry') return `bitte ${to} um Hilfe beim Tragen`;
       if (a.kind === 'pickup-request') return `bitte ${to}, dich abzuholen`;
-      return `schicke ${to} „${a.text ?? '👋'}“`;
+      return `schicke ${to} „${fillVariables(a.text ?? '👋', t, n)}“`;
     }
     case 'start_trip':
       return `teile deine Ankunftszeit nach „${n.placeName(a.destination)}“ mit ${a.to.map(n.contactName).join(', ')}`;

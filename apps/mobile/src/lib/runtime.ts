@@ -14,11 +14,13 @@ import {
   type SessionLevel,
   type SharingSession,
   BUILTIN_TEMPLATES,
+  safetyNumber,
 } from '@social-app/core';
 import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@social-app/transport-nostr';
 import { getPublicKey } from 'nostr-tools/pure';
 import { Platform } from 'react-native';
-import { startDemoFriends } from './demo';
+import { DEMO_KEYS, startDemoFriends } from './demo';
+import type { Appearance } from './theme';
 import { EncryptedFileVault, MemoryVault, type Vault } from './vault';
 
 export interface ChatMessage {
@@ -34,6 +36,8 @@ export interface Settings {
   /** Demo mode: simulated friends in memory, nothing leaves the phone. */
   demo: boolean;
   onboarded: boolean;
+  /** Dark unless the person picks otherwise. */
+  appearance?: Appearance;
 }
 
 interface Persisted {
@@ -42,6 +46,8 @@ interface Persisted {
   plugins: Plugin[];
   settings: Settings;
   seen: { sync: number; ids: string[] };
+  /** The running trip, so it survives the OS killing and relaunching the app. */
+  trip?: SharingSession;
 }
 
 export interface Snapshot {
@@ -52,10 +58,19 @@ export interface Snapshot {
   activeTrip: SharingSession | undefined;
   templates: RuleTemplate[];
   settings: Settings;
+  isDemo: boolean;
 }
 
 export interface NotifySink {
-  (title: string, body: string): void;
+  (title: string, body: string, from?: ContactKey): void;
+}
+
+type CreatedHook = (runtime: AppRuntime) => void;
+const createdHooks: CreatedHook[] = [];
+
+/** Lets platform glue (location, notifications) attach before anything can happen. */
+export function onRuntimeCreated(hook: CreatedHook): void {
+  createdHooks.push(hook);
 }
 
 const MAX_CHAT_PER_CONTACT = 500;
@@ -94,8 +109,9 @@ export class AppRuntime {
           this.changed(false);
           break;
         case 'trip':
+          this.data.trip = e.session;
           this.onTripChange(e.session);
-          this.changed(false);
+          this.changed();
           break;
         case 'notify':
           this.notify(e.intent.title, e.intent.body);
@@ -105,7 +121,7 @@ export class AppRuntime {
           if (m.type === 'chat.text' || m.type === 'ping') {
             const text = m.type === 'chat.text' ? m.text : (m.text ?? pingLabel(m.kind));
             this.appendChat(e.from, { id: m.id, from: e.from, text, at: Date.now(), kind: m.type === 'ping' ? 'ping' : 'text' });
-            this.notify(this.contactName(e.from), text);
+            this.notify(this.contactName(e.from), text, e.from);
           }
           break;
         }
@@ -130,7 +146,7 @@ export class AppRuntime {
       },
       chats: {},
       plugins: [],
-      settings: { displayName: 'Ich', demo: web, onboarded: false },
+      settings: { displayName: 'Ich', demo: web, onboarded: false, appearance: 'dark' },
       seen: { sync: 0, ids: [] },
     };
     const seen = MemorySeenStore.restore(data.seen);
@@ -152,7 +168,9 @@ export class AppRuntime {
     }
 
     const runtime = new AppRuntime(node, vault, data, seen);
+    for (const hook of createdHooks) hook(runtime);
     await node.start();
+    if (data.trip && !node.resumeTrip(data.trip)) data.trip = undefined;
     if (demoStarter) runtime.stopDemo = demoStarter(node);
     return runtime;
   }
@@ -171,6 +189,7 @@ export class AppRuntime {
       statuses: { ...this.statuses },
       chats: this.data.chats,
       activeTrip: this.node.activeTrip,
+      isDemo: this.data.settings.demo,
       templates: [...BUILTIN_TEMPLATES, ...this.data.plugins.flatMap((p) => p.templates)],
       settings: this.data.settings,
     };
@@ -178,6 +197,19 @@ export class AppRuntime {
   };
 
   // ---- actions ----------------------------------------------------------------------
+
+  get isDemo(): boolean {
+    return this.data.settings.demo;
+  }
+
+  /** Numbers both people compare in person to rule out a swapped QR code. */
+  safetyNumberWith(key: ContactKey): string {
+    return safetyNumber(this.data.state.self.key, key);
+  }
+
+  markVerified(key: ContactKey): void {
+    this.node.markVerified(key);
+  }
 
   contactName(key: ContactKey): string {
     return this.data.state.contacts.find((c) => c.key === key)?.name ?? 'Unbekannt';
@@ -200,6 +232,7 @@ export class AppRuntime {
     destinationName: string;
     destination?: { lat: number; lon: number };
     level: SessionLevel;
+    durationMs?: number;
   }): Promise<SharingSession> {
     return this.node.startTrip(input);
   }
@@ -216,6 +249,11 @@ export class AppRuntime {
     const clean = name.trim().slice(0, 40) || 'Ich';
     this.data.settings = { ...this.data.settings, displayName: clean };
     await this.node.setProfileName(clean);
+  }
+
+  setAppearance(appearance: Appearance): void {
+    this.data.settings = { ...this.data.settings, appearance };
+    this.changed();
   }
 
   finishOnboarding(): void {
@@ -281,15 +319,27 @@ export class AppRuntime {
     this.node.removeContact(key);
   }
 
+  /** Switches between demo and real mode. The caller rebuilds the runtime afterwards. */
   async setDemo(demo: boolean): Promise<void> {
     this.data.settings = { ...this.data.settings, demo };
+    await this.shutdown(false);
+    if (!demo) this.removeDemoData();
     await this.flush();
   }
 
   async wipeEverything(): Promise<void> {
-    this.stopDemo?.();
-    await this.node.stop();
+    await this.shutdown(false);
     await this.vault.wipe([DATA_FILE]);
+  }
+
+  /** Stops everything; with `save`, writes the latest state first. */
+  async shutdown(save = true): Promise<void> {
+    this.stopDemo?.();
+    this.stopDemo = undefined;
+    if (this.node.activeTrip) await this.node.stopTrip();
+    await this.node.stop();
+    if (save) await this.flush();
+    else if (this.saveTimer) clearTimeout(this.saveTimer);
   }
 
   /** Persist now, e.g. when the app goes to the background. */
@@ -300,7 +350,26 @@ export class AppRuntime {
     await this.vault.save(DATA_FILE, this.data);
   }
 
+  /** For background tasks: persist only if something changed, before the OS suspends us. */
+  async flushIfDirty(): Promise<void> {
+    if (this.saveTimer) await this.flush();
+  }
+
   // ---- internals -------------------------------------------------------------------
+
+  private removeDemoData(): void {
+    const isDemo = (k: string) => DEMO_KEYS.includes(k);
+    const mentionsDemo = (r: Rule) => DEMO_KEYS.some((k) => JSON.stringify(r).includes(k));
+    const s = this.data.state;
+    this.data.state = {
+      ...s,
+      contacts: s.contacts.filter((c) => !isDemo(c.key)),
+      grants: s.grants.filter((g) => !isDemo(g.contactKey)),
+      rules: s.rules.filter((r) => !mentionsDemo(r)),
+    };
+    this.data.chats = Object.fromEntries(Object.entries(this.data.chats).filter(([k]) => !isDemo(k)));
+    this.data.trip = undefined;
+  }
 
   private appendChat(contact: ContactKey, message: ChatMessage): void {
     const list = [...(this.data.chats[contact] ?? []), message].slice(-MAX_CHAT_PER_CONTACT);

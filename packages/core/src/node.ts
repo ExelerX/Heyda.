@@ -6,7 +6,7 @@ import { decodeInvite, encodeInvite, InviteBook } from './pairing/invite';
 import { PrivacyPolicy, type PlaceGrant } from './privacy/policy';
 import { composeMessage } from './protocol/compose';
 import type { AppMessage, AppMessageBody, MessageOf } from './protocol/messages';
-import { createSession, type SessionLevel, type SharingSession } from './session/session';
+import { createSession, isSessionActive, type SessionLevel, type SharingSession } from './session/session';
 import { TripSharer, type TripOptions } from './session/trip';
 import type { ContactKey, IncomingMessage, Transport } from './transport/transport';
 
@@ -212,6 +212,19 @@ export class SocialNode {
     this.emit({ type: 'trip', session: undefined });
   }
 
+  /**
+   * Picks up a trip that was running before the app restarted (the OS may kill and
+   * relaunch it in the background). Sends nothing: the recipients already know it.
+   */
+  resumeTrip(session: SharingSession): boolean {
+    if (this.activeTrip || !isSessionActive(session, this.now())) return false;
+    const recipients = session.recipients.filter((k) => this.contact(k));
+    if (!recipients.length) return false;
+    this.trip = new TripSharer({ ...session, recipients }, this.options.tripOptions);
+    this.emit({ type: 'trip', session: this.trip.session });
+    return true;
+  }
+
   /** Feed every location fix from the OS here. */
   async onLocationFix(fix: LocationFix): Promise<void> {
     for (const ev of this.geofence.update(fix)) await this.handlePlaceEvent(ev.placeId, ev.type, ev.at);
@@ -226,6 +239,14 @@ export class SocialNode {
   async onPlaceTransition(placeId: string, type: 'arrive' | 'leave', at: number = this.now()): Promise<void> {
     if (!this.geofence.applyTransition(placeId, type === 'arrive')) return;
     await this.handlePlaceEvent(placeId, type, at);
+  }
+
+  /**
+   * Records where I am without announcing anything. Used right after geofences are
+   * registered, when the OS reports the current state as if it were a transition.
+   */
+  syncPlaceState(placeId: string, inside: boolean): void {
+    this.geofence.applyTransition(placeId, inside);
   }
 
   private async handlePlaceEvent(placeId: string, type: 'arrive' | 'leave', at: number): Promise<void> {

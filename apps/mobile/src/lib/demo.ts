@@ -46,6 +46,10 @@ export function startDemoFriends(network: MemoryNetwork, me: SocialNode): () => 
     if (!known.has(DEMO_LISA)) await me.acceptInvite(lisa.createInvite());
     if (!known.has(DEMO_MAX)) await me.acceptInvite(max.createInvite());
     seedRules(me);
+    if (!me.getState().places.length) {
+      me.setPlaces([{ id: 'demo-home', name: 'Zuhause', center: MY_HOME, radiusM: 100 }]);
+      me.setGrants([{ contactKey: DEMO_LISA, placeIds: ['demo-home'] }]);
+    }
 
     max.setPlaces([{ id: 'store', name: 'Supermarkt', center: STORE, radiusM: 80 }]);
     max.setGrants([{ contactKey: meKey, placeIds: ['store'] }]);

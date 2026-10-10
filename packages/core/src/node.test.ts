@@ -138,4 +138,42 @@ describe('SocialNode', () => {
     await flush();
     expect(max.getStatus(LISA).lastPlace).toMatchObject({ kind: 'arrive', placeName: 'Zuhause' });
   });
+
+  it('resumes a trip after a restart without announcing it again', async () => {
+    const { net, lisa, max, now, tick } = await pairedPair();
+    const session = await lisa.startTrip({ recipients: [MAX], destinationName: 'Bei Max', destination: home, level: 'eta' });
+    await flush();
+    const starts: string[] = [];
+    max.on((e) => e.type === 'message' && starts.push(e.message.type));
+
+    // The OS killed Lisa's app; a fresh node is built from the saved state.
+    await lisa.stop();
+    const relaunched = new SocialNode({ transport: net.createTransport(LISA, now), initialState: lisa.getState(), now });
+    await relaunched.start();
+    expect(relaunched.resumeTrip(session)).toBe(true);
+    expect(relaunched.resumeTrip(session)).toBe(false); // already running
+    tick(60_000);
+    await relaunched.onLocationFix({ ...north(2000), timestamp: now(), accuracyM: 10, speedMps: 8 });
+    await flush();
+    expect(starts).not.toContain('session.start');
+    expect(max.getStatus(LISA).trip?.etaMinutes).toBeDefined();
+
+    // An expired trip is not resumed.
+    tick(3 * 3600_000);
+    const later = new SocialNode({ transport: net.createTransport(LISA, now), initialState: lisa.getState(), now });
+    expect(later.resumeTrip(session)).toBe(false);
+  });
+
+  it('syncs the OS-reported place state silently', async () => {
+    const { lisa, max } = await pairedPair();
+    lisa.setPlaces([{ id: 'home', name: 'Zuhause', center: home, radiusM: 100 }]);
+    lisa.setGrants([{ contactKey: MAX, placeIds: ['home'] }]);
+    lisa.syncPlaceState('home', true); // geofence just registered while at home
+    await lisa.onPlaceTransition('home', 'arrive');
+    await flush();
+    expect(max.getStatus(LISA).lastPlace).toBeUndefined();
+    await lisa.onPlaceTransition('home', 'leave');
+    await flush();
+    expect(max.getStatus(LISA).lastPlace).toMatchObject({ kind: 'leave' });
+  });
 });
