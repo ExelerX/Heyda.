@@ -1,0 +1,23 @@
+{
+  "name": "@social-app/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Platform-independent core: privacy levels, ETA, geofences, automations, protocol and transport interface.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "sideEffects": false,
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3",
+    "vitest": "^5.0.3"
+  }
+}

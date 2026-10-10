@@ -1,0 +1,17 @@
+{
+  "name": "social-app",
+  "private": true,
+  "description": "Privacy-first app to share ETA and arrival events with friends and family, without a server.",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
