@@ -25,7 +25,7 @@ export default function Chats() {
   const now = useTick(60_000);
 
   const rows: ThreadRow[] = [
-    ...state.contacts.map((c) => ({
+    ...state.contacts.map((c): ThreadRow => ({
       thread: c.key,
       name: contactLabel(c),
       last: chats[c.key]?.at(-1),
@@ -35,7 +35,7 @@ export default function Chats() {
     })),
     ...state.groups
       .filter((g) => !g.dissolved)
-      .map((g) => ({ thread: `g:${g.id}`, name: g.name, last: chats[`g:${g.id}`]?.at(-1), group: true, members: g.members.length })),
+      .map((g): ThreadRow => ({ thread: `g:${g.id}`, name: g.name, last: chats[`g:${g.id}`]?.at(-1), group: true, members: g.members.length })),
   ].sort(
     (a, b) =>
       (b.last?.at ?? 0) - (a.last?.at ?? 0) ||
