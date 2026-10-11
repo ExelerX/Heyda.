@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "Fastda",
-    "slug": "fastda",
-    "scheme": "fastda",
+    "name": "Heyda.",
+    "slug": "heyda",
+    "scheme": "heyda",
     "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -10,10 +10,10 @@
     "backgroundColor": "#0F1115",
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "io.github.exelerx.fastda"
+      "bundleIdentifier": "io.github.exelerx.heyda"
     },
     "android": {
-      "package": "io.github.exelerx.fastda",
+      "package": "io.github.exelerx.heyda",
       "adaptiveIcon": {
         "backgroundColor": "#0F1115",
         "foregroundImage": "./assets/android-icon-foreground.png",

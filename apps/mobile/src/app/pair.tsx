@@ -1,4 +1,4 @@
-import { INVITE_TTL_MS, type Contact } from '@fastda/core';
+import { INVITE_TTL_MS, type Contact } from '@heyda/core';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
@@ -89,13 +89,13 @@ function ScanCode({ onAdded }: { onAdded: (c: Contact) => void }) {
   if (web) {
     return (
       <View style={{ gap: spacing.md, marginTop: spacing.md }}>
-        <Hint>Im Browser gibt es keinen Scanner. Füge den Code-Text ein (beginnt mit „fastda:1:“).</Hint>
+        <Hint>Im Browser gibt es keinen Scanner. Füge den Code-Text ein (beginnt mit „heyda:1:“).</Hint>
         <TextInput
           value={pasted}
           onChangeText={setPasted}
           autoCapitalize="none"
           autoCorrect={false}
-          placeholder="fastda:1:…"
+          placeholder="heyda:1:…"
           placeholderTextColor={t.textMuted}
           accessibilityLabel="Einladungs-Code"
           style={{ backgroundColor: t.surface, borderColor: t.border, borderWidth: 1, borderRadius: radius.md, color: t.text, padding: spacing.md }}

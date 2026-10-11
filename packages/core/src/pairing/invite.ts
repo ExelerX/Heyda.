@@ -9,7 +9,7 @@ import { randomId } from '../util/random';
  * There is no search, no phone-number lookup and no public profile, so nobody can
  * be found or tracked without having met them.
  */
-export const INVITE_PREFIX = 'fastda:1:';
+export const INVITE_PREFIX = 'heyda:1:';
 export const INVITE_TTL_MS = 10 * 60 * 1000;
 
 const Invite = z.strictObject({
@@ -49,7 +49,7 @@ export type DecodeInviteResult = { ok: true; invite: PairingInvite } | { ok: fal
 export function decodeInvite(text: string, now: number = Date.now()): DecodeInviteResult {
   const trimmed = text.trim();
   if (!trimmed.startsWith(INVITE_PREFIX) || trimmed.length > 2000) {
-    return { ok: false, error: 'not a Fastda invite' };
+    return { ok: false, error: 'not a Heyda invite' };
   }
   let json: unknown;
   try {
@@ -93,7 +93,7 @@ export class InviteBook {
  */
 export function safetyNumber(a: ContactKey, b: ContactKey): string {
   const [x, y] = [a, b].sort();
-  const digest = sha256(new TextEncoder().encode(`fastda-safety-v1:${x}:${y}`));
+  const digest = sha256(new TextEncoder().encode(`heyda-safety-v1:${x}:${y}`));
   const groups: string[] = [];
   for (let i = 0; i < 6; i++) {
     const n = ((digest[i * 4]! << 24) | (digest[i * 4 + 1]! << 16) | (digest[i * 4 + 2]! << 8) | digest[i * 4 + 3]!) >>> 0;

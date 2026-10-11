@@ -1,4 +1,4 @@
-import type { SessionLevel } from '@fastda/core';
+import type { SessionLevel } from '@heyda/core';
 import { router } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, TextInput, View } from 'react-native';

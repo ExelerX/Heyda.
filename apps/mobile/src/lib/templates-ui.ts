@@ -1,4 +1,4 @@
-import type { NodeState, RuleTemplate, SlotValues } from '@fastda/core';
+import type { NodeState, RuleTemplate, SlotValues } from '@heyda/core';
 
 export const CATEGORY_TEXT: Record<RuleTemplate['category'], string> = {
   ankunft: 'Ankommen',

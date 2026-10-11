@@ -5,8 +5,8 @@
   "dependencies": {
     "@expo/metro-runtime": "~57.0.16",
     "@noble/ciphers": "^2.1.1",
-    "@fastda/core": "0.1.0",
-    "@fastda/transport-nostr": "0.1.0",
+    "@heyda/core": "0.1.0",
+    "@heyda/transport-nostr": "0.1.0",
     "expo": "~57.0.27",
     "expo-camera": "~57.0.6",
     "expo-constants": "~57.0.21",

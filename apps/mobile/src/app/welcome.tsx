@@ -39,7 +39,7 @@ export default function Welcome() {
         Hallo 👋
       </T>
       <T variant="muted">
-        Willkommen bei Fastda. Teile mit Familie und Freunden, wann du ankommst, ohne dass jemand weiß, wo du gerade bist.
+        Willkommen bei Heyda. Teile mit Familie und Freunden, wann du ankommst, ohne dass jemand weiß, wo du gerade bist.
       </T>
 
       <View style={{ gap: spacing.md, marginTop: spacing.lg }}>

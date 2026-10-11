@@ -1,5 +1,5 @@
 {
-  "name": "@fastda/transport-nostr",
+  "name": "@heyda/transport-nostr",
   "version": "0.1.0",
   "private": true,
   "description": "Serverless transport over public Nostr relays with NIP-44 encryption and NIP-59 gift wraps.",
@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@fastda/core": "0.1.0",
+    "@heyda/core": "0.1.0",
     "nostr-tools": "2.25.2"
   },
   "devDependencies": {

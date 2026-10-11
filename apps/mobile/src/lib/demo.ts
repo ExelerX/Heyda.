@@ -4,7 +4,7 @@ import {
   SocialNode,
   type MemoryNetwork,
   type NodeState,
-} from '@fastda/core';
+} from '@heyda/core';
 
 /** Fixed keys so demo friends can be recognised and removed when leaving demo mode. */
 export const DEMO_LISA = 'a1'.repeat(32);

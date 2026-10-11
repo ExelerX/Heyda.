@@ -1,4 +1,4 @@
-import { CAPABILITY_TEXT, importPlugin, type ImportResult } from '@fastda/core';
+import { CAPABILITY_TEXT, importPlugin, type ImportResult } from '@heyda/core';
 import { router } from 'expo-router';
 import { useState } from 'react';
 import { TextInput, View } from 'react-native';

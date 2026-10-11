@@ -1,4 +1,4 @@
-import { randomId } from '@fastda/core';
+import { randomId } from '@heyda/core';
 import { useState } from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';
 import { Button, Card, Chip, Empty, Hint, Row, Screen, Section, T, Wrap } from '../components/ui';

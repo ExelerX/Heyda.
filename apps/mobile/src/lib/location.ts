@@ -1,4 +1,4 @@
-import type { LocationFix, Place } from '@fastda/core';
+import type { LocationFix, Place } from '@heyda/core';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import { Platform } from 'react-native';
@@ -9,8 +9,8 @@ import { getRuntime } from './runtime';
  * goes into `node.onLocationFix`; what leaves the phone is decided by the core's
  * privacy gate, never here.
  */
-export const GEOFENCE_TASK = 'fastda-geofence';
-export const TRIP_TASK = 'fastda-trip';
+export const GEOFENCE_TASK = 'heyda-geofence';
+export const TRIP_TASK = 'heyda-trip';
 
 /** iOS monitors at most 20 regions per app. */
 export const MAX_REGIONS = 20;

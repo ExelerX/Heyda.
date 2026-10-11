@@ -76,7 +76,7 @@ describe('pairing invites', () => {
 
   it('rejects junk', () => {
     expect(decodeInvite('https://evil.example').ok).toBe(false);
-    expect(decodeInvite('fastda:1:!!!').ok).toBe(false);
+    expect(decodeInvite('heyda:1:!!!').ok).toBe(false);
   });
 
   it('gives both sides the same safety number', () => {

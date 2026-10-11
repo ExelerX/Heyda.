@@ -15,8 +15,8 @@ import {
   type SharingSession,
   BUILTIN_TEMPLATES,
   safetyNumber,
-} from '@fastda/core';
-import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@fastda/transport-nostr';
+} from '@heyda/core';
+import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@heyda/transport-nostr';
 import { getPublicKey } from 'nostr-tools/pure';
 import { Platform } from 'react-native';
 import { DEMO_KEYS, startDemoFriends } from './demo';

@@ -1,4 +1,4 @@
-import { composeMessage, SocialNode, type IncomingMessage, type NodeState } from '@fastda/core';
+import { composeMessage, SocialNode, type IncomingMessage, type NodeState } from '@heyda/core';
 import { createRumor, createSeal, createWrap } from 'nostr-tools/nip59';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { describe, expect, it } from 'vitest';

@@ -1,4 +1,4 @@
-import { describeRule, type RuleTemplate } from '@fastda/core';
+import { describeRule, type RuleTemplate } from '@heyda/core';
 import { router } from 'expo-router';
 import { useMemo, useState } from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';

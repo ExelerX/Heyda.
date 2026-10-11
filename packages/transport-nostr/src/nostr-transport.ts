@@ -6,7 +6,7 @@ import {
   type IncomingMessage,
   type SendOptions,
   type Transport,
-} from '@fastda/core';
+} from '@heyda/core';
 import { getConversationKey, encrypt as nip44Encrypt } from 'nostr-tools/nip44';
 import { createRumor, createSeal, unwrapEvent } from 'nostr-tools/nip59';
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent, type NostrEvent } from 'nostr-tools/pure';

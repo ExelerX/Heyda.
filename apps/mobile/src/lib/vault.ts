@@ -20,8 +20,8 @@ export interface Vault {
 }
 
 const KEYCHAIN = { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY };
-const STORAGE_KEY_ITEM = 'fastda.storage-key.v1';
-const IDENTITY_ITEM = 'fastda.identity.v1';
+const STORAGE_KEY_ITEM = 'heyda.storage-key.v1';
+const IDENTITY_ITEM = 'heyda.identity.v1';
 const FORMAT_VERSION = 1;
 
 async function getOrCreate(item: string): Promise<Uint8Array> {
