@@ -16,6 +16,8 @@ export interface SendOptions {
    * A hint only: a relay can ignore it, so nothing secret may depend on deletion.
    */
   ttlSeconds?: number;
+  /** Publish to these relays instead of the recipient's known ones (e.g. a device being linked). */
+  relays?: string[];
 }
 
 /**

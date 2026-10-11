@@ -1,0 +1,73 @@
+{
+  "name": "desktop",
+  "productName": "Heyda",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Heyda. for Windows: Electron shell around the shared app UI.",
+  "license": "Apache-2.0",
+  "author": "Heyda contributors",
+  "main": "build/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "prepare-web": "node scripts/prepare-web.mjs",
+    "dist:win": "electron-builder --win nsis --publish never",
+    "dist:dir": "electron-builder --dir --publish never",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.7.0",
+    "electron-builder": "26.15.3",
+    "typescript": "~6.0.3"
+  },
+  "build": {
+    "appId": "io.github.exelerx.heyda",
+    "productName": "Heyda",
+    "executableName": "Heyda",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build-resources"
+    },
+    "files": [
+      "build/**/*",
+      "web/**/*",
+      "assets/**/*"
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "publish": null,
+    "icon": "assets/icon.png",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "selectPerMachineByDefault": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Heyda",
+      "artifactName": "Heyda-Setup-${version}.exe",
+      "deleteAppDataOnUninstall": false
+    },
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "onlyLoadAppFromAsar": true,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "enableCookieEncryption": true,
+      "grantFileProtocolExtraPrivileges": false
+    }
+  }
+}

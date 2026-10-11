@@ -1,4 +1,4 @@
-import { composeMessage, SocialNode, type IncomingMessage, type NodeState } from '@heyda/core';
+import { composeMessage, createInitialState, SocialNode, type IncomingMessage, type NodeState } from '@heyda/core';
 import { createRumor, createSeal, createWrap } from 'nostr-tools/nip59';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { describe, expect, it } from 'vitest';
@@ -121,14 +121,8 @@ describe('NostrTransport', () => {
 
   it('runs two full app nodes over it', async () => {
     const { alice, bob } = setup();
-    const state = (key: string, name: string, relay: string): NodeState => ({
-      self: { key, name, relays: [relay] },
-      contacts: [],
-      places: [],
-      grants: [],
-      rules: [],
-      ghost: false,
-    });
+    const state = (key: string, name: string, relay: string): NodeState =>
+      createInitialState({ key, name, relays: [relay], deviceId: `device-${name}`, deviceName: name });
     const a = new SocialNode({ transport: alice, initialState: state(alice.selfKey, 'Alice', RELAY_A) });
     const b = new SocialNode({ transport: bob, initialState: state(bob.selfKey, 'Bob', RELAY_B) });
     await a.start();
@@ -136,5 +130,22 @@ describe('NostrTransport', () => {
     await a.acceptInvite(b.createInvite());
     await new Promise((r) => setTimeout(r, 0));
     expect(b.getState().contacts.map((c) => c.name)).toEqual(['Alice']);
+  });
+
+  it('reaches every device of one account, and can publish to explicit relays', async () => {
+    const pool = new MemoryRelayPool();
+    const key = generateSecretKey();
+    const phone = new NostrTransport({ secretKey: key, ownRelays: [RELAY_A], relaysFor: () => [RELAY_A], pool });
+    const desktop = new NostrTransport({ secretKey: key, ownRelays: [RELAY_A], relaysFor: () => [RELAY_A], pool });
+    const got: string[] = [];
+    desktop.onMessage((m) => got.push(m.message.id));
+    await phone.start();
+    await desktop.start();
+    const note = composeMessage({ type: 'link.done', deviceId: 'device-phone', deviceName: 'Handy' });
+    await phone.send(phone.selfKey, note);
+    expect(got).toEqual([note.id]);
+
+    await phone.send(getPublicKey(generateSecretKey()), composeMessage({ type: 'chat.text', text: 'x' }), { relays: [RELAY_B] });
+    expect(pool.events.at(-1)?.relays).toEqual([RELAY_B]);
   });
 });

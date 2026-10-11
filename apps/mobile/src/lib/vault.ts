@@ -2,6 +2,7 @@ import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { bytesToHex, bytesToUtf8, hexToBytes, randomBytes, utf8ToBytes } from '@noble/ciphers/utils.js';
 import { File, Paths } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
+import { b64ToBytes, bytesToB64, type HeydaDesktopBridge } from './platform';
 
 /**
  * Local storage for everything the app knows (contacts, places, rules, chats).
@@ -13,8 +14,10 @@ import * as SecureStore from 'expo-secure-store';
 export interface Vault {
   load<T>(name: string): Promise<T | undefined>;
   save(name: string, value: unknown): Promise<void>;
-  /** The device's transport identity, created on first use. */
+  /** The account's identity key, created on first use. */
   secretKey(): Promise<Uint8Array>;
+  /** Replaces the identity key (linking this device to an account, or restoring a backup). */
+  setSecretKey(key: Uint8Array): Promise<void>;
   /** Deletes all local data and keys. */
   wipe(names: string[]): Promise<void>;
 }
@@ -56,10 +59,7 @@ export class EncryptedFileVault implements Vault {
     // Outside the try: a keychain that is merely locked must not count as a lost key.
     const key = await this.storageKey();
     try {
-      if (data[0] !== FORMAT_VERSION || data.length < 1 + 24 + 16) throw new Error('unknown format');
-      const nonce = data.subarray(1, 25);
-      const plain = xchacha20poly1305(key, nonce).decrypt(data.subarray(25));
-      return JSON.parse(bytesToUtf8(plain)) as T;
+      return open<T>(key, data);
     } catch {
       // Typically a backup restored onto a new phone: the key never leaves the old device,
       // so the file can never be read again. Keep it aside instead of crashing at startup.
@@ -69,12 +69,7 @@ export class EncryptedFileVault implements Vault {
   }
 
   async save(name: string, value: unknown): Promise<void> {
-    const nonce = randomBytes(24);
-    const sealed = xchacha20poly1305(await this.storageKey(), nonce).encrypt(utf8ToBytes(JSON.stringify(value)));
-    const out = new Uint8Array(1 + nonce.length + sealed.length);
-    out[0] = FORMAT_VERSION;
-    out.set(nonce, 1);
-    out.set(sealed, 1 + nonce.length);
+    const out = seal(await this.storageKey(), value);
     // Write-then-rename so a crash mid-write never destroys the last good copy.
     const tmp = this.file(name, '.tmp');
     tmp.write(out);
@@ -83,6 +78,11 @@ export class EncryptedFileVault implements Vault {
 
   secretKey(): Promise<Uint8Array> {
     return getOrCreate(IDENTITY_ITEM);
+  }
+
+  async setSecretKey(key: Uint8Array): Promise<void> {
+    if (key.length !== 32) throw new Error('invalid key');
+    await SecureStore.setItemAsync(IDENTITY_ITEM, bytesToHex(key), KEYCHAIN);
   }
 
   async wipe(names: string[]): Promise<void> {
@@ -97,10 +97,83 @@ export class EncryptedFileVault implements Vault {
   }
 }
 
-/** For the web preview and demo mode: nothing is written anywhere. */
+function seal(key: Uint8Array, value: unknown): Uint8Array {
+  const nonce = randomBytes(24);
+  const sealed = xchacha20poly1305(key, nonce).encrypt(utf8ToBytes(JSON.stringify(value)));
+  const out = new Uint8Array(1 + nonce.length + sealed.length);
+  out[0] = FORMAT_VERSION;
+  out.set(nonce, 1);
+  out.set(sealed, 1 + nonce.length);
+  return out;
+}
+
+function open<T>(key: Uint8Array, data: Uint8Array): T {
+  if (data[0] !== FORMAT_VERSION || data.length < 1 + 24 + 16) throw new Error('unknown format');
+  const plain = xchacha20poly1305(key, data.subarray(1, 25)).decrypt(data.subarray(25));
+  return JSON.parse(bytesToUtf8(plain)) as T;
+}
+
+/**
+ * Windows app: same encryption as on the phone. The data key and the identity are kept by
+ * the OS (Electron safeStorage, DPAPI on Windows); the encrypted files by the app's main process.
+ */
+export class DesktopVault implements Vault {
+  private key: Promise<Uint8Array> | undefined;
+
+  constructor(private readonly bridge: HeydaDesktopBridge) {}
+
+  private async getOrCreate(item: string): Promise<Uint8Array> {
+    const existing = await this.bridge.secretGet(item);
+    if (existing && /^[0-9a-f]{64}$/.test(existing)) return hexToBytes(existing);
+    const fresh = randomBytes(32);
+    await this.bridge.secretSet(item, bytesToHex(fresh));
+    return fresh;
+  }
+
+  private storageKey(): Promise<Uint8Array> {
+    this.key ??= this.getOrCreate(STORAGE_KEY_ITEM).catch((e: unknown) => {
+      this.key = undefined;
+      throw e;
+    });
+    return this.key;
+  }
+
+  async load<T>(name: string): Promise<T | undefined> {
+    const b64 = await this.bridge.vaultRead(name);
+    if (!b64) return undefined;
+    const key = await this.storageKey();
+    try {
+      return open<T>(key, b64ToBytes(b64));
+    } catch {
+      return undefined;
+    }
+  }
+
+  async save(name: string, value: unknown): Promise<void> {
+    await this.bridge.vaultWrite(name, bytesToB64(seal(await this.storageKey(), value)));
+  }
+
+  secretKey(): Promise<Uint8Array> {
+    return this.getOrCreate(IDENTITY_ITEM);
+  }
+
+  async setSecretKey(key: Uint8Array): Promise<void> {
+    if (key.length !== 32) throw new Error('invalid key');
+    await this.bridge.secretSet(IDENTITY_ITEM, bytesToHex(key));
+  }
+
+  async wipe(names: string[]): Promise<void> {
+    for (const n of names) await this.bridge.vaultDelete(n);
+    await this.bridge.secretDelete(STORAGE_KEY_ITEM);
+    await this.bridge.secretDelete(IDENTITY_ITEM);
+    this.key = undefined;
+  }
+}
+
+/** For the browser preview and demo mode: nothing is written anywhere. */
 export class MemoryVault implements Vault {
   private readonly data = new Map<string, string>();
-  private readonly key = randomBytes(32);
+  private key = randomBytes(32);
 
   async load<T>(name: string): Promise<T | undefined> {
     const raw = this.data.get(name);
@@ -113,6 +186,10 @@ export class MemoryVault implements Vault {
 
   async secretKey(): Promise<Uint8Array> {
     return this.key;
+  }
+
+  async setSecretKey(key: Uint8Array): Promise<void> {
+    this.key = key;
   }
 
   async wipe(): Promise<void> {

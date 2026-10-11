@@ -22,7 +22,7 @@ export interface SharingSession {
 }
 
 export const DEFAULT_SESSION_MS = 2 * 60 * 60 * 1000;
-export const MAX_SESSION_MS = 12 * 60 * 60 * 1000;
+export const MAX_SESSION_MS = 24 * 60 * 60 * 1000;
 export const MAX_SESSION_RECIPIENTS = 20;
 
 export interface CreateSessionInput {

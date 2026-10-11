@@ -1,0 +1,29 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!-- Foreground service of type remoteMessaging (type permission required since Android 14). -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+  <!-- Restart after reboot, only if the user enabled it (setStartOnBoot). -->
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+  <!-- The service's ongoing notification (runtime permission on Android 13+). -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <!-- HeadlessJsTaskService holds a partial wake lock while the JS task runs, so timers keep firing. -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+  <application>
+    <service
+      android:name="expo.modules.heydabackground.KeepAliveService"
+      android:exported="false"
+      android:foregroundServiceType="remoteMessaging" />
+
+    <!-- Not exported: only the system can deliver these broadcasts. -->
+    <receiver
+      android:name="expo.modules.heydabackground.KeepAliveBootReceiver"
+      android:exported="false">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+        <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>

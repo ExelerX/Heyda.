@@ -28,6 +28,7 @@ export class TripSharer {
   private lastEta: number | undefined;
   private lastPointAt = -Infinity;
   private ended = false;
+  private reason: 'arrived' | 'stopped' | 'expired' | undefined;
 
   constructor(
     readonly session: SharingSession,
@@ -46,6 +47,21 @@ export class TripSharer {
 
   get isEnded(): boolean {
     return this.ended;
+  }
+
+  get endReason(): 'arrived' | 'stopped' | 'expired' | undefined {
+    return this.reason;
+  }
+
+  /** The last rounded ETA that was sent, if any. */
+  get lastEtaMinutes(): number | undefined {
+    return this.lastEta;
+  }
+
+  /** Ends the trip because its time ran out (checked by the app's timer, not only on fixes). */
+  expire(now: number): AppMessageBody[] {
+    if (this.ended || isSessionActive(this.session, now)) return [];
+    return [this.end('expired')];
   }
 
   startMessage(): AppMessageBody {
@@ -108,6 +124,7 @@ export class TripSharer {
 
   private end(reason: 'arrived' | 'stopped' | 'expired'): AppMessageBody {
     this.ended = true;
+    this.reason = reason;
     return { type: 'session.end', sessionId: this.session.id, reason };
   }
 }

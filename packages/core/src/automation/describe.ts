@@ -1,4 +1,30 @@
+import { CHECKIN_LABELS, PING_LABELS } from '../features/labels';
+import type { CheckinKind, PingKind } from '../protocol/messages';
 import type { Action, Condition, Rule, Trigger } from './schema';
+
+export const PING_TRIGGER_TEXT: Record<PingKind, string> = {
+  'help-carry': 'um Hilfe beim Tragen bittet',
+  'pickup-request': 'abgeholt werden möchte',
+  'call-me': 'um einen Anruf bittet',
+  'dinner-ready': '„Essen ist fertig“ schickt',
+  'running-late': 'sich verspätet',
+  'on-my-way': '„bin unterwegs“ schickt',
+  'thinking-of-you': 'ein Herz schickt',
+  custom: 'dich anstupst',
+};
+
+const PING_ACTION_TEXT: Record<PingKind, string> = Object.fromEntries(
+  Object.entries(PING_LABELS).map(([k, v]) => [k, `${v.text} ${v.emoji}`]),
+) as Record<PingKind, string>;
+
+export const CHECKIN_TEXT: Record<CheckinKind, string> = Object.fromEntries(
+  Object.entries(CHECKIN_LABELS).map(([k, v]) => [k, v.text]),
+) as Record<CheckinKind, string>;
+
+export function durationText(minutes: number): string {
+  if (minutes % 60 === 0) return minutes === 60 ? '1 Stunde' : `${minutes / 60} Stunden`;
+  return `${minutes} Minuten`;
+}
 
 export interface DescribeNames {
   contactName: (key: string) => string;
@@ -40,15 +66,14 @@ function describeTrigger(t: Trigger, n: DescribeNames): string {
         : `Wenn ${who(t.contact, n)} das Teilen beendet`;
     case 'contact.message':
       return `Wenn ${who(t.contact, n)} schreibt${t.contains ? ` und „${t.contains}“ darin vorkommt` : ''}`;
-    case 'contact.ping': {
-      const what =
-        t.kind === 'help-carry'
-          ? 'um Hilfe beim Tragen bittet'
-          : t.kind === 'pickup-request'
-            ? 'abgeholt werden möchte'
-            : 'dich anstupst';
-      return `Wenn ${who(t.contact, n)} ${what}`;
-    }
+    case 'contact.ping':
+      return `Wenn ${who(t.contact, n)} ${PING_TRIGGER_TEXT[t.kind ?? 'custom']}`;
+    case 'contact.checkin':
+      return t.kind
+        ? `Wenn ${who(t.contact, n)} „${CHECKIN_TEXT[t.kind]}“ meldet`
+        : `Wenn ${who(t.contact, n)} sich meldet`;
+    case 'contact.sos':
+      return `Wenn ${who(t.contact, n)} einen Notruf sendet`;
     case 'me.arrive':
       return `Wenn ich bei „${n.placeName(t.place)}“ ankomme`;
     case 'me.leave':
@@ -86,10 +111,17 @@ function describeAction(a: Action, n: DescribeNames, t: Trigger): string {
       return `zeige „${fillVariables(a.title, t, n)}“ an`;
     case 'send_ping': {
       const to = n.contactName(a.to);
-      if (a.kind === 'help-carry') return `bitte ${to} um Hilfe beim Tragen`;
-      if (a.kind === 'pickup-request') return `bitte ${to}, dich abzuholen`;
-      return `schicke ${to} „${fillVariables(a.text ?? '👋', t, n)}“`;
+      if (a.kind === 'custom') return `schicke ${to} „${fillVariables(a.text ?? '👋', t, n)}“`;
+      return `schicke ${to} „${PING_ACTION_TEXT[a.kind]}“`;
     }
+    case 'send_message':
+      return `schreibe ${n.contactName(a.to)} „${fillVariables(a.text, t, n)}“`;
+    case 'send_checkin':
+      return `melde ${a.to.map(n.contactName).join(', ')} „${a.text ? fillVariables(a.text, t, n) : CHECKIN_TEXT[a.kind]}“`;
+    case 'set_dnd':
+      return a.minutes === 0 ? 'schalte den Ruhemodus aus' : `schalte den Ruhemodus für ${durationText(a.minutes)} an`;
+    case 'set_status':
+      return `setze deinen Status auf „${[a.emoji, a.text].filter(Boolean).join(' ')}“`;
     case 'start_trip':
       return `teile deine Ankunftszeit nach „${n.placeName(a.destination)}“ mit ${a.to.map(n.contactName).join(', ')}`;
   }

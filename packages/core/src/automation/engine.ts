@@ -1,3 +1,4 @@
+import type { CheckinKind, PingKind } from '../protocol/messages';
 import type { ContactKey } from '../transport/transport';
 import type { Action, Condition, Rule, Trigger } from './schema';
 
@@ -25,26 +26,20 @@ export type AutomationEvent =
       at: number;
     }
   | { type: 'contact.message'; contact: ContactKey; text: string; at: number }
-  | {
-      type: 'contact.ping';
-      contact: ContactKey;
-      kind: 'help-carry' | 'pickup-request' | 'custom';
-      text?: string;
-      at: number;
-    }
+  | { type: 'contact.ping'; contact: ContactKey; kind: PingKind; text?: string; at: number }
+  | { type: 'contact.checkin'; contact: ContactKey; kind: CheckinKind; text?: string; placeName?: string; at: number }
+  | { type: 'contact.sos'; contact: ContactKey; at: number }
   | { type: 'me.arrive'; placeId: string; at: number }
   | { type: 'me.leave'; placeId: string; at: number };
 
 /** A resolved action for the app to carry out. The engine itself has no side effects. */
 export type ActionIntent =
   | { kind: 'notify'; ruleId: string; title: string; body: string }
-  | {
-      kind: 'send_ping';
-      ruleId: string;
-      to: ContactKey;
-      pingKind: 'help-carry' | 'pickup-request' | 'custom';
-      text?: string;
-    }
+  | { kind: 'send_ping'; ruleId: string; to: ContactKey; pingKind: PingKind; text?: string }
+  | { kind: 'send_message'; ruleId: string; to: ContactKey; text: string }
+  | { kind: 'send_checkin'; ruleId: string; to: ContactKey[]; checkinKind: CheckinKind; text?: string }
+  | { kind: 'set_dnd'; ruleId: string; minutes: number }
+  | { kind: 'set_status'; ruleId: string; text: string; emoji?: string; hours: number }
   | { kind: 'start_trip'; ruleId: string; to: ContactKey[]; destination: string; level: 'eta' };
 
 export interface LocalTime {
@@ -156,6 +151,14 @@ export class AutomationEngine {
           contactOk(t.contact, event.contact) &&
           (t.kind === undefined || t.kind === event.kind)
         );
+      case 'contact.checkin':
+        return (
+          event.type === 'contact.checkin' &&
+          contactOk(t.contact, event.contact) &&
+          (t.kind === undefined || t.kind === event.kind)
+        );
+      case 'contact.sos':
+        return event.type === 'contact.sos' && contactOk(t.contact, event.contact);
       case 'me.arrive':
         return event.type === 'me.arrive' && event.placeId === t.place;
       case 'me.leave':
@@ -219,13 +222,37 @@ export class AutomationEngine {
         };
       case 'start_trip':
         return { kind: 'start_trip', ruleId: rule.id, to: action.to, destination: action.destination, level: 'eta' };
+      case 'send_message':
+        if (!this.allowPing(action.to, event.at)) return undefined;
+        return { kind: 'send_message', ruleId: rule.id, to: action.to, text: render(action.text, vars, 280) };
+      case 'send_checkin': {
+        const to = action.to.filter((k) => this.allowPing(k, event.at));
+        if (!to.length) return undefined;
+        return {
+          kind: 'send_checkin',
+          ruleId: rule.id,
+          to,
+          checkinKind: action.kind,
+          text: action.text === undefined ? undefined : render(action.text, vars, 140),
+        };
+      }
+      case 'set_dnd':
+        return { kind: 'set_dnd', ruleId: rule.id, minutes: action.minutes };
+      case 'set_status':
+        return {
+          kind: 'set_status',
+          ruleId: rule.id,
+          text: render(action.text, vars, 80),
+          emoji: action.emoji,
+          hours: action.hours,
+        };
     }
   }
 
   private variables(event: AutomationEvent): Record<string, string> {
     const vars: Record<string, string> = {};
     if ('contact' in event) vars.contact = this.ctx.contactName(event.contact);
-    if ('placeName' in event) vars.place = event.placeName;
+    if ('placeName' in event && event.placeName !== undefined) vars.place = event.placeName;
     if ('placeId' in event) vars.place = this.ctx.placeName(event.placeId) ?? '';
     if ('destinationName' in event) vars.destination = event.destinationName;
     if (event.type === 'contact.eta') vars.eta = event.etaMinutes === 0 ? 'gleich' : `in ca. ${event.etaMinutes} min`;

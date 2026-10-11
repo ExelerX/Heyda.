@@ -126,9 +126,9 @@ describe('PrivacyPolicy', () => {
 });
 
 describe('createSession', () => {
-  it('caps precise sharing at two hours', () => {
-    const s = createSession({ recipients: [A], destinationName: 'X', level: 'precise', durationMs: 10 * 3600_000, now: 0 });
-    expect(s.expiresAt).toBe(2 * 3600_000);
+  it('caps precise sharing at a day', () => {
+    const s = createSession({ recipients: [A], destinationName: 'X', level: 'precise', durationMs: 30 * 3600_000, now: 0 });
+    expect(s.expiresAt).toBe(24 * 3600_000);
   });
 
   it('needs a recipient', () => {

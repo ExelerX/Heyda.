@@ -1,0 +1,245 @@
+# Builds and tests every part of Heyda. Called by ci.yml (pull requests, main) and release.yml (tags).
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      ios:
+        description: Also build the iPhone app (macOS runner, expensive)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  EXPO_NO_TELEMETRY: '1'
+  # Electron is only needed on Windows; skip its download elsewhere.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  test:
+    name: Typecheck, tests, web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Web export
+        run: npm run export:web -w mobile
+      - name: Web smoke test (demo mode in Chromium)
+        run: |
+          npx playwright install --with-deps chromium
+          npm run smoke:web -w mobile -- --out web-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-smoke
+          path: apps/mobile/web-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+      - name: Version
+        id: version
+        run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
+      - name: Signing key (only if the repository has one)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.HEYDA_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.HEYDA_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.HEYDA_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.HEYDA_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::notice::No signing key configured: the APK is signed with the public test key."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/heyda-release.keystore"
+          {
+            echo "HEYDA_ANDROID_KEYSTORE=$RUNNER_TEMP/heyda-release.keystore"
+            echo "HEYDA_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "HEYDA_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "HEYDA_ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+      - name: Generate the native project
+        working-directory: apps/mobile
+        env:
+          HEYDA_VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          npx expo prebuild --platform android --no-install
+          # More memory for Gradle; ABIs: phones (arm) plus x86_64 for the emulator test.
+          sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g/' android/gradle.properties
+          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86_64/' android/gradle.properties
+      - name: Build
+        working-directory: apps/mobile/android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk "out/Heyda-${{ steps.version.outputs.version }}-android.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+  android-smoke:
+    name: Android emulator test
+    needs: android
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Start the app on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash scripts/android-smoke.sh apk android-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-smoke
+          path: android-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: ''
+      # No code signing certificate: build unsigned instead of searching for one.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Version
+        id: version
+        shell: bash
+        run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
+      - run: npm run export:web -w mobile
+      - run: npm run prepare-web -w desktop
+      - run: npm run build -w desktop
+      - run: npm run dist:win -w desktop
+      - name: Start the installed app and check it
+        run: npm run smoke -w desktop -- --exe dist/win-unpacked/Heyda.exe --out ../../windows-smoke/smoke.png
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "apps/desktop/dist/Heyda-Setup-${{ steps.version.outputs.version }}.exe" "out/Heyda-${{ steps.version.outputs.version }}-windows-setup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: out/*.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-smoke
+          path: windows-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ios:
+    name: iPhone app (unsigned)
+    if: inputs.ios
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Newest stable Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_[0-9]*.app | grep -vi beta | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+      - run: npm ci
+      - name: Version
+        id: version
+        run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
+      - name: Generate the native project
+        working-directory: apps/mobile
+        run: |
+          npx expo prebuild --platform ios --no-install
+          cd ios && pod install
+      - name: Build for the simulator
+        working-directory: apps/mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild -workspace Heyda.xcworkspace -scheme Heyda -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/dd-sim" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            build > "$RUNNER_TEMP/xcode-sim.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-sim.log"; exit 1; }
+      - name: Start the app on a simulator
+        run: bash scripts/ios-smoke.sh "$RUNNER_TEMP/dd-sim/Build/Products/Release-iphonesimulator/Heyda.app" ios-smoke
+      - name: Build for iPhone (unsigned)
+        working-directory: apps/mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild -workspace Heyda.xcworkspace -scheme Heyda -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Heyda.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive > "$RUNNER_TEMP/xcode-device.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-device.log"; exit 1; }
+      - name: Package IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/ipa/Payload" out
+          cp -R "$RUNNER_TEMP/Heyda.xcarchive/Products/Applications/Heyda.app" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/out/Heyda-${{ steps.version.outputs.version }}-iphone-unsigned.ipa" Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: out/*.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-smoke
+          path: |
+            ios-smoke
+            ${{ runner.temp }}/xcode-*.log
+          if-no-files-found: ignore
+          retention-days: 14

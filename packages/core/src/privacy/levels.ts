@@ -9,8 +9,8 @@
 export const SHARE_LEVELS = ['event', 'eta', 'coarse', 'precise'] as const;
 export type ShareLevel = (typeof SHARE_LEVELS)[number];
 
-/** Longest a precise share may run before it must be renewed explicitly. */
-export const MAX_PRECISE_SHARE_MS = 2 * 60 * 60 * 1000;
+/** Longest a precise trip may run before it must be renewed explicitly (same as any trip). */
+export const MAX_PRECISE_SHARE_MS = 24 * 60 * 60 * 1000;
 
 export function levelRank(level: ShareLevel): number {
   return SHARE_LEVELS.indexOf(level);

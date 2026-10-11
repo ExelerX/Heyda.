@@ -169,7 +169,7 @@ describe('describeRule', () => {
       'Wenn jemand bei „Schule“ ankommt: Zeige „[Person] ist da“ an.',
     );
     expect(describeRule(fromTemplate('core.home-safe', { myplace: 'home', contact: MAX }), n)).toBe(
-      'Wenn ich bei „Zuhause“ ankomme: Schicke Max „Bin gut bei Zuhause angekommen ✅“.',
+      'Wenn ich bei „Zuhause“ ankomme: Melde Max „Bin gut bei Zuhause angekommen ✅“.',
     );
   });
 });

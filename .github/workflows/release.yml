@@ -1,0 +1,78 @@
+# Push a tag like v1.0.0 to build Android, Windows and iPhone and publish a GitHub release.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)publish, e.g. v1.0.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      ios: true
+    secrets: inherit
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the app version
+        id: version
+        run: |
+          node scripts/version.mjs >> "$GITHUB_OUTPUT"
+          VERSION="$(node scripts/version.mjs | sed -n 's/^version=//p')"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Tag $TAG does not match the app version $VERSION (apps/mobile/app.json, apps/desktop/package.json)."
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed "s/{{VERSION}}/$VERSION/g" .github/RELEASE_NOTES.md > notes.md
+          PRERELEASE=""
+          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md --title "Heyda. $VERSION"
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "Heyda. $VERSION" --notes-file notes.md $PRERELEASE
+          fi

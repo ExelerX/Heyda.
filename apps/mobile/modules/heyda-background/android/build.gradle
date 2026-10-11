@@ -1,0 +1,27 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'io.github.exelerx.heyda'
+version = '1.0.0'
+
+expoModule {
+  // Local module of the app, compiled from source; never published as an AAR.
+  canBePublished false
+}
+
+android {
+  namespace "expo.modules.heydabackground"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+}
+
+dependencies {
+  // NotificationCompat, NotificationChannelCompat, ServiceCompat, ContextCompat.
+  implementation 'androidx.core:core:1.17.0'
+  // HeadlessJsTaskService. The version is set by the React Native Gradle Plugin.
+  implementation 'com.facebook.react:react-android'
+}

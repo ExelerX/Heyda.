@@ -3,7 +3,11 @@ import type { NodeState, RuleTemplate, SlotValues } from '@heyda/core';
 export const CATEGORY_TEXT: Record<RuleTemplate['category'], string> = {
   ankunft: 'Ankommen',
   unterwegs: 'Unterwegs',
+  reise: 'Reise',
   sicherheit: 'Sicherheit',
+  familie: 'Familie',
+  freunde: 'Freunde',
+  ruhe: 'Ruhe',
   alltag: 'Alltag',
 };
 
@@ -11,7 +15,11 @@ export const CATEGORY_TEXT: Record<RuleTemplate['category'], string> = {
 const SYNONYMS: Record<string, string[]> = {
   ankunft: ['da', 'angekommen', 'ankommen', 'zuhause', 'heim'],
   unterwegs: ['eta', 'fahrt', 'weg', 'minuten', 'gleich', 'losfahren', 'auto', 'bus'],
-  sicherheit: ['sicher', 'abholen', 'notfall', 'gut angekommen', 'kind'],
+  reise: ['urlaub', 'flug', 'hotel', 'ferien', 'angekommen'],
+  sicherheit: ['sicher', 'abholen', 'notfall', 'sos', 'gut angekommen', 'kind'],
+  familie: ['eltern', 'kinder', 'zuhause', 'oma', 'opa'],
+  freunde: ['herz', 'antwort', 'bis gleich'],
+  ruhe: ['nicht stören', 'stumm', 'arbeit', 'schlafen', 'dnd', 'leise'],
   alltag: ['einkauf', 'laden', 'supermarkt', 'tragen', 'helfen', 'shopping'],
 };
 
@@ -21,8 +29,13 @@ export function fillSentence(template: RuleTemplate, values: SlotValues, state: 
     const slot = template.slots.find((s) => s.name === name);
     const v = values[name];
     if (!slot || v === undefined || v === '') return `[${slot?.label ?? name}]`;
-    if (slot.kind === 'contact') return v === 'any' ? 'jemand' : state.contacts.find((c) => c.key === v)?.name ?? '?';
+    if (slot.kind === 'contact') {
+      if (v === 'any') return 'jemand';
+      const c = state.contacts.find((x) => x.key === v);
+      return c?.nickname || c?.name || '?';
+    }
     if (slot.kind === 'my_place') return state.places.find((p) => p.id === v)?.name ?? '?';
+    if (slot.kind === 'duration' && typeof v === 'number') return v % 60 === 0 ? `${v / 60} Std.` : `${v} Min.`;
     return String(v);
   });
 }
@@ -39,7 +52,8 @@ export function matchesSearch(template: RuleTemplate, query: string): boolean {
 export const TIPS = [
   'Tippe auf „Gleich da“, damit du rechtzeitig die Tür aufmachst.',
   '„Heimweg teilen“ startet das Teilen automatisch, sobald du die Arbeit verlässt. Immer nur als Ankunftszeit.',
+  'Mit „Ruhe bei der Arbeit“ schaltet sich „Bitte nicht stören“ von selbst an und aus.',
   'Plugins sind nur Vorlagen. Wen sie betreffen, wählst immer du aus.',
-  'Mit dem Geistermodus auf der Startseite pausierst du alles auf einmal.',
+  'Mit dem Geistmodus pausierst du jedes automatische Teilen auf einmal. Ein Notruf geht trotzdem raus.',
   'Jede Automation darf höchstens 20-mal pro Stunde auslösen. So nervt nichts.',
 ];

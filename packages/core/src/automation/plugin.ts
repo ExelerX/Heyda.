@@ -25,6 +25,7 @@ export type PluginCapability =
   | 'notify'
   | 'send_message'
   | 'start_sharing'
+  | 'change_settings'
   | 'react_to_contacts'
   | 'react_to_my_places';
 
@@ -33,6 +34,7 @@ export const CAPABILITY_TEXT: Record<PluginCapability, string> = {
   notify: 'Benachrichtigungen auf diesem Handy anzeigen',
   send_message: 'In deinem Namen kurze Nachrichten an gewählte Kontakte senden',
   start_sharing: 'Das Teilen deiner Ankunftszeit starten (nur Stufe „ETA“)',
+  change_settings: 'Deinen Ruhemodus oder Status ändern',
   react_to_contacts: 'Auf Ereignisse reagieren, die deine Kontakte mit dir teilen',
   react_to_my_places: 'Auf deine Ankunft und Abfahrt an deinen Orten reagieren',
 };
@@ -79,7 +81,8 @@ export function capabilitiesOf(plugin: Plugin): PluginCapability[] {
     caps.add(on.startsWith('me.') ? 'react_to_my_places' : 'react_to_contacts');
     for (const a of t.rule.actions as Partial<Action>[]) {
       if (a.do === 'notify') caps.add('notify');
-      if (a.do === 'send_ping') caps.add('send_message');
+      if (a.do === 'send_ping' || a.do === 'send_message' || a.do === 'send_checkin') caps.add('send_message');
+      if (a.do === 'set_dnd' || a.do === 'set_status') caps.add('change_settings');
       if (a.do === 'start_trip') caps.add('start_sharing');
     }
   }
@@ -100,7 +103,7 @@ function sampleValues(t: RuleTemplate): Record<string, string | number> {
   for (const s of t.slots) {
     values[s.name] =
       s.default ??
-      { contact: SAMPLE_KEY, minutes: 5, my_place: 'sample', place_name: 'Beispiel', text: 'Beispiel' }[s.kind];
+      { contact: SAMPLE_KEY, minutes: 5, duration: 60, my_place: 'sample', place_name: 'Beispiel', text: 'Beispiel' }[s.kind];
   }
   return values;
 }

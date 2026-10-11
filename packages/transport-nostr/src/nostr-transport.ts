@@ -136,7 +136,7 @@ export class NostrTransport implements Transport {
     const rumor = createRumor({ kind: APP_RUMOR_KIND, content, tags: [], created_at: nowS }, this.opts.secretKey);
     const seal = createSeal(rumor, this.opts.secretKey, to);
     const wrap = this.createWrap(seal, to, options.ttlSeconds ? nowS + options.ttlSeconds : undefined);
-    const relays = this.opts.relaysFor(to);
+    const relays = options.relays?.length ? options.relays : this.opts.relaysFor(to);
     await this.pool.publish(relays.length ? relays : this.opts.ownRelays, wrap);
   }
 
