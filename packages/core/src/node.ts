@@ -709,12 +709,21 @@ export class SocialNode {
     const text = (input.text?.trim() || existing?.text || this.state.sosMessage)?.slice(0, 200) || undefined;
     const sosId = existing?.sosId ?? randomId();
     this.update({
-      sos: { sosId, startedAt: existing?.startedAt ?? now, recipients: all, text, locationUntil: now + SOS_LOCATION_MS, acks: existing?.acks ?? [] },
+      sos: {
+        sosId,
+        startedAt: existing?.startedAt ?? now,
+        recipients: all,
+        text,
+        locationUntil: now + SOS_LOCATION_MS,
+        pointSentAt: existing?.pointSentAt,
+        acks: existing?.acks ?? [],
+      },
     });
     this.sosTracker.reset();
     const fix = this.freshFix();
     if (fix) this.sosTracker.precise(fix);
     const point = fix ? toPoint(fix) : undefined;
+    if (point) this.update({ sos: { ...this.state.sos!, pointSentAt: now } });
     await Promise.all(
       all.map((to) =>
         this.sendTo(
@@ -771,7 +780,9 @@ export class SocialNode {
     const sos = this.state.sos;
     if (!sos || this.now() >= sos.locationUntil) return;
     const point = this.sosTracker.precise(fix);
-    if (point) await this.sendMany(sos.recipients, { type: 'sos.update', sosId: sos.sosId, point }, TTL.sos);
+    if (!point) return;
+    this.update({ sos: { ...sos, pointSentAt: this.now() } });
+    await this.sendMany(sos.recipients, { type: 'sos.update', sosId: sos.sosId, point }, TTL.sos);
   }
 
   // ---- "where are you?" ------------------------------------------------------------------------
@@ -1516,7 +1527,7 @@ export class SocialNode {
           if (acks.length >= MAX_SOS_ACKS) break;
           if (a.key === this.state.self.key || acks.some((x) => x.key === a.key)) continue;
           acks.push({ key: a.key, name: this.contact(a.key) ? this.name(a.key) : a.name, at, text: a.text });
-          this.alert({ category: 'checkin', title: `${a.name} kümmert sich um ${this.name(from)}`, body: a.text ?? 'Hilfe ist unterwegs.', from, thread: from, ref: { sosId: m.sosId, sosOwner: from } });
+          this.alert({ category: 'sos', followUp: true, title: `${a.name} kümmert sich um ${this.name(from)}`, body: a.text ?? 'Hilfe ist unterwegs.', from, thread: from, ref: { sosId: m.sosId, sosOwner: from } });
         }
         next = { ...next, acks };
       }
@@ -1527,7 +1538,8 @@ export class SocialNode {
     if (!same || prev.endedAt) return;
     this.setStatus(from, { sos: { ...prev, endedAt: at, endReason: m.reason } });
     this.alert({
-      category: 'checkin',
+      category: 'sos',
+      followUp: true,
       title: m.reason === 'safe' ? `✅ ${this.name(from)} ist in Sicherheit` : `${this.name(from)} hat den Notruf abgebrochen`,
       body: m.reason === 'safe' ? 'Der Notruf ist beendet.' : 'Es war wohl ein Versehen.',
       from,
@@ -1544,7 +1556,7 @@ export class SocialNode {
       const first = !sos.acks.some((a) => a.key === from);
       const acks = [...sos.acks.filter((a) => a.key !== from), { key: from, at, text: m.text }];
       this.update({ sos: { ...sos, acks } });
-      this.alert({ category: 'checkin', title: `${name} kümmert sich`, body: m.text ?? 'Hilfe ist unterwegs.', from, thread: from, ref: { sosId: m.sosId, sosOwner: this.state.self.key } });
+      this.alert({ category: 'sos', followUp: true, title: `${name} kümmert sich`, body: m.text ?? 'Hilfe ist unterwegs.', from, thread: from, ref: { sosId: m.sosId, sosOwner: this.state.self.key } });
       // Tell the other helpers, who may not be contacts of each other.
       if (first) {
         const list = acks.slice(-20).map((a) => ({ key: a.key, name: this.contact(a.key)?.name ?? 'Jemand', ...(a.text ? { text: a.text } : {}) }));
@@ -1556,7 +1568,8 @@ export class SocialNode {
     if (!sos || sos.sosId !== m.sosId || sos.endedAt || !sos.others.some((o) => o.key === from)) return;
     this.setStatus(m.owner, { sos: { ...sos, acks: [...sos.acks.filter((a) => a.key !== from), { key: from, name, at, text: m.text }] } });
     this.alert({
-      category: 'checkin',
+      category: 'sos',
+      followUp: true,
       title: `${name} kümmert sich um ${this.name(m.owner)}`,
       body: m.text ?? 'Hilfe ist unterwegs.',
       from,
@@ -1811,15 +1824,18 @@ export class SocialNode {
 
   // ---- helpers ---------------------------------------------------------------------------------
 
-  private alert(input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean }): void {
+  /**
+   * `followUp` marks news about an emergency that already rang (a helper is on the way, the
+   * person is safe): it comes through quiet mode and can't be switched off like the SOS itself,
+   * but as a normal notification, not a second alarm.
+   */
+  private alert(input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean; followUp?: boolean }): void {
     const now = this.now();
-    const { urgent, id, ...rest } = input;
+    const { urgent, id, followUp, ...rest } = input;
     const c = input.from ? this.contact(input.from) : undefined;
-    let level: AlertLevel = alertLevel(
-      { category: input.category, favorite: c?.favorite, muted: c?.muted, urgent },
-      this.state.prefs,
-      this.dndActive(),
-    );
+    let level: AlertLevel = followUp
+      ? 'normal'
+      : alertLevel({ category: input.category, favorite: c?.favorite, muted: c?.muted, urgent }, this.state.prefs, this.dndActive());
     const critical = input.category === 'sos' || input.category === 'watch';
     if (!critical && input.from && level !== 'feed' && !this.alertLimiter.allow(input.from, now)) level = 'feed';
     this.emit({ type: 'alert', alert: { ...rest, id: id ?? randomId(), at: now, level } });

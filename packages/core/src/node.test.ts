@@ -341,17 +341,24 @@ describe('SocialNode: safety', () => {
     expect(sos.point?.lat).toBeCloseTo(north(100).lat, 6);
     expect(sos.others.map((o) => o.name)).toEqual(['Mia']);
     expect(got.at(-1)).toMatchObject({ category: 'sos', level: 'alarm' });
+    expect(lisa.getState().sos?.pointSentAt).toBe(now());
     expect(lisa.locationNeeds().mode).toBe('high');
 
-    // Max takes care; Lisa and Mia (another helper) both learn it.
+    // Max takes care; Lisa and Mia (another helper) both learn it, as news, not a second alarm.
+    const lisaGot = alerts(lisa);
+    const miaGot = alerts(mia);
     await max.ackSos(LISA, 'Bin in 5 min da');
     await flush();
     expect(lisa.getState().sos?.acks.map((a) => a.key)).toEqual([MAX]);
     expect(mia.getStatus(LISA).sos?.acks.map((a) => a.name)).toEqual(['Max']);
+    expect(lisaGot.at(-1)).toMatchObject({ category: 'sos', level: 'normal', ref: { sosOwner: LISA } });
+    expect(miaGot.at(-1)).toMatchObject({ category: 'sos', level: 'normal', ref: { sosOwner: LISA } });
 
+    // Even in quiet mode with Lisa muted, Max hears that she is safe, without an alarm.
     await lisa.endSos('safe');
     await flush();
     expect(max.getStatus(LISA).sos?.endReason).toBe('safe');
+    expect(got.at(-1)).toMatchObject({ category: 'sos', level: 'normal' });
     expect(lisa.locationNeeds().mode).toBe('off');
     expect(lisa.sosFallback()).toBeUndefined();
   });
@@ -365,6 +372,13 @@ describe('SocialNode: safety', () => {
     expect(fb.phones).toEqual(['0170555']);
     expect(fb.text).toContain('Lisa braucht Hilfe');
     expect(fb.text).toContain('openstreetmap.org/?mlat=52.52000&mlon=13.40500');
+  });
+
+  it('records that no location went out when there was no fix', async () => {
+    const { lisa } = await pairedPair();
+    lisa.updateContact(MAX, { emergency: true });
+    await lisa.startSos();
+    expect(lisa.getState().sos?.pointSentAt).toBeUndefined();
   });
 
   it('refuses an SOS without emergency contacts', async () => {

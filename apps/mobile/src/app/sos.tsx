@@ -284,7 +284,6 @@ function ActiveSos({ sos, onEnded }: { sos: MySos; onEnded: (r: 'safe' | 'cancel
 
   const fallback = runtime.node.sosFallback();
   const showSms = settings.smsFallback && smsOk && !!fallback?.phones.length;
-  const fix = runtime.node.freshFix(10 * 60_000);
   const locationLive = now < sos.locationUntil;
   const fg = onFilled(t);
 
@@ -348,7 +347,7 @@ function ActiveSos({ sos, onEnded }: { sos: MySos; onEnded: (r: 'safe' | 'cancel
   let locationText: string;
   if (isDemo) locationText = 'Im Demo-Modus wird kein echter Standort gesendet.';
   else if (!locationLive) locationText = `Standort-Updates sind seit ${hhmm(sos.locationUntil)} beendet.`;
-  else if (fix) locationText = `Dein genauer Standort wurde gesendet und wird bis ${hhmm(sos.locationUntil)} aktualisiert.`;
+  else if (sos.pointSentAt) locationText = `Dein genauer Standort wurde um ${hhmm(sos.pointSentAt)} gesendet und wird bis ${hhmm(sos.locationUntil)} aktualisiert.`;
   else if (!locationSupported) locationText = 'Dieses Gerät kennt deinen Standort nicht. Der Notruf ging ohne Standort raus.';
   else locationText = 'Dein Standort ist gerade nicht bekannt. Er wird nachgeschickt, sobald dein Handy ihn hat.';
 

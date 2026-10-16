@@ -8,7 +8,7 @@ Werbung, ohne Tracking. Für Android, Windows und iPhone.
 
 - 🚗 **Ankunftszeit teilen:** „Lisa kommt in ca. 5 Min. an“, automatisch, wenn du losfährst
 - 📍 **Orte:** „Max ist im Supermarkt angekommen“, nur für Orte, die du freigibst
-- 🗺️ **Live-Standort wie bei Snapchat, aber freiwillig:** ungefähr (~2 km) oder genau, immer mit Ablaufzeit
+- 🗺️ **Live-Standort wie bei Snapchat, aber freiwillig:** ungefähr (~2 km) oder genau, mit Ablaufzeit oder bis du es beendest (jederzeit mit einem Tipp)
 - ❓ **„Wo bist du?“:** Freunde fragen, du entscheidest, was du antwortest
 - 🆘 **Notruf:** ein Knopf benachrichtigt deine Notfallkontakte mit genauem Standort, auf Wunsch auch per SMS
 - 🛡️ **Pass auf mich auf:** Meldest du dich bis zu einer Uhrzeit nicht, schlagen deine Kontakte Alarm
@@ -36,7 +36,7 @@ Heyda. auf dem Handy hat, verbindet den PC unter *Ich → Meine Geräte*.
 
 | Wer | Sieht | Sieht nicht |
 | --- | --- | --- |
-| Deine Kontakte | Was du freigibst: Ankunftszeit (gerundet), Ankunft/Abfahrt an freigegebenen Orten, Status, Ruhemodus; nur wenn du es wählst: ein ~2-km-Raster oder den genauen Punkt (immer zeitlich begrenzt) | Koordinaten deiner Orte, deinen Standort, wenn du nichts teilst |
+| Deine Kontakte | Was du freigibst: Ankunftszeit (gerundet), Ankunft/Abfahrt an freigegebenen Orten, Status, Ruhemodus; nur wenn du es wählst: ein ~2-km-Raster oder den genauen Punkt (mit Ablaufzeit oder bis du es beendest) | Koordinaten deiner Orte, deinen Standort, wenn du nichts teilst |
 | Deine Notfallkontakte, wenn **du** einen Notruf auslöst | Deinen genauen Standort (auch im Geistmodus) | |
 | Nostr-Relays | Für welchen (anonymen) Schlüssel eine Nachricht bestimmt ist, ungefähre Zeit (bis zu 2 Tage zufällig verschoben), Größe, deine IP-Adresse | Inhalt, Absender, Art der Nachricht |
 | openstreetmap.org (nur wenn du die Karte einschaltest) | Welche Kartenausschnitte du ansiehst | Wer du bist und was deine Freunde teilen |

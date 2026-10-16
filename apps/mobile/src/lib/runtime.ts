@@ -276,6 +276,8 @@ export class AppRuntime {
         secretKey,
         ownRelays: data.state.self.relays.length ? data.state.self.relays : DEFAULT_RELAYS,
         relaysFor: (k) => node.relaysFor(k),
+        // Strangers' messages are dropped before they take room in the saved seen store.
+        accept: (from, message) => node.acceptsMessage(from, message),
         seen,
       });
       node = new SocialNode({ ...common, transport });

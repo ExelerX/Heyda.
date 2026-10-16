@@ -23,4 +23,4 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       ios: ${{ inputs.ios == true }}
-    secrets: inherit
+    # No secrets: pull request code (and everything npm and Gradle run for it) never sees the release signing key.

@@ -25,7 +25,7 @@ Privat, ohne Server, Ende-zu-Ende-verschlüsselt. Für Freunde und Familie.
 - 🆘 **Notruf:** ein Knopf benachrichtigt deine Notfallkontakte mit genauem Standort (auch im Geistmodus), auf Wunsch zusätzlich per SMS, 112 direkt wählbar.
 - 🛡️ **Pass auf mich auf:** Wenn du dich bis zu einer Uhrzeit nicht meldest, schlagen deine Kontakte Alarm, auch durch ihr „Bitte nicht stören“.
 - ✅ **Kurz melden:** „Gut angekommen“, „Bin zuhause“, „Im Urlaub angekommen“ mit einem Tipp.
-- 🚗 **Ankunftszeit teilen** und 📍 **Live-Standort** (ungefähr oder genau, mit Ablaufzeit), **„Wo bist du?“**-Anfragen, die du selbst beantwortest.
+- 🚗 **Ankunftszeit teilen** und 📍 **Live-Standort** (ungefähr oder genau, mit Ablaufzeit oder bis du es beendest), **„Wo bist du?“**-Anfragen, die du selbst beantwortest.
 - 💬 **Chats und Gruppen**, Pings, dringende Nachrichten.
 - 🌙 **Bitte nicht stören** mit Zeitplan und Ausnahmen (Favoriten, Dringendes, Pass auf mich auf). Ein Notruf kommt immer durch; damit er auch das „Nicht stören“ des Handys durchbricht, erlaube es einmal in der App unter *Ruhe & Benachrichtigungen*.
 - ⚡ **Automationen** aus Vorlagen oder per Baukasten, Plugins ohne Code.

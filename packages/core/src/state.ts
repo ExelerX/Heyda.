@@ -63,6 +63,8 @@ export interface MySos {
   text?: string;
   /** Location updates stop after this, even if the alert is still open. */
   locationUntil: number;
+  /** When my exact location last went out with this alert; absent = none sent yet (no fix). */
+  pointSentAt?: number;
   acks: { key: ContactKey; at: number; text?: string }[];
 }
 

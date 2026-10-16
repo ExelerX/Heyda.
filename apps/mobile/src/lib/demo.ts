@@ -54,7 +54,7 @@ export function startDemoFriends(network: MemoryNetwork, me: SocialNode): () => 
 
     // Lisa answers an SOS, so the demo shows what happens after sending one.
     lisa.on((e) => {
-      if (e.type === 'alert' && e.alert.ref?.sosOwner === meKey && e.alert.category === 'sos') {
+      if (e.type === 'alert' && e.alert.ref?.sosOwner === meKey && e.alert.category === 'sos' && e.alert.level === 'alarm') {
         later(4000, () => lisa.ackSos(meKey, 'Bin unterwegs, rufe dich gleich an!'));
       }
     });
