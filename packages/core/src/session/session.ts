@@ -1,3 +1,4 @@
+import { CLOCK_TOLERANCE_MS } from '../geo/fix';
 import type { LatLon } from '../geo/types';
 import { MAX_PRECISE_SHARE_MS } from '../privacy/levels';
 import type { ContactKey } from '../transport/transport';
@@ -59,6 +60,11 @@ export function createSession(input: CreateSessionInput): SharingSession {
   };
 }
 
+/**
+ * Whether the session runs at `now`. Before its start (beyond a little slack for small clock
+ * corrections) counts as over: the clock was set back, and waiting for `expiresAt` could then
+ * take far longer than the session was meant to last.
+ */
 export function isSessionActive(session: SharingSession, now: number = Date.now()): boolean {
-  return session.endedAt === undefined && now < session.expiresAt;
+  return session.endedAt === undefined && now < session.expiresAt && now >= session.startedAt - CLOCK_TOLERANCE_MS;
 }

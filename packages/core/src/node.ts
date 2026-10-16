@@ -1,7 +1,8 @@
 import { AutomationEngine, systemLocalTime, type ActionIntent, type AutomationEvent, type LocalTime } from './automation/engine';
 import type { Rule } from './automation/schema';
 import { checkinText, pingText } from './features/labels';
-import { LIVE_CADENCE, LiveTracker, SOS_CADENCE } from './features/live';
+import { isLiveShareActive, LIVE_CADENCE, LiveTracker, SOS_CADENCE } from './features/live';
+import { CLOCK_TOLERANCE_MS, normalizeFix } from './geo/fix';
 import { GeofenceTracker, type Place } from './geo/geofence';
 import type { LatLon, LocationFix } from './geo/types';
 import { alertLevel, dndEndsAt, isDndActive, normalizePrefs, type AlertLevel, type NotificationPrefs } from './notify/prefs';
@@ -41,9 +42,10 @@ import {
   type Alarm,
 } from './state';
 import { buildSyncDoc, mergeSyncDoc, parseSyncDoc } from './sync/doc';
-import { decodeLinkInvite, linkCode } from './sync/link';
+import { decodeLinkInvite, linkCode, linkCommitment, randomLinkSecret, type LinkInvite } from './sync/link';
 import { chunkPayload, Reassembler } from './sync/xfer';
 import type { ContactKey, IncomingMessage, Transport } from './transport/transport';
+import { base64urlDecode, base64urlEncode } from './util/base64url';
 import { RateLimiter, RecentIds } from './util/rate-limit';
 import { randomId } from './util/random';
 
@@ -61,7 +63,26 @@ export type NodeEvent =
   | { type: 'trip'; session: SharingSession | undefined }
   /** Which location tracking the platform should run now. */
   | { type: 'location'; needs: LocationNeeds }
-  | { type: 'state'; state: NodeState };
+  | { type: 'state'; state: NodeState }
+  /** The device link this device is sending its account through changed (see `linkStatus`). */
+  | { type: 'link'; status: LinkStatus | undefined };
+
+/**
+ * Where linking a new device stands on the existing device: waiting for the new device to
+ * answer, or showing the 6 digits the person compares before the account is sent.
+ */
+export type LinkStatus = { phase: 'waiting'; expiresAt: number } | { phase: 'compare'; code: string; expiresAt: number };
+
+/** The one device link in progress on the existing device. Lives only in memory. */
+interface PendingLink {
+  invite: LinkInvite;
+  /** My random share. Wiped once the digits are known. */
+  rE: Uint8Array;
+  startedAt: number;
+  /** Set once the new device's reveal opened its commitment. */
+  code?: string;
+  sending?: boolean;
+}
 
 export interface SocialNodeOptions {
   transport: Transport;
@@ -168,6 +189,7 @@ export class SocialNode {
   private syncTimer: ReturnType<typeof setTimeout> | undefined;
   private flushingOutbox = false;
   private running = false;
+  private pendingLink: PendingLink | undefined;
 
   constructor(private readonly options: SocialNodeOptions) {
     this.state = JSON.parse(JSON.stringify(options.initialState)) as NodeState;
@@ -276,7 +298,7 @@ export class SocialNode {
     const reasons: LocationNeeds['reasons'] = [];
     const now = this.now();
     if (this.activeTrip) reasons.push('trip');
-    const live = this.state.ghost ? [] : this.state.liveShares.filter((s) => !s.expiresAt || now < s.expiresAt);
+    const live = this.state.ghost ? [] : this.state.liveShares.filter((s) => isLiveShareActive(s, now));
     if (live.length) reasons.push('live');
     if (this.state.sos && now < this.state.sos.locationUntil) reasons.push('sos');
     const high = reasons.includes('trip') || reasons.includes('sos') || live.some((s) => s.level === 'precise');
@@ -288,9 +310,11 @@ export class SocialNode {
     return this.state.places.find((p) => this.geofence.isInside(p.id));
   }
 
-  /** The newest location fix, if it is recent enough to share. */
+  /** The newest location fix, if it is recent enough to share. Never one from the future (the clock was set back since). */
   freshFix(maxAgeMs = FRESH_FIX_MS): LocationFix | undefined {
-    return this.lastFix && this.now() - this.lastFix.timestamp < maxAgeMs ? this.lastFix : undefined;
+    if (!this.lastFix) return undefined;
+    const age = this.now() - this.lastFix.timestamp;
+    return age >= -CLOCK_TOLERANCE_MS && age < maxAgeMs ? this.lastFix : undefined;
   }
 
   // ---- profile and settings ------------------------------------------------------------------
@@ -482,11 +506,18 @@ export class SocialNode {
 
   // ---- location ------------------------------------------------------------------------------
 
-  /** Feed every location fix from the OS here. */
-  async onLocationFix(fix: LocationFix): Promise<void> {
-    if (!Number.isFinite(fix.lat) || !Number.isFinite(fix.lon) || Math.abs(fix.lat) > 90 || Math.abs(fix.lon) > 180) return;
-    if (!Number.isFinite(fix.timestamp)) return;
-    if (this.lastFix && fix.timestamp < this.lastFix.timestamp) return; // out of order
+  /**
+   * Feed every location fix from the OS here. Broken fixes are dropped (never thrown), and a fix
+   * dated in the future counts as now (see `normalizeFix`).
+   */
+  async onLocationFix(raw: LocationFix): Promise<void> {
+    const now = this.now();
+    const fix = normalizeFix(raw, now);
+    if (!fix) return;
+    // Out of order, unless the last fix now lies in the future: then the clock was set back, and
+    // waiting for it to catch up would freeze location handling, so this fix becomes the reference.
+    const last = this.lastFix;
+    if (last && fix.timestamp < last.timestamp && last.timestamp <= now + CLOCK_TOLERANCE_MS) return;
     this.lastFix = fix;
     for (const ev of this.geofence.update(fix)) await this.handlePlaceEvent(ev.placeId, ev.type, ev.at);
     await this.onTripFix(fix);
@@ -508,7 +539,8 @@ export class SocialNode {
   private async onTripFix(fix: LocationFix): Promise<void> {
     if (!this.trip || this.trip.isEnded) return;
     const etaBefore = this.trip.lastEtaMinutes;
-    for (const body of this.trip.onFix(fix)) await this.broadcastTrip(body);
+    // My clock decides when the trip is over (also after it was set back), not the fix's time.
+    for (const body of [...this.trip.expire(this.now()), ...this.trip.onFix(fix)]) await this.broadcastTrip(body);
     if (this.trip.isEnded) this.afterTripEnded();
     // Screens show my own ETA too.
     else if (this.trip.lastEtaMinutes !== etaBefore) this.emit({ type: 'trip', session: this.trip.session });
@@ -571,7 +603,7 @@ export class SocialNode {
   private async sendLiveUpdates(fix: LocationFix): Promise<void> {
     if (this.state.ghost || !this.state.liveShares.length) return;
     const now = this.now();
-    const active = this.state.liveShares.filter((s) => !s.expiresAt || now < s.expiresAt);
+    const active = this.state.liveShares.filter((s) => isLiveShareActive(s, now));
     const precise = active.filter((s) => s.level === 'precise');
     const coarse = active.filter((s) => s.level === 'coarse');
     const point = precise.length ? this.preciseTracker.precise(fix) : undefined;
@@ -932,25 +964,60 @@ export class SocialNode {
 
   // ---- my other devices -----------------------------------------------------------------------
 
-  /** Checks a scanned device code and returns the 6-digit code both screens must show. */
-  previewLink(text: string): { ok: true; code: string } | { ok: false; error: string } {
-    const d = decodeLinkInvite(text, this.now());
-    return d.ok ? { ok: true, code: linkCode(d.invite) } : d;
+  /**
+   * Where linking a new device stands (see `sync/link.ts`): `waiting` for the new device to
+   * answer, then `compare` with the 6 digits. Undefined when nothing runs or the code expired.
+   */
+  get linkStatus(): LinkStatus | undefined {
+    const p = this.pendingLink;
+    if (!p || p.invite.expiresAt <= this.now()) return undefined;
+    return p.code === undefined ? { phase: 'waiting', expiresAt: p.invite.expiresAt } : { phase: 'compare', code: p.code, expiresAt: p.invite.expiresAt };
   }
 
   /**
-   * Sends my account to a new device that shows a device code. The identity key travels
-   * end-to-end encrypted to the new device's one-time key; only that device can read it.
+   * Starts linking the new device that shows this device code: picks my random share and
+   * sends it to the code's one-time key. The digits appear in `linkStatus` once the new device
+   * answered. Replaces a link already in progress. Throws (in German) for bad codes.
    */
-  async sendLink(text: string, secretKeyHex: string): Promise<void> {
+  async startLink(text: string): Promise<void> {
     const d = decodeLinkInvite(text, this.now());
     if (!d.ok) throw new Error(d.error);
+    if (d.invite.tempKey === this.state.self.key) throw new Error('Dieser Code passt nicht. Lass auf dem neuen Gerät einen neuen anzeigen.');
+    this.clearLink(false);
+    const session: PendingLink = { invite: d.invite, rE: randomLinkSecret(), startedAt: this.now() };
+    // Set before sending, so the answer is accepted however fast it comes.
+    this.pendingLink = session;
+    this.emitLink();
+    const hello: BodyOf<'link.hello'> = {
+      type: 'link.hello',
+      nonce: d.invite.nonce,
+      rE: base64urlEncode(session.rE),
+      relays: this.state.self.relays.filter((r) => RelayUrl.safeParse(r).success).slice(0, 8),
+    };
+    try {
+      await this.transport.send(d.invite.tempKey, composeMessage(hello, this.now()), { ttlSeconds: TTL.link, relays: d.invite.relays });
+    } catch {
+      if (this.pendingLink === session) this.clearLink();
+      throw new Error('Keine Verbindung. Prüfe dein Internet und versuch es nochmal.');
+    }
+  }
+
+  /**
+   * The person saw the same digits on both devices: sends my account to the new device. The
+   * identity key travels end-to-end encrypted to the new device's one-time key; only that
+   * device can read it. Only possible while `linkStatus` is `compare`.
+   */
+  async confirmLink(secretKeyHex: string): Promise<void> {
+    const p = this.pendingLink;
+    if (!p || p.invite.expiresAt <= this.now()) throw new Error('Die Zeit ist abgelaufen. Lass auf dem neuen Gerät einen neuen Code anzeigen.');
+    if (p.code === undefined) throw new Error('Vergleiche zuerst die Zahlen auf beiden Geräten.');
+    if (p.sending) throw new Error('Dein Konto wird schon gesendet.');
     if (!/^[0-9a-f]{64}$/.test(secretKeyHex)) throw new Error('Ungültiger Schlüssel.');
     const { self } = this.state;
     const payload = {
       format: 'heyda.link',
-      v: 1,
-      nonce: d.invite.nonce,
+      v: 2,
+      nonce: p.invite.nonce,
       secretKey: secretKeyHex,
       relays: self.relays,
       deviceId: self.deviceId,
@@ -958,9 +1025,56 @@ export class SocialNode {
       devices: this.state.devices,
       doc: buildSyncDoc(this.state),
     };
-    for (const chunk of chunkPayload(randomId(), 'link', payload)) {
-      await this.transport.send(d.invite.tempKey, composeMessage(chunk, this.now()), { ttlSeconds: TTL.link, relays: d.invite.relays });
+    p.sending = true;
+    try {
+      for (const chunk of chunkPayload(randomId(), 'link', payload)) {
+        await this.transport.send(p.invite.tempKey, composeMessage(chunk, this.now()), { ttlSeconds: TTL.link, relays: p.invite.relays });
+      }
+    } catch {
+      // Stays in `compare`, so the person can try again.
+      p.sending = false;
+      throw new Error('Senden hat nicht geklappt. Prüfe dein Internet und versuch es nochmal.');
     }
+    if (this.pendingLink === p) this.clearLink();
+  }
+
+  /** Stops a device link in progress and forgets its secret. */
+  cancelLink(): void {
+    this.clearLink();
+  }
+
+  private clearLink(emit = true): void {
+    const p = this.pendingLink;
+    if (!p) return;
+    p.rE.fill(0);
+    this.pendingLink = undefined;
+    if (emit) this.emitLink();
+  }
+
+  private emitLink(): void {
+    this.emit({ type: 'link', status: this.linkStatus });
+  }
+
+  /** Whether a link.reveal is the one answer my pending device link waits for. */
+  private awaitsReveal(from: ContactKey, m: MessageOf<'link.reveal'>): boolean {
+    const p = this.pendingLink;
+    return !!p && p.code === undefined && p.invite.expiresAt > this.now() && from === p.invite.tempKey && m.nonce === p.invite.nonce;
+  }
+
+  private onLinkReveal(from: ContactKey, m: MessageOf<'link.reveal'>): void {
+    const p = this.pendingLink;
+    if (!p || !this.awaitsReveal(from, m)) return;
+    const rN = base64urlDecode(m.rN);
+    if (linkCommitment(rN) !== p.invite.commit) {
+      // The device that made the code did not keep its word: never send this one anything.
+      rN.fill(0);
+      this.clearLink();
+      return;
+    }
+    p.code = linkCode({ tempKey: p.invite.tempKey, nonce: p.invite.nonce, accountKey: this.state.self.key, rE: p.rE, rN });
+    rN.fill(0);
+    p.rE.fill(0);
+    this.emitLink();
   }
 
   /** Called once on a freshly linked device: tells my other devices it exists. */
@@ -1003,7 +1117,7 @@ export class SocialNode {
         this.afterTripEnded();
       }
     }
-    for (const s of this.state.liveShares.filter((x) => x.expiresAt !== undefined && now >= x.expiresAt)) {
+    for (const s of this.state.liveShares.filter((x) => !isLiveShareActive(x, now))) {
       await this.stopLive(s.contactKey, 'expired');
     }
     if (this.state.status && now >= this.state.status.expiresAt) {
@@ -1022,6 +1136,7 @@ export class SocialNode {
     this.checkOverdueWatches(now);
     this.pruneStatuses(now);
     this.pruneLists(now);
+    if (this.pendingLink && this.pendingLink.invite.expiresAt <= now) this.clearLink();
     this.emitLocationNeeds();
     await this.flushOutbox();
     await this.flushSync();
@@ -1082,6 +1197,9 @@ export class SocialNode {
         return this.isMember(message.groupId, from);
       case 'group.update':
         return this.group(message.groupId)?.owner === from;
+      case 'link.reveal':
+        // The one-time key of a device I am linking, answering my hello once, for that code only.
+        return this.awaitsReveal(from, message);
       default:
         return false;
     }
@@ -1093,6 +1211,11 @@ export class SocialNode {
     if (!this.acceptsMessage(from, message)) return;
     if (!this.seen.add(`${from}|${message.id}`)) return;
 
+    // Whoever sent it (stranger, contact or my own key), a reveal only ever moves my pending link.
+    if (message.type === 'link.reveal') {
+      this.onLinkReveal(from, message);
+      return;
+    }
     if (from === this.state.self.key) {
       this.handleOwn(message);
       return;
@@ -1156,7 +1279,8 @@ export class SocialNode {
       case 'group.leave':
         return this.onGroupLeave(from, message);
       default:
-        // sync.sent, link.done and xfer.chunk only count from my own devices.
+        // sync.sent, link.done and xfer.chunk only count from my own devices; link.hello goes to a
+        // new device's one-time key, never to an account.
         return;
     }
   }

@@ -1,15 +1,34 @@
 import type { LinkedDevice } from '@heyda/core';
 import { Stack } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 import { Banner, Bullet, Digits, errorText, Narrow, Step } from '../components/setup/kit';
 import { LinkScanner } from '../components/setup/LinkScanner';
 import { Button, Card, Pill, Row, Screen, Section, T } from '../components/ui';
 import { confirm, notice } from '../lib/confirm';
-import { useRuntime, useSnapshot } from '../lib/store';
+import { useRuntime, useSnapshot, useTick } from '../lib/store';
 import { spacing, TOUCH, useTheme } from '../lib/theme';
 
-type Flow = { step: 'idle' } | { step: 'scan'; error?: string } | { step: 'compare'; code: string; digits: string } | { step: 'sending'; code: string; digits: string } | { step: 'sent'; known: number } | { step: 'failed'; error: string };
+/**
+ * Linking from here: scan → starting (sending my share) → linking (the node's `linkStatus`:
+ * waiting for the new device, then the digits) → sending → sent.
+ */
+type Flow =
+  | { step: 'idle' }
+  | { step: 'scan'; error?: string }
+  | { step: 'starting' }
+  | { step: 'linking'; expiresAt: number }
+  | { step: 'sending'; code: string; expiresAt: number }
+  | { step: 'sent'; known: number }
+  | { step: 'failed'; error: string };
+
+const EXPIRED = 'Die Zeit ist abgelaufen.';
+const BAD_ANSWER = 'Das neue Gerät hat nicht passend geantwortet.';
+
+function countdown(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 
 function deviceIcon(name: string): string {
   return /pc|windows|computer|laptop|mac|browser/i.test(name) ? '💻' : '📱';
@@ -20,11 +39,29 @@ function dateText(at: number): string {
 }
 
 export default function Devices() {
+  const t = useTheme();
   const runtime = useRuntime();
-  const { state, isDemo } = useSnapshot();
+  const { state, isDemo, linkStatus } = useSnapshot();
   const [flow, setFlow] = useState<Flow>({ step: 'idle' });
   const others = state.devices.filter((d) => d.deviceId !== state.self.deviceId);
-  const sendingRef = useRef(false);
+  const busyRef = useRef(false);
+  const now = useTick(1000);
+  const runtimeRef = useRef(runtime);
+  runtimeRef.current = runtime;
+
+  // Leaving the screen ends a link in progress and wipes its secret.
+  useEffect(() => () => runtimeRef.current.cancelLink(), []);
+
+  // The link ended without a "yes" from here: the time ran out, or the new device answered wrongly.
+  useEffect(() => {
+    if (flow.step !== 'linking') return;
+    if (Date.now() >= flow.expiresAt) {
+      runtimeRef.current.cancelLink();
+      setFlow({ step: 'failed', error: EXPIRED });
+    } else if (!linkStatus) {
+      setFlow({ step: 'failed', error: BAD_ANSWER });
+    }
+  }, [flow, linkStatus, now]);
 
   // After sending: the new device announces itself, then it shows up in the list.
   const newDevice = flow.step === 'sent' && others.length > flow.known ? others[others.length - 1] : undefined;
@@ -34,23 +71,46 @@ export default function Devices() {
     return () => clearTimeout(id);
   }, [flow.step]);
 
-  function check(text: string) {
-    const r = runtime.node.previewLink(text.trim());
-    if (r.ok) setFlow({ step: 'compare', code: text.trim(), digits: r.code });
-    else setFlow({ step: 'scan', error: r.error });
+  async function check(text: string) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setFlow({ step: 'starting' });
+    try {
+      await runtime.startLink(text.trim());
+      const status = runtime.node.linkStatus;
+      setFlow(status ? { step: 'linking', expiresAt: status.expiresAt } : { step: 'failed', error: BAD_ANSWER });
+    } catch (e) {
+      setFlow({ step: 'scan', error: errorText(e, 'Der Code passt nicht.') });
+    } finally {
+      busyRef.current = false;
+    }
   }
 
-  async function send(code: string, digits: string) {
-    if (sendingRef.current) return;
-    sendingRef.current = true;
-    setFlow({ step: 'sending', code, digits });
+  async function send(code: string, expiresAt: number) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setFlow({ step: 'sending', code, expiresAt });
     try {
-      await runtime.linkDevice(code);
+      await runtime.confirmLink();
       setFlow({ step: 'sent', known: others.length });
     } catch (e) {
-      setFlow({ step: 'failed', error: errorText(e, 'Das Konto konnte nicht gesendet werden.') });
+      if (runtime.node.linkStatus?.phase === 'compare') {
+        // E.g. offline for a moment: the digits still count, so let the person try again.
+        setFlow({ step: 'linking', expiresAt });
+        notice('Nicht gesendet', errorText(e));
+      } else {
+        setFlow({ step: 'failed', error: Date.now() >= expiresAt ? EXPIRED : errorText(e, 'Das Konto konnte nicht gesendet werden.') });
+      }
     } finally {
-      sendingRef.current = false;
+      busyRef.current = false;
+    }
+  }
+
+  function cancelLink(afterCompare: boolean) {
+    runtime.cancelLink();
+    setFlow({ step: 'idle' });
+    if (afterCompare) {
+      notice('Abgebrochen', 'Gut so. Wenn die Zahlen nicht stimmen, könnte ein fremder Code dahinterstecken. Starte auf dem neuen Gerät eine neue Verbindung.');
     }
   }
 
@@ -94,8 +154,9 @@ export default function Devices() {
           ) : flow.step === 'idle' ? (
             <Card style={{ gap: spacing.md }}>
               <Step n={1}>Installiere Heyda. auf dem neuen Gerät und wähle dort „Ich habe Heyda. schon auf einem anderen Gerät“.</Step>
-              <Step n={2}>Das neue Gerät zeigt einen QR-Code und 6 Zahlen.</Step>
-              <Step n={3}>Scanne den Code hier oder füge den Code-Text ein. Dann vergleichst du die Zahlen.</Step>
+              <Step n={2}>Das neue Gerät zeigt einen QR-Code.</Step>
+              <Step n={3}>Scanne den Code hier oder füge den Code-Text ein.</Step>
+              <Step n={4}>Dann zeigen beide Geräte 6 Zahlen. Stimmen sie überein, bestätigst du hier.</Step>
               <Button title="Neues Gerät verbinden" icon="🔗" onPress={() => setFlow({ step: 'scan' })} />
             </Card>
           ) : flow.step === 'scan' ? (
@@ -103,25 +164,39 @@ export default function Devices() {
               <LinkScanner onCode={check} error={flow.error} />
               <Button title="Abbrechen" kind="ghost" compact onPress={() => setFlow({ step: 'idle' })} />
             </Card>
-          ) : flow.step === 'compare' || flow.step === 'sending' ? (
+          ) : flow.step === 'starting' || (flow.step === 'linking' && linkStatus?.phase !== 'compare') ? (
+            <Card style={{ gap: spacing.md, alignItems: 'center' }}>
+              <ActivityIndicator color={t.accent} accessibilityElementsHidden importantForAccessibility="no" />
+              <View accessible accessibilityLiveRegion="polite" style={{ gap: spacing.xs, alignItems: 'center' }}>
+                <T variant="h2" style={{ textAlign: 'center' }}>
+                  Verbinde mit dem neuen Gerät …
+                </T>
+                <T variant="muted" style={{ textAlign: 'center' }}>
+                  Gleich zeigen beide Geräte 6 Zahlen. Lass das neue Gerät dafür offen.
+                </T>
+              </View>
+              {flow.step === 'linking' && <T variant="small">{`Gültig noch ${countdown(flow.expiresAt - now)}`}</T>}
+              <Button title="Abbrechen" kind="ghost" compact disabled={flow.step === 'starting'} onPress={() => cancelLink(false)} />
+            </Card>
+          ) : (flow.step === 'linking' && linkStatus?.phase === 'compare') || flow.step === 'sending' ? (
             <Card style={{ gap: spacing.md }}>
               <T variant="h2" style={{ textAlign: 'center' }}>
-                Stimmen die Zahlen auf beiden Geräten überein?
+                Zeigt das neue Gerät genau diese Zahlen?
               </T>
-              <Digits value={flow.digits} label="Vergleichszahlen" />
+              <Digits value={flow.step === 'sending' ? flow.code : linkStatus?.phase === 'compare' ? linkStatus.code : ''} label="Vergleichszahlen" />
+              <T variant="small" style={{ textAlign: 'center' }}>{`Gültig noch ${countdown(flow.expiresAt - now)}`}</T>
               <Bullet icon="🔐">
                 Nur wenn sie gleich sind, ist es wirklich dein neues Gerät. Es bekommt dein ganzes Konto und kann danach in deinem Namen schreiben. Verbinde nur Geräte, die dir gehören.
               </Bullet>
-              <Button title="Ja, die Zahlen stimmen" icon="✅" onPress={() => void send(flow.code, flow.digits)} busy={flow.step === 'sending'} />
               <Button
-                title="Nein, abbrechen"
-                kind="secondary"
-                disabled={flow.step === 'sending'}
+                title="Zahlen stimmen überein"
+                icon="✅"
+                busy={flow.step === 'sending'}
                 onPress={() => {
-                  setFlow({ step: 'idle' });
-                  notice('Abgebrochen', 'Gut so. Wenn die Zahlen nicht stimmen, könnte ein fremder Code dahinterstecken. Starte auf dem neuen Gerät eine neue Verbindung.');
+                  if (flow.step === 'linking' && linkStatus?.phase === 'compare') void send(linkStatus.code, flow.expiresAt);
                 }}
               />
+              <Button title="Abbrechen" kind="secondary" disabled={flow.step === 'sending'} onPress={() => cancelLink(true)} />
             </Card>
           ) : flow.step === 'sent' ? (
             <Card style={{ gap: spacing.md }}>
@@ -131,7 +206,7 @@ export default function Devices() {
                 </Banner>
               ) : (
                 <Banner tone="success" title="Gesendet">
-                  Dein Konto ist verschlüsselt unterwegs. Auf dem neuen Gerät geht es gleich von selbst weiter, und es taucht hier in der Liste auf, sobald es sich meldet.
+                  Dein Konto ist verschlüsselt unterwegs. Bestätige auf dem neuen Gerät, dass es dein Konto ist. Danach taucht es hier in der Liste auf.
                 </Banner>
               )}
               <Button title="Fertig" kind="secondary" compact onPress={() => setFlow({ step: 'idle' })} />

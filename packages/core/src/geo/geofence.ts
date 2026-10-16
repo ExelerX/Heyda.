@@ -1,4 +1,5 @@
 import { distanceM } from './distance';
+import { CLOCK_TOLERANCE_MS } from './fix';
 import type { LatLon, LocationFix } from './types';
 
 /**
@@ -102,7 +103,10 @@ export class GeofenceTracker {
 
       if (!state.inside) {
         if (d <= place.radiusM) {
-          state.candidateSince ??= fix.timestamp;
+          // A start far "in the future" means the clock was set back: count the dwell time again.
+          if (state.candidateSince === undefined || fix.timestamp < state.candidateSince - CLOCK_TOLERANCE_MS) {
+            state.candidateSince = fix.timestamp;
+          }
           if (fix.timestamp - state.candidateSince >= this.opts.minDwellMs) {
             state.inside = true;
             state.candidateSince = undefined;

@@ -246,6 +246,31 @@ export const LinkDoneMessage = msg('link.done', {
   deviceName: shortText(40),
 });
 
+/** Nonce of a device-link code (`heyda-link:2:`), as the code itself carries it. */
+export const LinkNonce = z.string().regex(/^[A-Za-z0-9_-]{16,64}$/);
+/** Exactly 32 bytes as unpadded base64url: 43 characters, the last one carrying only 4 bits. */
+export const Bytes32 = z.string().regex(/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/);
+
+/**
+ * Device link, step 2 (existing device → one-time key of the new device): answers a scanned
+ * device code with the existing device's random share `rE`, chosen after it saw the commitment.
+ */
+export const LinkHelloMessage = msg('link.hello', {
+  nonce: LinkNonce,
+  rE: Bytes32,
+  /** Where the existing device listens, so the new device can answer. */
+  relays: z.array(relayUrl).max(8),
+});
+
+/**
+ * Device link, step 3 (new device → existing device): opens the commitment from the code.
+ * Only now can both sides work out the 6 digits; see `sync/link.ts`.
+ */
+export const LinkRevealMessage = msg('link.reveal', {
+  nonce: LinkNonce,
+  rN: Bytes32,
+});
+
 /** One slice of a larger payload (device link or settings sync). */
 export const XferChunkMessage = msg('xfer.chunk', {
   xferId: id,
@@ -282,6 +307,8 @@ export const AppMessage = z.discriminatedUnion('type', [
   GroupLeaveMessage,
   SyncSentMessage,
   LinkDoneMessage,
+  LinkHelloMessage,
+  LinkRevealMessage,
   XferChunkMessage,
 ]);
 

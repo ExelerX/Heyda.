@@ -1,4 +1,5 @@
 import { distanceM } from '../geo/distance';
+import { elapsedMs } from '../geo/fix';
 import type { LocationFix } from '../geo/types';
 import { EtaEstimator, type TravelMode } from '../eta/estimator';
 import { CoarseLocator, DEFAULT_CELL_M } from '../privacy/coarse-grid';
@@ -58,7 +59,10 @@ export class TripSharer {
     return this.lastEta;
   }
 
-  /** Ends the trip because its time ran out (checked by the app's timer, not only on fixes). */
+  /**
+   * Ends the trip because its time ran out, or the clock was set back to before it started
+   * (checked by the app's timer and on each fix, with the device's clock).
+   */
   expire(now: number): AppMessageBody[] {
     if (this.ended || isSessionActive(this.session, now)) return [];
     return [this.end('expired')];
@@ -80,7 +84,9 @@ export class TripSharer {
 
   onFix(fix: LocationFix): AppMessageBody[] {
     if (this.ended) return [];
-    if (!isSessionActive(this.session, fix.timestamp)) return [this.end('expired')];
+    // Only the end is checked against the fix's time: an old fix the OS hands over late must not
+    // end a trip that just started. A clock set back to before the start is caught by `expire`.
+    if (this.session.endedAt !== undefined || fix.timestamp >= this.session.expiresAt) return [this.end('expired')];
 
     if (this.session.destination && distanceM(fix, this.session.destination) <= this.arrivalRadiusM) {
       return [this.end('arrived')];
@@ -102,12 +108,13 @@ export class TripSharer {
     }
 
     if (this.session.level === 'precise') {
-      if (fix.timestamp - this.lastPointAt >= this.preciseIntervalMs) {
+      // `elapsedMs`: after the clock was set back, pacing starts over instead of waiting for it to catch up.
+      if (elapsedMs(this.lastPointAt, fix.timestamp) >= this.preciseIntervalMs) {
         this.lastPointAt = fix.timestamp;
         update.point = {
           lat: fix.lat,
           lon: fix.lon,
-          accuracyM: Math.min(fix.accuracyM ?? 50, 10_000),
+          accuracyM: Math.min(Math.max(fix.accuracyM ?? 50, 0), 10_000),
         };
         changed = true;
       }

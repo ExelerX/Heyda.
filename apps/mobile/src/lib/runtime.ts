@@ -15,6 +15,7 @@ import {
   type ChatEntry,
   type ContactKey,
   type ContactStatus,
+  type LinkStatus,
   type LocationNeeds,
   type NodeState,
   type Place,
@@ -86,6 +87,8 @@ export interface Snapshot {
   dndActive: boolean;
   dndEndsAt: number | undefined;
   locationNeeds: LocationNeeds;
+  /** Linking a new device from here: waiting for it, or the 6 digits to compare. */
+  linkStatus: LinkStatus | undefined;
 }
 
 /** Hooks the platform layer (location, geofences) sets when a runtime is created. */
@@ -263,6 +266,10 @@ export class AppRuntime {
           if (!this.isDemo) this.hooks.onLocationNeeds(e.needs);
           this.changed(false);
           break;
+        case 'link':
+          // Only in memory: nothing to save.
+          this.changed(false);
+          break;
         case 'contact.added':
           break;
       }
@@ -366,6 +373,7 @@ export class AppRuntime {
         dndActive: this.node.isDndActive(),
         dndEndsAt: this.node.dndEndsAt(),
         locationNeeds: this.node.locationNeeds(),
+        linkStatus: this.node.linkStatus,
       };
     }
     return this.snapshotCache;
@@ -502,9 +510,21 @@ export class AppRuntime {
     return hex;
   }
 
-  async linkDevice(code: string): Promise<void> {
+  /** Starts linking the new device that shows this code. The digits then appear in `linkStatus`. */
+  async startLink(code: string): Promise<void> {
     if (this.isDemo) throw new Error('Im Demo-Modus kann kein Gerät verbunden werden.');
-    await this.node.sendLink(code, await this.secretKeyHex());
+    await this.node.startLink(code);
+  }
+
+  /** The digits matched: sends the account. The account key is read only now. */
+  async confirmLink(): Promise<void> {
+    if (this.isDemo) throw new Error('Im Demo-Modus kann kein Gerät verbunden werden.');
+    if (this.node.linkStatus?.phase !== 'compare') throw new Error('Vergleiche zuerst die Zahlen auf beiden Geräten.');
+    await this.node.confirmLink(await this.secretKeyHex());
+  }
+
+  cancelLink(): void {
+    this.node.cancelLink();
   }
 
   /** A password-protected file with the account and settings, for moving to a new phone. */

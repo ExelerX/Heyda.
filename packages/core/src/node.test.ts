@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { describe, expect, it, vi } from 'vitest';
 import type { Rule } from './automation/schema';
 import { BUILTIN_TEMPLATES, instantiateTemplate } from './automation/templates';
-import { SocialNode, type NodeEvent } from './node';
+import { SocialNode, TTL, type NodeEvent } from './node';
 import { createInitialState, type Alert, type NodeState } from './state';
-import { encodeLinkInvite } from './sync/link';
-import { createLinkedState, LinkReceiver } from './sync/receiver';
+import { composeMessage } from './protocol/compose';
+import { encodeLinkInvite, linkCommitment } from './sync/link';
+import { createLinkedState, LinkReceiver, type LinkPayload } from './sync/receiver';
+import { base64urlEncode } from './util/base64url';
 import { MemoryNetwork, MemoryTransport } from './transport/memory';
 import type { AppMessage } from './protocol/messages';
 import type { SendOptions } from './transport/transport';
@@ -619,21 +622,18 @@ describe('SocialNode: offline and own devices', () => {
     await w.pair(lisa, max);
 
     // The new device shows its code and listens on a one-time key.
-    const invite = { tempKey: TEMP, relays: RELAY, nonce: 'n'.repeat(20), expiresAt: w.now() + 600_000 };
-    const temp = w.net.createTransport(TEMP, w.now);
-    const receiver = new LinkReceiver(invite, (s) => (s === LISA_SECRET ? LISA : 'x'));
-    let payload: ReturnType<LinkReceiver['handle']>;
-    temp.onMessage((m) => (payload = receiver.handle(m, w.now()) ?? payload));
-    await temp.start();
-
-    const code = encodeLinkInvite(invite);
-    expect(lisa.previewLink(code)).toEqual({ ok: true, code: expect.stringMatching(/^\d{3} \d{3}$/) });
-    await lisa.sendLink(code, LISA_SECRET);
+    const n = await newDevice(w);
+    await lisa.startLink(n.code);
     await flush();
-    expect(payload!.accountKey).toBe(LISA);
+    expect(n.digits).toMatch(/^\d{3} \d{3}$/);
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: n.invite.expiresAt });
+    await lisa.confirmLink(LISA_SECRET);
+    await flush();
+    expect(n.payload!.accountKey).toBe(LISA);
+    expect(lisa.linkStatus).toBeUndefined();
 
     const desktop = w.make(LISA, 'Lisa', {
-      initial: createLinkedState(payload!, { deviceId: 'dev-desktop-1', deviceName: 'PC' }, w.now()),
+      initial: createLinkedState(n.payload!, { deviceId: 'dev-desktop-1', deviceName: 'PC' }, w.now()),
     });
     await desktop.start();
     expect(desktop.getState().contacts.map((c) => c.name)).toEqual(['Max']);
@@ -658,15 +658,239 @@ describe('SocialNode: offline and own devices', () => {
 
   it('refuses a linked account that does not belong to the sender', async () => {
     const w = world();
-    const invite = { tempKey: TEMP, relays: RELAY, nonce: 'n'.repeat(20), expiresAt: w.now() + 600_000 };
-    const receiver = new LinkReceiver(invite, () => MAX); // the secret belongs to Max, not to the sender
+    const n = await newDevice(w, { publicKeyOf: () => MAX }); // the secret belongs to Max, not to the sender
     const mallory = w.make(MALLORY, 'Mallory');
-    const temp = w.net.createTransport(TEMP, w.now);
-    let got: unknown;
-    temp.onMessage((m) => (got = receiver.handle(m, w.now()) ?? got));
-    await temp.start();
-    await mallory.sendLink(encodeLinkInvite(invite), 'b'.repeat(64));
+    await mallory.start();
+    await mallory.startLink(n.code);
     await flush();
-    expect(got).toBeUndefined();
+    await mallory.confirmLink('b'.repeat(64));
+    await flush();
+    expect(n.payload).toBeUndefined();
+  });
+});
+
+/** The new device: shows a code, answers the first hello with its reveal, collects the account. */
+async function newDevice(
+  w: ReturnType<typeof world>,
+  opts: { tempKey?: string; secret?: Uint8Array; nonce?: string; publicKeyOf?: (secretKeyHex: string) => string } = {},
+) {
+  const secret = opts.secret ?? new Uint8Array(32).fill(7);
+  const invite = {
+    tempKey: opts.tempKey ?? TEMP,
+    relays: RELAY,
+    nonce: opts.nonce ?? 'n'.repeat(20),
+    expiresAt: w.now() + 600_000,
+    commit: linkCommitment(secret),
+  };
+  const transport = w.net.createTransport(invite.tempKey, w.now);
+  const receiver = new LinkReceiver(invite, secret, opts.publicKeyOf ?? ((s) => (s === LISA_SECRET ? LISA : 'x')));
+  const out = {
+    invite,
+    secret,
+    code: encodeLinkInvite(invite),
+    transport,
+    receiver,
+    digits: undefined as string | undefined,
+    payload: undefined as LinkPayload | undefined,
+  };
+  transport.onMessage((m) => {
+    const step = receiver.handle(m, w.now());
+    if (step?.type === 'reveal') {
+      out.digits = step.code;
+      void transport.send(step.to, composeMessage(step.message, w.now()), { ttlSeconds: TTL.link, relays: step.relays });
+    } else if (step?.type === 'payload') {
+      out.payload = step.payload;
+    }
+  });
+  await transport.start();
+  return out;
+}
+
+/** Makes every "random" byte predictable (and still distinct), so a test can fix all seeds. */
+function seededRandom(seed: string) {
+  let counter = 0;
+  const fill = ((array: ArrayBufferView) => {
+    const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+    for (let off = 0; off < bytes.length; off += 32) {
+      const block = sha256(new TextEncoder().encode(`${seed}:${counter++}`));
+      bytes.set(block.subarray(0, Math.min(32, bytes.length - off)), off);
+    }
+    return array;
+  }) as typeof globalThis.crypto.getRandomValues;
+  return vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(fill);
+}
+
+describe('SocialNode: linking a device with compared digits', () => {
+  it('shows nothing to compare until the new device revealed its secret, then the same digits on both', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const evs = events(lisa);
+    const n = await newDevice(w);
+    // Hold the reveal back to see the waiting phase.
+    n.transport.running = false;
+    await lisa.startLink(n.code);
+    expect(lisa.linkStatus).toEqual({ phase: 'waiting', expiresAt: n.invite.expiresAt });
+    const hello = w.net.log.find((e) => e.message.type === 'link.hello');
+    expect(hello?.from).toBe(LISA);
+    expect(hello?.to).toBe(TEMP);
+    expect(hello?.options).toEqual({ ttlSeconds: TTL.link, relays: RELAY });
+    expect(hello?.message).toMatchObject({ nonce: n.invite.nonce, relays: RELAY });
+    expect(n.digits).toBeUndefined();
+
+    await n.transport.start();
+    await flush();
+    expect(n.receiver.peerKey).toBe(LISA);
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: n.invite.expiresAt });
+    expect(evs.filter((e) => e.type === 'link').map((e) => e.type === 'link' && e.status?.phase)).toEqual(['waiting', 'compare']);
+  });
+
+  it('turns away codes from the old version and broken codes', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    await expect(lisa.startLink('heyda-link:1:eyJ0IjoiYSJ9')).rejects.toThrow('Dieser Code ist von einer älteren Version. Aktualisiere Heyda. auf beiden Geräten.');
+    await expect(lisa.startLink('heyda-link:2:%%%')).rejects.toThrow('Der Code ist beschädigt.');
+    expect(lisa.linkStatus).toBeUndefined();
+    expect(w.net.log.filter((e) => e.message.type === 'link.hello')).toEqual([]);
+  });
+
+  it('stops when the reveal does not open the commitment in the code', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const n = await newDevice(w);
+    n.transport.running = false; // the new device stays silent; we answer by hand
+    await lisa.startLink(n.code);
+    await n.transport.send(LISA, composeMessage({ type: 'link.reveal', nonce: n.invite.nonce, rN: base64urlEncode(new Uint8Array(32).fill(1)) }, w.now()));
+    await flush();
+    expect(lisa.linkStatus).toBeUndefined();
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+    expect(w.net.log.filter((e) => e.message.type === 'xfer.chunk')).toEqual([]);
+  });
+
+  it('ignores reveals from strangers, for another code, or a second time', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const n = await newDevice(w);
+    n.transport.running = false;
+    await lisa.startLink(n.code);
+    const reveal = (nonce: string) => composeMessage({ type: 'link.reveal', nonce, rN: base64urlEncode(n.secret) }, w.now());
+
+    // Mallory knows everything but cannot send from the one-time key.
+    const mallory = w.net.createTransport(MALLORY, w.now);
+    expect(lisa.acceptsMessage(MALLORY, reveal(n.invite.nonce))).toBe(false);
+    await mallory.send(LISA, reveal(n.invite.nonce));
+    // The one-time key, but for another code.
+    expect(lisa.acceptsMessage(TEMP, reveal('m'.repeat(20)))).toBe(false);
+    await n.transport.send(LISA, reveal('m'.repeat(20)));
+    await flush();
+    expect(lisa.linkStatus?.phase).toBe('waiting');
+
+    // The one-time key may not use the opening to get anything else in.
+    expect(lisa.acceptsMessage(TEMP, composeMessage({ type: 'chat.text', text: 'hi' }, w.now()))).toBe(false);
+    expect(lisa.acceptsMessage(TEMP, composeMessage({ type: 'link.hello', nonce: n.invite.nonce, rE: base64urlEncode(n.secret), relays: RELAY }, w.now()))).toBe(false);
+
+    expect(lisa.acceptsMessage(TEMP, reveal(n.invite.nonce))).toBe(true);
+    await n.transport.send(LISA, reveal(n.invite.nonce));
+    await flush();
+    expect(lisa.linkStatus?.phase).toBe('compare');
+    const code = lisa.linkStatus?.phase === 'compare' ? lisa.linkStatus.code : '';
+    // Once compared, no further reveal is taken (not even a correct one).
+    expect(lisa.acceptsMessage(TEMP, reveal(n.invite.nonce))).toBe(false);
+    await n.transport.send(LISA, reveal(n.invite.nonce));
+    await flush();
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code, expiresAt: n.invite.expiresAt });
+  });
+
+  it('refuses to send the account before the digits were compared', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+    const n = await newDevice(w);
+    n.transport.running = false;
+    await lisa.startLink(n.code);
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+    expect(w.net.log.filter((e) => e.message.type === 'xfer.chunk')).toEqual([]);
+    await n.transport.start();
+    await flush();
+    await lisa.confirmLink(LISA_SECRET);
+    await flush();
+    expect(n.payload?.accountKey).toBe(LISA);
+    // Only once.
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+  });
+
+  it('keeps one session at a time and forgets it on cancel or expiry', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const first = await newDevice(w);
+    first.transport.running = false;
+    await lisa.startLink(first.code);
+    const second = await newDevice(w, { tempKey: MIA, nonce: 'o'.repeat(20) });
+    second.transport.running = false;
+    await lisa.startLink(second.code);
+    // The first device's reveal no longer counts.
+    await first.transport.start();
+    await flush();
+    expect(lisa.linkStatus).toEqual({ phase: 'waiting', expiresAt: second.invite.expiresAt });
+
+    lisa.cancelLink();
+    expect(lisa.linkStatus).toBeUndefined();
+    await second.transport.start();
+    await flush();
+    expect(lisa.linkStatus).toBeUndefined();
+
+    const third = await newDevice(w, { tempKey: '6'.repeat(64), nonce: 'p'.repeat(20) });
+    third.transport.running = false;
+    await lisa.startLink(third.code);
+    const evs = events(lisa);
+    w.tick(600_001);
+    expect(lisa.linkStatus).toBeUndefined();
+    await lisa.tick();
+    expect(evs.filter((e) => e.type === 'link')).toEqual([{ type: 'link', status: undefined }]);
+    await third.transport.start();
+    await flush();
+    expect(lisa.linkStatus).toBeUndefined();
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+  });
+
+  it('a swapped code gives the attacker one guess at the digits, which fails for fixed seeds', async () => {
+    const random = seededRandom('swap');
+    try {
+      const w = world();
+      const lisa = w.make(LISA, 'Lisa');
+      await lisa.start();
+      // The real new device shows its code; Mallory intercepts it and hands Lisa his own instead.
+      const real = await newDevice(w, { secret: new Uint8Array(32).fill(21) });
+      const fake = await newDevice(w, { tempKey: MALLORY, nonce: 'm'.repeat(20), secret: new Uint8Array(32).fill(22) });
+      await lisa.startLink(fake.code);
+      await flush();
+      const lisaCode = lisa.linkStatus?.phase === 'compare' ? lisa.linkStatus.code : undefined;
+      expect(lisaCode).toBe(fake.digits);
+
+      // Mallory now knows Lisa's digits and tries to get the real device to show the same.
+      // He must send his share before he learns the real device's secret ...
+      const mallory = w.net.createTransport('7'.repeat(64), w.now);
+      await mallory.start();
+      const hello = (i: number) =>
+        composeMessage({ type: 'link.hello', nonce: real.invite.nonce, rE: base64urlEncode(new Uint8Array(32).fill(i)), relays: RELAY }, w.now());
+      await mallory.send(TEMP, hello(1));
+      await flush();
+      expect(real.receiver.peerKey).toBe('7'.repeat(64));
+      expect(real.digits).toMatch(/^\d{3} \d{3}$/);
+      expect(real.digits).not.toBe(lisaCode);
+      // ... and gets no second try: the real device answers only the first hello.
+      const shown = real.digits;
+      for (let i = 2; i < 50; i++) await mallory.send(TEMP, hello(i));
+      await flush();
+      expect(real.digits).toBe(shown);
+      expect(w.net.log.filter((e) => e.from === TEMP && e.message.type === 'link.reveal')).toHaveLength(1);
+    } finally {
+      random.mockRestore();
+    }
   });
 });

@@ -1,7 +1,9 @@
 import { distanceM } from '../geo/distance';
+import { CLOCK_TOLERANCE_MS, elapsedMs } from '../geo/fix';
 import type { LocationFix } from '../geo/types';
 import { CoarseLocator, DEFAULT_CELL_M } from '../privacy/coarse-grid';
 import type { Cell, Point } from '../protocol/messages';
+import type { LiveShare } from '../state';
 
 export interface LiveCadence {
   /** Precise: send after moving this far ... */
@@ -29,6 +31,16 @@ export const SOS_CADENCE: LiveCadence = {
 };
 
 /**
+ * Whether a live share still runs at `now`. One with an end also counts as over while `now` lies
+ * before its start: the clock was set back, and waiting for the end could then take far longer
+ * than the share was meant to last. An open-ended share runs until it is stopped.
+ */
+export function isLiveShareActive(share: Pick<LiveShare, 'startedAt' | 'expiresAt'>, now: number): boolean {
+  if (share.expiresAt == null) return true;
+  return now < share.expiresAt && now >= share.startedAt - CLOCK_TOLERANCE_MS;
+}
+
+/**
  * Decides, per location fix, whether a live-location update is due. Sends little:
  * on movement or a slow heartbeat, never on every fix.
  */
@@ -51,11 +63,13 @@ export class LiveTracker {
     this.lastCellAt = -Infinity;
   }
 
+  /** Pacing uses `elapsedMs`: after the clock was set back it starts over instead of waiting for it to catch up. */
   precise(fix: LocationFix): Point | undefined {
     const last = this.lastPoint;
     const at = fix.timestamp;
+    if (!Number.isFinite(at)) return undefined;
     if (last) {
-      const since = at - last.at;
+      const since = elapsedMs(last.at, at);
       if (since < this.cadence.minIntervalMs) return undefined;
       if (since < this.cadence.heartbeatMs && distanceM(last, fix) < this.cadence.minMoveM) return undefined;
     }
@@ -64,10 +78,11 @@ export class LiveTracker {
   }
 
   cell(fix: LocationFix): Cell | undefined {
+    if (!Number.isFinite(fix.timestamp)) return undefined;
     const changed = this.coarse.update(fix);
     const current = this.coarse.cell;
     if (!current) return undefined;
-    if (!changed && fix.timestamp - this.lastCellAt < this.cadence.coarseHeartbeatMs) return undefined;
+    if (!changed && elapsedMs(this.lastCellAt, fix.timestamp) < this.cadence.coarseHeartbeatMs) return undefined;
     this.lastCellAt = fix.timestamp;
     return { lat: current.lat, lon: current.lon, cellM: current.cellM };
   }
