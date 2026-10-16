@@ -71,9 +71,14 @@ export function isAppUrl(raw: string): boolean {
   );
 }
 
-/** Only notifications are granted, and only to the app's own origin. */
+/**
+ * Granted only to the app's own origin: notifications, and the clipboard for the "Einfügen" and
+ * "Kopieren" buttons (pairing and linking codes; Chromium still requires a click to read it).
+ */
+const ALLOWED_PERMISSIONS: ReadonlySet<string> = new Set(['notifications', 'clipboard-read', 'clipboard-sanitized-write']);
+
 export function isPermissionAllowed(permission: string, requestingUrl: string): boolean {
-  return permission === 'notifications' && isAppUrl(requestingUrl);
+  return ALLOWED_PERMISSIONS.has(permission) && isAppUrl(requestingUrl);
 }
 
 // ---------------------------------------------------------------------------------------------

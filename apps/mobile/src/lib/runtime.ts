@@ -10,6 +10,7 @@ import {
   randomId,
   safetyNumber,
   type Alarm,
+  type BackupContents,
   type Alert,
   type ChatEntry,
   type ContactKey,
@@ -27,7 +28,7 @@ import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@heyda/transpor
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
 import { DEMO_KEYS, startDemoFriends } from './demo';
-import { cancelAlarm, deliverAlert, scheduleAlarm, setBadge, setOpenThread as setNotificationThread } from './notifications';
+import { cancelAlarm, deliverAlert, scheduleAlarm, setBadge, setOpenThread as setNotificationThread, showToast } from './notifications';
 import { desktop, deviceLabel, isBrowserPreview, isDesktop } from './platform';
 import type { Appearance } from './theme';
 import { DesktopVault, EncryptedFileVault, MemoryVault, type Vault } from './vault';
@@ -104,7 +105,16 @@ export function onRuntimeCreated(hook: CreatedHook): void {
 }
 
 const MAX_CHAT_PER_THREAD = 500;
+/**
+ * Character budgets for stored chats (UTF-16 units; emoji count double). Messages may be 4000
+ * characters and contacts can create many groups, so without a budget a chatty or hostile
+ * contact could grow the saved file until saving fails. The oldest messages go first.
+ */
+const MAX_CHAT_CHARS_PER_THREAD = 400_000;
+const MAX_CHAT_CHARS_TOTAL = 3_000_000;
 const MAX_ACTIVITY = 300;
+const MAX_ACTIVITY_TITLE = 200;
+const MAX_ACTIVITY_BODY = 600;
 const DATA_FILE = 'app-data';
 const TICK_MS = 20_000;
 
@@ -199,6 +209,8 @@ export class AppRuntime {
   private stopDemo: (() => void) | undefined;
   private openThread: string | undefined;
   private started = false;
+  /** Set by shutdown(): late events and timers must not write over what replaced this instance. */
+  private disposed = false;
   hooks: PlatformHooks = { onLocationNeeds: () => {}, onPlacesChange: () => {}, freshFix: async () => {} };
 
   private constructor(
@@ -224,10 +236,13 @@ export class AppRuntime {
         case 'chat':
           this.appendChat(e.thread, e.entry);
           break;
-        case 'alert':
+        case 'alert': {
+          // On Windows the alarm timer already rang for this watch; the core's overdue check reports it again.
+          const rang = isDesktop && e.alert.id.startsWith('watch:') && this.data.activity.some((a) => a.id === e.alert.id);
           this.addActivity(e.alert);
-          deliverAlert(e.alert);
+          if (!rang) deliverAlert(e.alert);
           break;
+        }
         case 'alarm.schedule':
           this.data.alarms = [...this.data.alarms.filter((a) => a.id !== e.alarm.id), e.alarm].slice(-100);
           void scheduleAlarm(e.alarm, (a) => this.fireDesktopAlarm(a)).catch(() => {});
@@ -519,7 +534,11 @@ export class AppRuntime {
     if (this.started) await this.node.stop().catch(() => {});
     this.started = false;
     if (save) await this.flush();
-    else if (this.saveTimer) clearTimeout(this.saveTimer);
+    // From here on nothing saves any more (also a save scheduled while the node was stopping):
+    // a restore, a link or a wipe may be about to replace the data on disk.
+    this.disposed = true;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
   }
 
   /** Switches between demo and real mode. The caller rebuilds the runtime afterwards. */
@@ -528,7 +547,7 @@ export class AppRuntime {
     this.data.settings = { ...this.data.settings, demo };
     await this.shutdown(false);
     if (!demo) this.removeDemoData();
-    await this.flush();
+    await this.write();
   }
 
   async wipeEverything(): Promise<void> {
@@ -541,6 +560,11 @@ export class AppRuntime {
   async flush(): Promise<void> {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
+    if (this.disposed) return;
+    await this.write();
+  }
+
+  private async write(): Promise<void> {
     this.data.seen = this.seen.snapshot();
     this.data.statuses = this.node.exportStatuses();
     await this.vault.save(DATA_FILE, this.data);
@@ -554,14 +578,23 @@ export class AppRuntime {
   // ---- internals ---------------------------------------------------------------------------
 
   private fireDesktopAlarm(alarm: Alarm): void {
-    if (!this.data.alarms.some((a) => a.id === alarm.id)) return;
+    if (this.disposed || !this.data.alarms.some((a) => a.id === alarm.id && a.at === alarm.at)) return;
+    // Rung once: without this, every restart within 24 h re-arms it with delay 0 and it rings again.
+    this.data.alarms = this.data.alarms.filter((a) => a.id !== alarm.id);
+    // The core's overdue check may have reported this watch a moment earlier; ring only once.
+    const already = this.data.activity.some((a) => a.id === alarm.id);
+    if (already) {
+      this.changed();
+      return;
+    }
     const alert: Alert = { id: alarm.id, at: Date.now(), category: alarm.level === 'alarm' ? 'watch' : 'automation', level: alarm.level, title: alarm.title, body: alarm.body };
     this.addActivity(alert);
     deliverAlert(alert);
   }
 
   private addActivity(alert: Alert): void {
-    this.data.activity = [alert, ...this.data.activity.filter((a) => a.id !== alert.id)].slice(0, MAX_ACTIVITY);
+    const stored = { ...alert, title: clip(alert.title, MAX_ACTIVITY_TITLE), body: clip(alert.body, MAX_ACTIVITY_BODY) };
+    this.data.activity = [stored, ...this.data.activity.filter((a) => a.id !== alert.id)].slice(0, MAX_ACTIVITY);
     this.changed();
   }
 
@@ -592,7 +625,7 @@ export class AppRuntime {
   private appendChat(thread: string, entry: ChatEntry): void {
     const list = this.data.chats[thread] ?? [];
     if (list.some((m) => m.id === entry.id)) return;
-    this.data.chats = { ...this.data.chats, [thread]: [...list, entry].slice(-MAX_CHAT_PER_THREAD) };
+    this.data.chats = trimChats({ ...this.data.chats, [thread]: trimThread([...list, entry].slice(-MAX_CHAT_PER_THREAD)) });
     if (entry.from !== 'me' && thread !== this.openThread) {
       this.data.unread = { ...this.data.unread, [thread]: (this.data.unread[thread] ?? 0) + 1 };
       void setBadge(Object.values(this.data.unread).reduce((n, x) => n + x, 0));
@@ -601,16 +634,30 @@ export class AppRuntime {
   }
 
   private flushSoon(): void {
-    void this.flush().catch(() => {});
+    void this.flush().catch(this.reportSaveError);
   }
+
+  private lastSaveError = 0;
+  /** A failed save must not go unnoticed (full storage, a broken file); at most every 10 minutes. */
+  private reportSaveError = (): void => {
+    const now = Date.now();
+    if (this.disposed || now - this.lastSaveError < 10 * 60_000) return;
+    this.lastSaveError = now;
+    showToast({
+      id: 'save-failed',
+      title: 'Speichern hat nicht geklappt',
+      body: 'Heyda. konnte deine Daten gerade nicht sichern. Ist der Speicher voll? Neue Nachrichten könnten nach einem Neustart fehlen.',
+      level: 'normal',
+    });
+  };
 
   private changed(persist = true): void {
     this.version++;
     this.snapshotCache = undefined;
     for (const l of [...this.listeners]) l();
-    if (persist) {
+    if (persist && !this.disposed) {
       if (this.saveTimer) clearTimeout(this.saveTimer);
-      this.saveTimer = setTimeout(() => void this.flush().catch(() => {}), 500);
+      this.saveTimer = setTimeout(() => void this.flush().catch(this.reportSaveError), 500);
     }
   }
 }
@@ -619,9 +666,17 @@ export class AppRuntime {
 export async function restoreBackup(file: Uint8Array, password: string, onProgress?: (f: number) => void): Promise<{ ok: true } | { ok: false; error: string }> {
   const r = await decryptBackup(file, password, onProgress);
   if (!r.ok) return r;
-  const data = r.contents.data as Partial<Persisted> | undefined;
-  if (!data?.state?.self) return { ok: false, error: 'Die Sicherung enthält keine App-Daten.' };
-  const secret = hexToBytes(r.contents.identity);
+  return restoreBackupContents(r.contents);
+}
+
+/**
+ * Saves already decrypted backup contents as this device's account (no second, slow password
+ * check). Stop the running runtime first and restart it afterwards.
+ */
+export async function restoreBackupContents(contents: BackupContents): Promise<{ ok: true } | { ok: false; error: string }> {
+  const data = contents.data as Partial<Persisted> | undefined;
+  if (!data?.state?.self || !/^[0-9a-f]{64}$/.test(contents.identity)) return { ok: false, error: 'Die Sicherung enthält keine App-Daten.' };
+  const secret = hexToBytes(contents.identity);
   const key = getPublicKey(secret);
   const state = normalizeState({
     ...data.state,
@@ -630,27 +685,90 @@ export async function restoreBackup(file: Uint8Array, password: string, onProgre
   await writeAccount(secret, state, {
     plugins: Array.isArray(data.plugins) ? data.plugins : [],
     settings: { ...DEFAULT_SETTINGS, ...data.settings, onboarded: true, demo: false },
-    chats: data.chats && typeof data.chats === 'object' ? data.chats : {},
+    chats: cleanChats(data.chats),
   });
   secret.fill(0);
   return { ok: true };
+}
+
+/** Keeps only well-formed chat entries from a backup, within the usual limits. */
+function cleanChats(input: unknown): Record<string, ChatEntry[]> {
+  if (!input || typeof input !== 'object') return {};
+  const out: Record<string, ChatEntry[]> = {};
+  for (const [thread, list] of Object.entries(input as Record<string, unknown>).slice(0, 1000)) {
+    if (!/^([0-9a-f]{64}|g:[A-Za-z0-9_-]{1,64})$/.test(thread) || !Array.isArray(list)) continue;
+    const entries = list.filter(
+      (m): m is ChatEntry =>
+        !!m &&
+        typeof m === 'object' &&
+        typeof m.id === 'string' &&
+        typeof m.text === 'string' &&
+        Number.isFinite(m.at) &&
+        (m.from === 'me' || (typeof m.from === 'string' && /^[0-9a-f]{64}$/.test(m.from))) &&
+        (m.kind === 'text' || m.kind === 'ping' || m.kind === 'system'),
+    );
+    if (entries.length) out[thread] = trimThread(entries.slice(-MAX_CHAT_PER_THREAD));
+  }
+  return trimChats(out);
 }
 
 let runtime: Promise<AppRuntime> | undefined;
 
 /** The single runtime, created and started on first use (also from background tasks). */
 export function getRuntime(): Promise<AppRuntime> {
-  runtime ??= AppRuntime.create().then(async (r) => {
+  if (runtime) return runtime;
+  const created = AppRuntime.create().then(async (r) => {
     await r.ensureStarted();
     return r;
   });
-  runtime.catch(() => {
-    runtime = undefined;
+  runtime = created;
+  // Only forget this attempt; a reset may already have put a newer one in its place.
+  created.catch(() => {
+    if (runtime === created) runtime = undefined;
   });
-  return runtime;
+  return created;
 }
 
 /** Drops the instance so the next `getRuntime()` rebuilds it, e.g. after leaving demo mode. */
 export function resetRuntime(): void {
   runtime = undefined;
+}
+
+/** Shortens text for storage without splitting an emoji. */
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max - 1;
+  const code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--;
+  return `${text.slice(0, end)}…`;
+}
+
+function chars(list: ChatEntry[]): number {
+  return list.reduce((n, m) => n + m.text.length, 0);
+}
+
+/** Drops the oldest messages of one chat until it fits its budget (the newest always stays). */
+export function trimThread(list: ChatEntry[]): ChatEntry[] {
+  let total = chars(list);
+  let start = 0;
+  while (total > MAX_CHAT_CHARS_PER_THREAD && start < list.length - 1) total -= list[start++]!.text.length;
+  return start ? list.slice(start) : list;
+}
+
+/** Drops the oldest messages across all chats until everything fits the overall budget. */
+export function trimChats(chats: Record<string, ChatEntry[]>): Record<string, ChatEntry[]> {
+  let total = Object.values(chats).reduce((n, l) => n + chars(l), 0);
+  if (total <= MAX_CHAT_CHARS_TOTAL) return chats;
+  const out = { ...chats };
+  while (total > MAX_CHAT_CHARS_TOTAL) {
+    let oldest: string | undefined;
+    for (const [thread, list] of Object.entries(out)) {
+      if (list.length > 1 && (oldest === undefined || list[0]!.at < out[oldest]![0]!.at)) oldest = thread;
+    }
+    if (oldest === undefined) break;
+    const [dropped, ...rest] = out[oldest]!;
+    out[oldest] = rest;
+    total -= dropped!.text.length;
+  }
+  return out;
 }

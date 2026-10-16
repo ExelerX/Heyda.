@@ -1,3 +1,5 @@
+import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
+import { scryptAsync } from '@noble/hashes/scrypt.js';
 import { describe, expect, it } from 'vitest';
 import { decryptBackup, encryptBackup, type BackupContents } from '../backup/backup';
 import { composeMessage } from '../protocol/compose';
@@ -121,5 +123,23 @@ describe('backup', () => {
     evil[4] = 30; // 2^30 iterations would need gigabytes
     const r = await decryptBackup(evil, 'richtig-langes-passwort');
     expect(r.ok).toBe(false);
+    const slow = file.slice();
+    slow[6] = 4; // more parallel rounds than any app version writes
+    expect((await decryptBackup(slow, 'richtig-langes-passwort')).ok).toBe(false);
+  });
+
+  it('writes p = 3 and still opens older files written with p = 1', async () => {
+    const file = await encryptBackup(contents, 'richtig-langes-passwort', { logN: 14 });
+    expect([...file.slice(4, 7)]).toEqual([14, 8, 3]);
+
+    // A file as the first builds wrote it: same layout, p = 1.
+    const header = file.slice(0, 47);
+    header[6] = 1;
+    const key = await scryptAsync('richtig-langes-passwort', header.slice(7, 23), { N: 2 ** 14, r: 8, p: 1, dkLen: 32 });
+    const sealed = xchacha20poly1305(key, header.slice(23, 47), header).encrypt(new TextEncoder().encode(JSON.stringify(contents)));
+    const old = new Uint8Array(47 + sealed.length);
+    old.set(header, 0);
+    old.set(sealed, 47);
+    expect(await decryptBackup(old, 'richtig-langes-passwort')).toEqual({ ok: true, contents });
   });
 });

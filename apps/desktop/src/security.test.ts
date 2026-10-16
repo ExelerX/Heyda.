@@ -44,11 +44,14 @@ describe('isAppUrl', () => {
 });
 
 describe('isPermissionAllowed', () => {
-  it('grants notifications to the app origin and nothing else', () => {
+  it('grants notifications and the clipboard to the app origin and nothing else', () => {
     expect(isPermissionAllowed('notifications', 'app://heyda')).toBe(true);
     expect(isPermissionAllowed('notifications', 'app://heyda/')).toBe(true);
+    expect(isPermissionAllowed('clipboard-read', 'app://heyda/')).toBe(true);
+    expect(isPermissionAllowed('clipboard-sanitized-write', 'app://heyda/')).toBe(true);
     expect(isPermissionAllowed('notifications', 'https://example.com')).toBe(false);
-    for (const permission of ['media', 'geolocation', 'clipboard-read', 'openExternal', 'hid', 'fullscreen']) {
+    expect(isPermissionAllowed('clipboard-read', 'https://example.com')).toBe(false);
+    for (const permission of ['media', 'geolocation', 'openExternal', 'hid', 'fullscreen', 'clipboard']) {
       expect(isPermissionAllowed(permission, 'app://heyda/')).toBe(false);
     }
   });

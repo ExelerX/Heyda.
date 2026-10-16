@@ -5,7 +5,7 @@ import { View } from 'react-native';
 import { confirm, notice } from '../../lib/confirm';
 import { pickBackupFile } from '../../lib/files';
 import { desktop, isNative } from '../../lib/platform';
-import { restoreBackup } from '../../lib/runtime';
+import { restoreBackupContents } from '../../lib/runtime';
 import { useRestart, useRuntime } from '../../lib/store';
 import { spacing, useTheme } from '../../lib/theme';
 import { Button, Card, T } from '../ui';
@@ -74,8 +74,8 @@ export function RestoreFlow({ warnReplace }: { warnReplace: boolean }) {
       await runtime.shutdown(false);
       stopped = true;
       setPhase('writing');
-      setProgress(0);
-      const r = await restoreBackup(file, password, (f) => setProgress(f));
+      setProgress(1);
+      const r = await restoreBackupContents(check.contents);
       if (!r.ok) {
         // The app restarts with the old data; this screen is rebuilt, so say it in a dialog.
         notice('Wiederherstellen hat nicht geklappt', r.error);

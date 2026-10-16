@@ -31,15 +31,19 @@ export async function beginLinkReceive(): Promise<LinkSession> {
     settle = resolve;
     fail = reject;
   });
+  // The one-time key is useless afterwards; don't leave it in memory.
+  const finish = () => {
+    clearTimeout(timer);
+    void transport.stop().finally(() => temp.fill(0));
+  };
   const timer = setTimeout(() => {
-    void transport.stop();
+    finish();
     fail(new Error('Der Code ist abgelaufen. Starte die Verbindung neu.'));
   }, LINK_TTL_MS + 60_000);
   transport.onMessage((m) => {
     const payload = receiver.handle(m, Date.now());
     if (!payload) return;
-    clearTimeout(timer);
-    void transport.stop();
+    finish();
     settle(payload);
   });
   await transport.start();
@@ -49,9 +53,7 @@ export async function beginLinkReceive(): Promise<LinkSession> {
     expiresAt: invite.expiresAt,
     result,
     cancel: () => {
-      clearTimeout(timer);
-      void transport.stop();
-      temp.fill(0);
+      finish();
       fail(new Error('Abgebrochen.'));
     },
   };

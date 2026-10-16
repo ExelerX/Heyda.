@@ -211,7 +211,7 @@ function PlaceEditor({ place }: { place?: Place }) {
               <Chip key={n} label={n} selected={name === n} onPress={() => setName(n)} />
             ))}
           </Wrap>
-          <T variant="small">Diesen Namen sehen Freunde, die du unten auswählst: „Lisa ist bei Zuhause angekommen“.</T>
+          <T variant="small">{`Diesen Namen sehen Freunde, die du unten auswählst: „${state.self.name.trim() || 'Dein Name'} ist bei ${name.trim() || 'Zuhause'} angekommen“.`}</T>
         </Section>
 
         <Section title="Wo ist der Ort?">

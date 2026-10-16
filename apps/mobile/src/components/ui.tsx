@@ -272,6 +272,8 @@ export function Toggle({ label, detail, value, onChange }: {
         }}
         trackColor={{ true: t.accent, false: t.border }}
         thumbColor="#FFFFFF"
+        // react-native-web colours the "on" thumb separately (not in the native types).
+        {...((Platform.OS === 'web' ? { activeThumbColor: '#FFFFFF' } : {}) as object)}
         accessibilityLabel={label}
       />
     </Row>

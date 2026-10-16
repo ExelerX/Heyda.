@@ -56,6 +56,11 @@ export function onToast(listener: (t: Toast) => void): () => void {
   return () => toastListeners.delete(listener);
 }
 
+/** An in-app banner that is not an alert, e.g. "saving failed". */
+export function showToast(toast: Toast): void {
+  toastListeners.forEach((l) => l(toast));
+}
+
 /** Called when the user taps a notification. */
 export function onNotificationOpen(listener: (alertId: string, data: Record<string, unknown>) => void): () => void {
   openListeners.add(listener);

@@ -28,6 +28,12 @@ class KeepAliveService : HeadlessJsTaskService() {
   private var taskStarted = false
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    if (intent?.action == ACTION_STOP) {
+      // Commands arrive in order, so a start sent just before this one has already called
+      // startForeground(). stopSelf(startId) does nothing if a newer start is still queued.
+      stopSelf(startId)
+      return Service.START_NOT_STICKY
+    }
     val text = textFrom(intent) ?: KeepAlivePrefs.loadText(this)
     // Must happen first: after startForegroundService() Android expects startForeground() within seconds.
     if (!enterForeground(text)) {
@@ -93,6 +99,7 @@ class KeepAliveService : HeadlessJsTaskService() {
     private const val TAG = "HeydaKeepAlive"
     private const val EXTRA_TITLE = "expo.modules.heydabackground.TITLE"
     private const val EXTRA_BODY = "expo.modules.heydabackground.BODY"
+    private const val ACTION_STOP = "expo.modules.heydabackground.STOP"
 
     /** True from a successful startForeground() until onDestroy(). Same process as the module. */
     @Volatile
@@ -125,9 +132,23 @@ class KeepAliveService : HeadlessJsTaskService() {
       }
     }
 
-    /** Stops the service. Safe to call when it is not running. */
+    /**
+     * Stops the service. Safe to call when it is not running.
+     *
+     * Goes through the service's own command queue instead of stopService(): stopping a service
+     * started with startForegroundService() before it reached startForeground() (a quick on/off
+     * toggle) makes Android crash the app. If Android refuses the command (app in the background
+     * and the service not running), stopService() is the fallback; there is nothing to race then.
+     */
     internal fun stop(context: Context) {
-      context.stopService(Intent(context, KeepAliveService::class.java))
+      val intent = Intent(context, KeepAliveService::class.java).setAction(ACTION_STOP)
+      try {
+        context.startService(intent)
+      } catch (e: IllegalStateException) {
+        context.stopService(Intent(context, KeepAliveService::class.java))
+      } catch (e: SecurityException) {
+        context.stopService(Intent(context, KeepAliveService::class.java))
+      }
     }
   }
 }

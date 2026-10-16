@@ -13,7 +13,14 @@ const MAGIC = [0x48, 0x59, 0x42, 0x31]; // "HYB1"
 const HEADER_LEN = 4 + 3 + 16 + 24;
 export const BACKUP_MIN_PASSWORD = 10;
 export const BACKUP_MAX_BYTES = 5 * 1024 * 1024;
+/**
+ * scrypt N = 2^15, r = 8, p = 3: one of OWASP's equivalent recommendations (Password Storage
+ * Cheat Sheet). It needs 32 MiB like p = 1 but three times the work, which phones handle better
+ * than the 128 MiB of N = 2^17. Older files with p = 1 still open.
+ */
 const DEFAULT_LOG_N = 15;
+const DEFAULT_P = 3;
+const MAX_P = 3;
 
 export interface BackupContents {
   format: 'heyda.backup';
@@ -47,10 +54,10 @@ export async function encryptBackup(
   const nonce = randomBytes(24);
   const header = new Uint8Array(HEADER_LEN);
   header.set(MAGIC, 0);
-  header.set([logN, 8, 1], 4);
+  header.set([logN, 8, DEFAULT_P], 4);
   header.set(salt, 7);
   header.set(nonce, 23);
-  const key = await deriveKey(password, salt, logN, 8, 1, options.onProgress);
+  const key = await deriveKey(password, salt, logN, 8, DEFAULT_P, options.onProgress);
   const plain = new TextEncoder().encode(JSON.stringify(contents));
   const sealed = xchacha20poly1305(key, nonce, header).encrypt(plain);
   key.fill(0);
@@ -73,7 +80,7 @@ export async function decryptBackup(
     return { ok: false, error: 'Das ist keine Heyda.-Sicherung.' };
   }
   const [logN, r, p] = [file[4]!, file[5]!, file[6]!];
-  if (logN < 14 || logN > 18 || r !== 8 || p !== 1) return { ok: false, error: 'Unbekanntes Sicherungsformat.' };
+  if (logN < 14 || logN > 18 || r !== 8 || p < 1 || p > MAX_P) return { ok: false, error: 'Unbekanntes Sicherungsformat.' };
   const header = file.subarray(0, HEADER_LEN);
   const salt = file.subarray(7, 23);
   const nonce = file.subarray(23, 47);

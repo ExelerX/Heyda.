@@ -87,7 +87,8 @@ starts the app with `--hidden`.
   `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:;
   font-src 'self' data:; connect-src 'self' wss:; ...`. No `unsafe-eval`: zod v4 probes for `new Function` and falls
   back to its interpreter when blocked (`z.config({ jitless: true })` in the UI avoids the probe).
-- Permissions: only `notifications` for `app://heyda`; everything else (camera, geolocation, clipboard read, HID, ...)
+- Permissions: only `notifications` and the clipboard (`clipboard-read`, `clipboard-sanitized-write`, for the
+  paste/copy buttons of pairing and linking codes) for `app://heyda`; everything else (camera, geolocation, HID, ...)
   is denied. Navigation away from `app://heyda` and new windows are blocked; `https:`, `tel:`, `sms:` and `geo:` links
   open in the system handler after validation, anything else is refused.
 - The `app://` handler rejects encoded slashes and backslashes, dot segments, NUL, Windows-reserved characters and

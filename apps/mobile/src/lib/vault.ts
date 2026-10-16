@@ -184,15 +184,18 @@ export class MemoryVault implements Vault {
     this.data.set(name, JSON.stringify(value));
   }
 
+  // Copies in and out: callers zero the arrays they get once they are done with them.
   async secretKey(): Promise<Uint8Array> {
-    return this.key;
+    return this.key.slice();
   }
 
   async setSecretKey(key: Uint8Array): Promise<void> {
-    this.key = key;
+    this.key = key.slice();
   }
 
   async wipe(): Promise<void> {
     this.data.clear();
+    this.key.fill(0);
+    this.key = randomBytes(32);
   }
 }
