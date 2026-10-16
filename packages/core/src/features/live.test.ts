@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isLiveShareActive, LIVE_CADENCE, LiveTracker } from './live';
+import { isLiveShareActive, isSosLocationActive, LIVE_CADENCE, LiveTracker, SOS_LOCATION_MS } from './live';
 
 const home = { lat: 52.52, lon: 13.405 };
 const north = (meters: number) => ({ lat: home.lat + meters / 111_195, lon: home.lon });
@@ -54,6 +54,15 @@ describe('LiveTracker', () => {
     expect(isLiveShareActive(timed, T + HOUR)).toBe(false);
     expect(isLiveShareActive({ startedAt: T }, T - DAY)).toBe(true);
     expect(isLiveShareActive({ startedAt: T }, T + 30 * DAY)).toBe(true);
+  });
+
+  it('counts SOS location as over after its hour, and before the press that started it', () => {
+    const sos = { locationUntil: T + SOS_LOCATION_MS };
+    expect(isSosLocationActive(sos, T)).toBe(true);
+    expect(isSosLocationActive(sos, T - 30_000)).toBe(true); // small clock correction
+    expect(isSosLocationActive(sos, T - DAY)).toBe(false);
+    expect(isSosLocationActive(sos, T + SOS_LOCATION_MS - 1)).toBe(true);
+    expect(isSosLocationActive(sos, T + SOS_LOCATION_MS)).toBe(false);
   });
 
   it('resends the coarse cell after the clock jumped back', () => {

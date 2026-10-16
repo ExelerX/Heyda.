@@ -57,7 +57,9 @@ Zeit oder wenn du ihn ausschaltest; was gerade läuft, steht immer oben auf dem 
   Schlüsselbund/Keystore (Handy) bzw. in der Windows-Datenschutz-API (PC).
 - **Sicherung:** passwortgeschützt (scrypt + XChaCha20-Poly1305), mindestens 10 Zeichen. Ohne Passwort kann sie
   niemand öffnen, auch wir nicht.
-- **Geräte verbinden:** per QR-Code und 6 Ziffern, die du auf beiden Geräten vergleichst; der Code gilt 15 Min.
+- **Geräte verbinden:** per QR-Code und 6 Ziffern, die du auf beiden Geräten vergleichst und bestätigst. Beide Geräte steuern
+  eine Zufallszahl bei, das neue legt sich vorher fest (Commit-Reveal); ein untergeschobener Code hat so nur einen
+  Versuch mit 1 zu 1 Million. Der Code gilt 10 Min.
 - **Eingaben werden streng geprüft** (zod-Schemas, Größenlimits, Ablaufzeiten, Schutz gegen Wiederholung).
 - **Plugins enthalten keinen Code**, nur Vorlagen. Automationen haben feste Limits (höchstens 20 Auslösungen pro
   Stunde) und können das Teilen nur auf Stufe „Ankunftszeit“ starten.

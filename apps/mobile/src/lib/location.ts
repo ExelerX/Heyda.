@@ -6,7 +6,7 @@ import { getRuntime } from './runtime';
 
 /**
  * Bridges the OS location services to the SocialNode. The exact position only ever
- * goes into `node.onLocationFix`; what leaves the phone is decided by the core's
+ * goes into `node.onLocationFixes`; what leaves the phone is decided by the core's
  * privacy gate, never here.
  */
 export const GEOFENCE_TASK = 'heyda-geofence';
@@ -39,7 +39,8 @@ function toFix(l: Location.LocationObject): LocationFix {
 
 async function feed(locations: Location.LocationObject[]): Promise<void> {
   const runtime = await getRuntime();
-  for (const l of locations) await runtime.node.onLocationFix(toFix(l));
+  // As one batch: if the fixes are dated ahead of the phone's clock, they keep their order and spacing.
+  await runtime.node.onLocationFixes(locations.map(toFix));
   await runtime.flushIfDirty();
 }
 

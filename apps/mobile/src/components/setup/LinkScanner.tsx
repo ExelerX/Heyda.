@@ -78,7 +78,7 @@ export function LinkScanner({ onCode, error }: { onCode: (text: string) => void;
         <Field
           value={pasted}
           onChangeText={(v) => setPasted(v.slice(0, CODE_MAX))}
-          placeholder="heyda-link:1:…"
+          placeholder="heyda-link:2:…"
           autoCapitalize="none"
           mono
           multiline

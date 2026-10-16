@@ -45,6 +45,8 @@ export default function Devices() {
   const [flow, setFlow] = useState<Flow>({ step: 'idle' });
   const others = state.devices.filter((d) => d.deviceId !== state.self.deviceId);
   const busyRef = useRef(false);
+  // Counts link attempts, so a slow start that was cancelled meanwhile changes nothing.
+  const attemptRef = useRef(0);
   const now = useTick(1000);
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
@@ -63,6 +65,15 @@ export default function Devices() {
     }
   }, [flow, linkStatus, now]);
 
+  // A hello whose send failed may have arrived anyway (the node keeps the session for the same
+  // code): if the new device answers while the scanner shows the error, go on to the digits.
+  useEffect(() => {
+    if (flow.step === 'scan' && linkStatus?.phase === 'compare') setFlow({ step: 'linking', expiresAt: linkStatus.expiresAt });
+  }, [flow.step, linkStatus]);
+
+  // The digits to compare, once the new device answered (kept while my account is being sent).
+  const compareCode = flow.step === 'sending' ? flow.code : flow.step === 'linking' && linkStatus?.phase === 'compare' ? linkStatus.code : undefined;
+
   // After sending: the new device announces itself, then it shows up in the list.
   const newDevice = flow.step === 'sent' && others.length > flow.known ? others[others.length - 1] : undefined;
   useEffect(() => {
@@ -74,15 +85,18 @@ export default function Devices() {
   async function check(text: string) {
     if (busyRef.current) return;
     busyRef.current = true;
+    const attempt = ++attemptRef.current;
     setFlow({ step: 'starting' });
     try {
       await runtime.startLink(text.trim());
+      // Cancelled meanwhile: the node already forgot this link.
+      if (attempt !== attemptRef.current) return;
       const status = runtime.node.linkStatus;
       setFlow(status ? { step: 'linking', expiresAt: status.expiresAt } : { step: 'failed', error: BAD_ANSWER });
     } catch (e) {
-      setFlow({ step: 'scan', error: errorText(e, 'Der Code passt nicht.') });
+      if (attempt === attemptRef.current) setFlow({ step: 'scan', error: errorText(e, 'Der Code passt nicht.') });
     } finally {
-      busyRef.current = false;
+      if (attempt === attemptRef.current) busyRef.current = false;
     }
   }
 
@@ -106,9 +120,16 @@ export default function Devices() {
     }
   }
 
-  function cancelLink(afterCompare: boolean) {
+  /** Ends any link in progress (and wipes its secret), then shows `next`. */
+  function reset(next: Flow) {
+    attemptRef.current++;
+    busyRef.current = false;
     runtime.cancelLink();
-    setFlow({ step: 'idle' });
+    setFlow(next);
+  }
+
+  function cancelLink(afterCompare: boolean) {
+    reset({ step: 'idle' });
     if (afterCompare) {
       notice('Abgebrochen', 'Gut so. Wenn die Zahlen nicht stimmen, könnte ein fremder Code dahinterstecken. Starte auf dem neuen Gerät eine neue Verbindung.');
     }
@@ -156,15 +177,15 @@ export default function Devices() {
               <Step n={1}>Installiere Heyda. auf dem neuen Gerät und wähle dort „Ich habe Heyda. schon auf einem anderen Gerät“.</Step>
               <Step n={2}>Das neue Gerät zeigt einen QR-Code.</Step>
               <Step n={3}>Scanne den Code hier oder füge den Code-Text ein.</Step>
-              <Step n={4}>Dann zeigen beide Geräte 6 Zahlen. Stimmen sie überein, bestätigst du hier.</Step>
+              <Step n={4}>Dann zeigen beide Geräte 6 Zahlen. Stimmen sie überein, bestätigst du auf beiden Geräten.</Step>
               <Button title="Neues Gerät verbinden" icon="🔗" onPress={() => setFlow({ step: 'scan' })} />
             </Card>
           ) : flow.step === 'scan' ? (
             <Card style={{ gap: spacing.md }}>
               <LinkScanner onCode={check} error={flow.error} />
-              <Button title="Abbrechen" kind="ghost" compact onPress={() => setFlow({ step: 'idle' })} />
+              <Button title="Abbrechen" kind="ghost" compact onPress={() => reset({ step: 'idle' })} />
             </Card>
-          ) : flow.step === 'starting' || (flow.step === 'linking' && linkStatus?.phase !== 'compare') ? (
+          ) : (flow.step === 'starting' || flow.step === 'linking') && compareCode === undefined ? (
             <Card style={{ gap: spacing.md, alignItems: 'center' }}>
               <ActivityIndicator color={t.accent} accessibilityElementsHidden importantForAccessibility="no" />
               <View accessible accessibilityLiveRegion="polite" style={{ gap: spacing.xs, alignItems: 'center' }}>
@@ -176,14 +197,16 @@ export default function Devices() {
                 </T>
               </View>
               {flow.step === 'linking' && <T variant="small">{`Gültig noch ${countdown(flow.expiresAt - now)}`}</T>}
-              <Button title="Abbrechen" kind="ghost" compact disabled={flow.step === 'starting'} onPress={() => cancelLink(false)} />
+              <Button title="Abbrechen" kind="ghost" compact onPress={() => cancelLink(false)} />
             </Card>
-          ) : (flow.step === 'linking' && linkStatus?.phase === 'compare') || flow.step === 'sending' ? (
+          ) : (flow.step === 'linking' || flow.step === 'sending') && compareCode !== undefined ? (
             <Card style={{ gap: spacing.md }}>
-              <T variant="h2" style={{ textAlign: 'center' }}>
-                Zeigt das neue Gerät genau diese Zahlen?
-              </T>
-              <Digits value={flow.step === 'sending' ? flow.code : linkStatus?.phase === 'compare' ? linkStatus.code : ''} label="Vergleichszahlen" />
+              <View accessibilityLiveRegion="polite" style={{ gap: spacing.md }}>
+                <T variant="h2" style={{ textAlign: 'center' }}>
+                  Zeigt das neue Gerät genau diese Zahlen?
+                </T>
+                <Digits value={compareCode} label="Vergleichszahlen" />
+              </View>
               <T variant="small" style={{ textAlign: 'center' }}>{`Gültig noch ${countdown(flow.expiresAt - now)}`}</T>
               <Bullet icon="🔐">
                 Nur wenn sie gleich sind, ist es wirklich dein neues Gerät. Es bekommt dein ganzes Konto und kann danach in deinem Namen schreiben. Verbinde nur Geräte, die dir gehören.
@@ -193,7 +216,7 @@ export default function Devices() {
                 icon="✅"
                 busy={flow.step === 'sending'}
                 onPress={() => {
-                  if (flow.step === 'linking' && linkStatus?.phase === 'compare') void send(linkStatus.code, flow.expiresAt);
+                  if (flow.step === 'linking') void send(compareCode, flow.expiresAt);
                 }}
               />
               <Button title="Abbrechen" kind="secondary" disabled={flow.step === 'sending'} onPress={() => cancelLink(true)} />
@@ -206,20 +229,20 @@ export default function Devices() {
                 </Banner>
               ) : (
                 <Banner tone="success" title="Gesendet">
-                  Dein Konto ist verschlüsselt unterwegs. Bestätige auf dem neuen Gerät, dass es dein Konto ist. Danach taucht es hier in der Liste auf.
+                  Dein Konto ist verschlüsselt unterwegs. Bestätige auch auf dem neuen Gerät die Zahlen und dass es dein Konto ist. Danach taucht es hier in der Liste auf.
                 </Banner>
               )}
               <Button title="Fertig" kind="secondary" compact onPress={() => setFlow({ step: 'idle' })} />
             </Card>
-          ) : (
+          ) : flow.step === 'failed' ? (
             <Card style={{ gap: spacing.md }}>
               <Banner tone="danger" title="Hat nicht geklappt">
                 {`${flow.error} Lass auf dem neuen Gerät einen neuen Code anzeigen und versuch es nochmal.`}
               </Banner>
-              <Button title="Nochmal scannen" onPress={() => setFlow({ step: 'scan' })} />
-              <Button title="Abbrechen" kind="ghost" compact onPress={() => setFlow({ step: 'idle' })} />
+              <Button title="Nochmal scannen" onPress={() => reset({ step: 'scan' })} />
+              <Button title="Abbrechen" kind="ghost" compact onPress={() => reset({ step: 'idle' })} />
             </Card>
-          )}
+          ) : null}
         </Section>
 
         <Section title="Gerät verloren?">

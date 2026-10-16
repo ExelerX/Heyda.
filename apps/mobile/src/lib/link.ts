@@ -14,7 +14,12 @@ export interface LinkSession {
    * device's reveal, because before that there is nothing to compare. Never rejects.
    */
   digits: Promise<string>;
-  /** Resolves with the account once the other device sent it. */
+  /**
+   * The person saw the same digits on the other device and tapped "Zahlen stimmen überein"
+   * here. Without this, an account that arrives is never handed out (see core `sync/link.ts`).
+   */
+  confirmDigits: () => void;
+  /** Resolves with the account once the other device sent it and the digits were confirmed here. */
   result: Promise<LinkPayload>;
   cancel: () => void;
 }
@@ -38,6 +43,8 @@ export async function beginLinkReceive(): Promise<LinkSession> {
   });
   let showDigits: (d: string) => void = () => {};
   const digits = new Promise<string>((resolve) => (showDigits = resolve));
+  // Set once a reveal went out and the digits are on screen.
+  let shown = false;
   let done = false;
   // The one-time key and the secret are useless afterwards; don't leave them in memory.
   const finish = () => {
@@ -60,13 +67,17 @@ export async function beginLinkReceive(): Promise<LinkSession> {
       settle(step.payload);
       return;
     }
+    // The first answer, or the same one again when the other device repeated its hello.
     transport.send(step.to, composeMessage(step.message), { ttlSeconds: TTL.link, relays: step.relays }).then(
       () => {
-        if (!done) showDigits(step.code);
+        if (done) return;
+        shown = true;
+        showDigits(step.code);
       },
       () => {
+        // A repeat that failed changes nothing: the first answer went out.
+        if (done || shown) return;
         // The other device waits for an answer that never comes; only a new code helps.
-        if (done) return;
         finish();
         fail(new Error('Keine Verbindung zu deinem anderen Gerät. Prüfe dein Internet und starte neu.'));
       },
@@ -82,6 +93,13 @@ export async function beginLinkReceive(): Promise<LinkSession> {
     code: encodeLinkInvite(invite),
     expiresAt: invite.expiresAt,
     digits,
+    confirmDigits: () => {
+      if (done || !shown) return;
+      const step = receiver.confirmCode();
+      if (step?.type !== 'payload') return;
+      finish();
+      settle(step.payload);
+    },
     result,
     cancel: () => {
       finish();

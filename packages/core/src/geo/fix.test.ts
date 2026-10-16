@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLOCK_TOLERANCE_MS, elapsedMs, normalizeFix } from './fix';
+import { CLOCK_TOLERANCE_MS, elapsedMs, normalizeFix, normalizeFixes } from './fix';
 
 const NOW = 1_700_000_000_000;
 const HOUR = 3600_000;
@@ -58,6 +58,38 @@ describe('normalizeFix', () => {
     expect(normalizeFix({ ...ok, accuracyM: null }, NOW)).toStrictEqual({ lat: ok.lat, lon: ok.lon, timestamp: ok.timestamp, speedMps: 3 });
     // A negative speed means "unknown" and is left for the ETA estimator to skip.
     expect(normalizeFix({ ...ok, speedMps: -1 }, NOW)?.speedMps).toBe(-1);
+  });
+});
+
+describe('normalizeFixes', () => {
+  const at = (timestamp: number, lat = ok.lat) => ({ ...ok, lat, timestamp });
+
+  it('passes an ordinary batch through as it is', () => {
+    const batch = [at(NOW - 3 * 60_000), at(NOW - 60_000), at(NOW + 30_000)];
+    const out = normalizeFixes(batch, NOW);
+    expect(out).toHaveLength(3);
+    out.forEach((f, i) => expect(f).toBe(batch[i]));
+  });
+
+  it('moves a batch dated in the future back as a whole, so its newest fix is now and the spacing stays', () => {
+    const batch = [1, 2, 3, 4, 5].map((i) => at(NOW + HOUR + i * 60_000, 52 + i / 100));
+    const out = normalizeFixes(batch, NOW);
+    expect(out.map((f) => f.timestamp)).toEqual([4, 3, 2, 1, 0].map((i) => NOW - i * 60_000));
+    expect(out.map((f) => f.lat)).toEqual(batch.map((f) => f.lat));
+    // A batch of one is the same as normalizeFix.
+    expect(normalizeFixes([at(NOW + HOUR)], NOW)).toEqual([normalizeFix(at(NOW + HOUR), NOW)]);
+  });
+
+  it('keeps a batch whose newest fix is only a few seconds ahead', () => {
+    const batch = [at(NOW - 60_000), at(NOW + CLOCK_TOLERANCE_MS)];
+    expect(normalizeFixes(batch, NOW).map((f) => f.timestamp)).toEqual([NOW - 60_000, NOW + CLOCK_TOLERANCE_MS]);
+  });
+
+  it('drops broken fixes, and those the move would push before 1970, without throwing', () => {
+    const batch = [null, at(Number.NaN), { ...ok, lat: 95 }, at(1), at(NOW + HOUR)] as unknown[];
+    expect(normalizeFixes(batch, NOW)).toEqual([{ ...ok, timestamp: NOW }]);
+    expect(normalizeFixes(undefined as unknown as unknown[], NOW)).toEqual([]);
+    expect(normalizeFixes([], NOW)).toEqual([]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { LinkNonce, type BodyOf } from '../protocol/messages';
+import { LinkNonce, RelayUrl, type BodyOf } from '../protocol/messages';
 import { createInitialState, type LinkedDevice, type NodeState } from '../state';
 import type { ContactKey, IncomingMessage } from '../transport/transport';
 import { base64urlDecode, base64urlEncode } from '../util/base64url';
@@ -26,7 +26,7 @@ const PayloadSchema = z.object({
   v: z.literal(2),
   nonce: LinkNonce,
   secretKey: z.string().regex(/^[0-9a-f]{64}$/),
-  relays: z.array(z.string().max(200).regex(/^wss:\/\//)).min(1).max(8),
+  relays: z.array(RelayUrl).min(1).max(8),
   deviceId,
   deviceName: z.string().trim().min(1).max(40),
   devices: z
@@ -37,24 +37,35 @@ const PayloadSchema = z.object({
 
 /** How long after the code expired the account may still arrive (slow relays, clock skew). */
 const PAYLOAD_GRACE_MS = 5 * 60_000;
+/** How often the same hello from the same device is answered (once, plus repeats of a lost answer). */
+const MAX_REVEALS = 3;
 
 /** What the new device has to do next. */
 export type LinkStep =
   /** Send `message` to `to` (over `relays`), then show `code`: the other device shows it now too. */
   | { type: 'reveal'; to: ContactKey; relays: string[]; message: BodyOf<'link.reveal'>; code: string }
-  /** The account arrived. Ask the person whether it is theirs before taking it over. */
+  /** The account arrived after the "yes" to the digits here. Ask whether it is theirs before taking it over. */
   | { type: 'payload'; payload: LinkPayload };
 
 /**
  * Runs on the new device while it shows its device code (see `sync/link.ts` for the protocol).
- * Answers only the first `link.hello` for its nonce, then takes chunks only from that sender,
- * and accepts the account only if the nonce matches and the sent identity key really belongs
- * to the sender (so nobody can push a foreign account onto it).
+ * Answers only the first `link.hello` for its nonce (and the very same hello again, should its
+ * answer have been lost), then takes chunks only from that sender. It accepts the account only
+ * if the nonce matches, the sent identity key really belongs to the sender (so nobody can push
+ * someone else's account onto it), and the person confirmed the digits here (`confirmCode`), so
+ * whoever answered the code first cannot push their own account past the comparison either.
  */
 export class LinkReceiver {
   private readonly reassembler = new Reassembler(2);
   private readonly secret: Uint8Array;
   private peer: ContactKey | undefined;
+  /** The peer's share as it sent it, and the digits that came from it. */
+  private answered: { rE: string; code: string } | undefined;
+  private reveals = 0;
+  /** The person said the digits match on both devices. */
+  private confirmed = false;
+  /** The account, when it came before that "yes". */
+  private held: LinkPayload | undefined;
   private done = false;
 
   constructor(
@@ -95,30 +106,55 @@ export class LinkReceiver {
     if (accountKey !== incoming.from) return undefined;
     const doc = parseSyncDoc(p.data.doc);
     if (!doc) return undefined;
-    this.dispose();
-    return {
-      type: 'payload',
-      payload: {
-        accountKey,
-        secretKey: p.data.secretKey,
-        relays: p.data.relays,
-        deviceId: p.data.deviceId,
-        deviceName: p.data.deviceName,
-        devices: p.data.devices,
-        doc,
-      },
+    const payload: LinkPayload = {
+      accountKey,
+      secretKey: p.data.secretKey,
+      relays: p.data.relays,
+      deviceId: p.data.deviceId,
+      deviceName: p.data.deviceName,
+      devices: p.data.devices,
+      doc,
     };
+    if (!this.confirmed) {
+      // Keep the first one until the person compared the digits here too.
+      this.held ??= payload;
+      return undefined;
+    }
+    this.dispose();
+    return { type: 'payload', payload };
+  }
+
+  /**
+   * The person saw the same digits on the existing device and said so here. Returns the
+   * account if it already arrived; otherwise `handle` returns it once it does. Does nothing
+   * before the digits were shown (no hello answered yet).
+   */
+  confirmCode(): LinkStep | undefined {
+    if (this.done || this.peer === undefined) return undefined;
+    this.confirmed = true;
+    const payload = this.held;
+    if (!payload) return undefined;
+    this.dispose();
+    return { type: 'payload', payload };
   }
 
   /** Wipes the secret and ignores everything from now on. Call on cancel and expiry. */
   dispose(): void {
     this.done = true;
     this.secret.fill(0);
+    this.held = undefined;
+    this.answered = undefined;
   }
 
   private onHello(from: ContactKey, m: BodyOf<'link.hello'>, now: number): LinkStep | undefined {
-    // One hello per code: a second answer would give an attacker a second guess at the digits.
-    if (this.peer !== undefined || m.nonce !== this.invite.nonce || now > this.invite.expiresAt || from === this.invite.tempKey) return undefined;
+    if (m.nonce !== this.invite.nonce || now > this.invite.expiresAt || from === this.invite.tempKey) return undefined;
+    if (this.peer !== undefined) {
+      // One share per code: another one would give an attacker a second guess at the digits.
+      // The same hello again only repeats what that device already got (my answer may be lost).
+      if (from !== this.peer || m.rE !== this.answered?.rE || this.reveals >= MAX_REVEALS) return undefined;
+      this.reveals++;
+      return this.reveal(from, m, this.answered.code);
+    }
     let rE: Uint8Array;
     try {
       rE = base64urlDecode(m.rE);
@@ -129,9 +165,15 @@ export class LinkReceiver {
     this.peer = from;
     const code = linkCode({ tempKey: this.invite.tempKey, nonce: this.invite.nonce, accountKey: from, rE, rN: this.secret });
     rE.fill(0);
+    this.answered = { rE: m.rE, code };
+    this.reveals = 1;
+    return this.reveal(from, m, code);
+  }
+
+  private reveal(to: ContactKey, m: BodyOf<'link.hello'>, code: string): LinkStep {
     return {
       type: 'reveal',
-      to: from,
+      to,
       relays: [...new Set([...m.relays, ...this.invite.relays])],
       message: { type: 'link.reveal', nonce: this.invite.nonce, rN: base64urlEncode(this.secret) },
       code,

@@ -88,15 +88,21 @@ async function runLisaTrip(
   meKey: string,
   later: (ms: number, fn: () => void | Promise<void>) => void,
 ): Promise<void> {
-  await lisa.startTrip({ recipients: [meKey], destinationName: 'Bei dir', destination: MY_HOME, level: 'eta' });
-  let simTime = Date.now();
   const distances = [6000, 5300, 4600, 3900, 3200, 2600, 2000, 1500, 1000, 600, 300, 150, 40];
-  distances.forEach((meters, i) => {
-    later(i * 2500, async () => {
-      simTime += 60_000;
-      await lisa.onLocationFix({ lat: MY_HOME.lat + meters / 111_195, lon: MY_HOME.lon, timestamp: simTime, accuracyM: 15 });
+  // Fixes carry the real time (the core takes fixes from the future as "now"), so the simulated
+  // minute goes into the speed: the distance of each tick per 60 s.
+  const drive = (i: number) =>
+    lisa.onLocationFix({
+      lat: MY_HOME.lat + distances[i]! / 111_195,
+      lon: MY_HOME.lon,
+      timestamp: Date.now(),
+      accuracyM: 15,
+      ...(i > 0 ? { speedMps: (distances[i - 1]! - distances[i]!) / 60 } : {}),
     });
-  });
+  // Where she starts first, so a new round does not begin where the last one arrived.
+  await drive(0);
+  await lisa.startTrip({ recipients: [meKey], destinationName: 'Bei dir', destination: MY_HOME, level: 'eta' });
+  for (let i = 1; i < distances.length; i++) later(i * 2500, () => drive(i));
   // Start over after a pause so the demo keeps showing something.
   later(distances.length * 2500 + 20_000, () => runLisaTrip(lisa, meKey, later));
 }

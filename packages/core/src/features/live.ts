@@ -3,7 +3,7 @@ import { CLOCK_TOLERANCE_MS, elapsedMs } from '../geo/fix';
 import type { LocationFix } from '../geo/types';
 import { CoarseLocator, DEFAULT_CELL_M } from '../privacy/coarse-grid';
 import type { Cell, Point } from '../protocol/messages';
-import type { LiveShare } from '../state';
+import type { LiveShare, MySos } from '../state';
 
 export interface LiveCadence {
   /** Precise: send after moving this far ... */
@@ -38,6 +38,18 @@ export const SOS_CADENCE: LiveCadence = {
 export function isLiveShareActive(share: Pick<LiveShare, 'startedAt' | 'expiresAt'>, now: number): boolean {
   if (share.expiresAt == null) return true;
   return now < share.expiresAt && now >= share.startedAt - CLOCK_TOLERANCE_MS;
+}
+
+/** How long an SOS keeps sending my location after each press. */
+export const SOS_LOCATION_MS = 60 * 60_000;
+
+/**
+ * Whether my SOS still sends my location at `now`: until `locationUntil`, and not while `now`
+ * lies before the press that set it (the clock was set back; waiting for `locationUntil` could
+ * then take far longer than the promised hour).
+ */
+export function isSosLocationActive(sos: Pick<MySos, 'locationUntil'>, now: number): boolean {
+  return now < sos.locationUntil && now >= sos.locationUntil - SOS_LOCATION_MS - CLOCK_TOLERANCE_MS;
 }
 
 /**

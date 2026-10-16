@@ -422,6 +422,11 @@ function LinkReceive() {
   const now = useTick(1000);
   const [attempt, setAttempt] = useState(0);
   const [session, setSession] = useState<LinkSession>();
+  // The 6 digits, once my other device answered and got this device's secret. Before that
+  // there is nothing to compare, so only the code is shown.
+  const [digits, setDigits] = useState<string>();
+  // The person said the digits match here too. Only then may an arriving account be shown.
+  const [digitsOk, setDigitsOk] = useState(false);
   const [phase, setPhase] = useState<'starting' | 'waiting' | 'confirm' | 'rejected' | 'received' | 'error'>('starting');
   // The received account waits here until the person confirms it is theirs. Only in component
   // state (gone on unmount), never logged, and dropped on "Nein" or a new attempt.
@@ -441,6 +446,8 @@ function LinkReceive() {
     setPhase('starting');
     setError(undefined);
     setSession(undefined);
+    setDigits(undefined);
+    setDigitsOk(false);
     setPending(undefined);
     beginLinkReceive().then(
       (s) => {
@@ -452,6 +459,9 @@ function LinkReceive() {
         current = s;
         setSession(s);
         setPhase('waiting');
+        void s.digits.then((d) => {
+          if (!cancelled) setDigits(d);
+        });
         s.result.then(
           (payload) => {
             if (cancelled) return;
@@ -530,12 +540,12 @@ function LinkReceive() {
   return (
     <View style={{ gap: spacing.md }}>
       <T variant="title">Mit deinem Konto verbinden</T>
-      {(phase === 'starting' || phase === 'waiting' || phase === 'error') && (
+      {(phase === 'starting' || (phase === 'waiting' && !digits) || phase === 'error') && (
         <Card style={{ gap: spacing.sm }}>
           <Step n={1}>Öffne Heyda. auf deinem anderen Gerät, auf dem dein Konto schon läuft.</Step>
           <Step n={2}>Tippe dort auf Ich → Meine Geräte → „Neues Gerät verbinden“.</Step>
           <Step n={3}>Scanne diesen QR-Code. Am PC: Kopiere den Code-Text unten und füge ihn dort ein.</Step>
-          <Step n={4}>Prüfe, dass beide Geräte dieselben 6 Zahlen zeigen, und bestätige dort.</Step>
+          <Step n={4}>Dann zeigen beide Geräte 6 Zahlen. Sind sie gleich, bestätige auf beiden Geräten.</Step>
         </Card>
       )}
 
@@ -579,14 +589,59 @@ function LinkReceive() {
             </Banner>
             <Button title="Neuen Code erstellen" onPress={() => setAttempt((a) => a + 1)} />
           </>
+        ) : digits && !digitsOk ? (
+          <>
+            <View accessibilityLiveRegion="polite" style={{ gap: spacing.md }}>
+              <T variant="h2" style={{ textAlign: 'center' }}>
+                Prüfe: Dein anderes Gerät zeigt jetzt dieselben 6 Zahlen. Bestätige hier und dort.
+              </T>
+              <Digits value={digits} label="Vergleichszahlen" />
+            </View>
+            <T variant="small" style={{ textAlign: 'center' }}>{`Gültig noch ${countdown(left)}`}</T>
+            <Bullet icon="⚠️">
+              Tippe nur, wenn dein anderes Gerät genau diese Zahlen zeigt. Zeigt es andere oder gar keine, will vielleicht jemand anderes sein Konto hierher schicken.
+            </Bullet>
+            <Button
+              title="Zahlen stimmen überein"
+              icon="✅"
+              onPress={() => {
+                session.confirmDigits();
+                setDigitsOk(true);
+              }}
+            />
+            <Button
+              title="Zahlen stimmen nicht"
+              kind="secondary"
+              onPress={() => {
+                setAttempt((a) => a + 1);
+                notice('Neu gestartet', 'Gut so. Brich auch auf deinem anderen Gerät ab und zeige den neuen Code nur deinem eigenen Gerät.');
+              }}
+            />
+          </>
+        ) : digits ? (
+          <>
+            <View accessibilityLiveRegion="polite" style={{ gap: spacing.md }}>
+              <T variant="h2" style={{ textAlign: 'center' }}>
+                Danke! Bestätige jetzt auch auf deinem anderen Gerät.
+              </T>
+              <Digits value={digits} label="Vergleichszahlen" />
+            </View>
+            <T variant="small" style={{ textAlign: 'center' }}>{`Gültig noch ${countdown(left)} · wartet auf deine Bestätigung dort…`}</T>
+            <Bullet icon="🔐">
+              Erst wenn du dort bestätigst, kommt dein Konto Ende-zu-Ende-verschlüsselt hier an. Nur dieses Gerät kann es lesen.
+            </Bullet>
+            <Bullet icon="⚠️">
+              Zeigt dein anderes Gerät andere Zahlen oder gar keine? Dann brich dort ab und starte hier neu.
+            </Bullet>
+            <Button title="Neu starten" icon="🔄" kind="secondary" compact onPress={() => setAttempt((a) => a + 1)} />
+          </>
         ) : (
           <>
+            <T variant="h2" style={{ textAlign: 'center' }}>
+              Scanne diesen Code mit deinem anderen Gerät
+            </T>
             <QrCode value={session.code} size={240} label="Geräte-Code zum Scannen" />
             <T variant="small" style={{ textAlign: 'center' }}>{`Gültig noch ${countdown(left)} · wartet auf dein anderes Gerät…`}</T>
-            <T variant="h2" style={{ textAlign: 'center', marginTop: spacing.sm }}>
-              Diese Zahlen müssen auf beiden Geräten gleich sein
-            </T>
-            <Digits value={session.digits} label="Vergleichszahlen" />
             <Card style={{ gap: spacing.sm }}>
               <T variant="small">Code-Text (zum Einfügen am PC):</T>
               <Text selectable style={{ color: t.text, fontFamily: MONO, fontSize: 12 }} numberOfLines={3}>
@@ -595,7 +650,7 @@ function LinkReceive() {
               <Button title={copied ? 'Kopiert ✓' : 'Code-Text kopieren'} icon="📋" kind="secondary" compact onPress={() => void copy()} />
             </Card>
             <Bullet icon="🔐">
-              Dein Konto kommt Ende-zu-Ende-verschlüsselt an. Nur dieses Gerät kann es lesen. Zeigt das andere Gerät andere Zahlen? Dann brich dort ab.
+              Danach zeigen beide Geräte 6 Zahlen zum Vergleichen. Dein Konto kommt Ende-zu-Ende-verschlüsselt an. Nur dieses Gerät kann es lesen.
             </Bullet>
           </>
         )

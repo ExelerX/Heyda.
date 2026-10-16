@@ -116,6 +116,65 @@ describe('AutomationEngine', () => {
     expect(sent).toBe(10); // per-contact message cap per hour
   });
 
+  it('lets rules act again one cooldown after the clock jumps back, instead of waiting for it to catch up', () => {
+    const rule = fromTemplate('core.home-safe', { myplace: 'home', contact: MAX });
+    const engine = engineWith([rule]);
+    const arrive = (at: number): AutomationEvent => ({ type: 'me.arrive', placeId: 'home', at });
+    const T = 10 * 3_600_000;
+    expect(engine.handle(arrive(T))).toHaveLength(1);
+    const back = T - 2 * 3_600_000; // the clock is set back by two hours
+    expect(engine.handle(arrive(back))).toHaveLength(0); // the firing just before still counts
+    expect(engine.handle(arrive(back + 30_000))).toHaveLength(0); // the cooldown counts from the jump
+    expect(engine.handle(arrive(back + 61_000))).toHaveLength(1);
+  });
+
+  it('holds the hourly caps for at most an hour after the clock jumps back', () => {
+    const rule = fromTemplate('core.home-safe', { myplace: 'home', contact: MAX });
+    const engine = engineWith([rule]);
+    const arrive = (at: number): AutomationEvent => ({ type: 'me.arrive', placeId: 'home', at });
+    const T = 10 * 3_600_000;
+    let sent = 0;
+    for (let t = T; t < T + 3_600_000; t += 61_000) sent += engine.handle(arrive(t)).length;
+    expect(sent).toBe(10);
+    const back = T - 2 * 3_600_000;
+    expect(engine.handle(arrive(back))).toHaveLength(0);
+    expect(engine.handle(arrive(back + 30 * 60_000))).toHaveLength(0); // still within the hour
+    expect(engine.handle(arrive(back + 3_600_000 + 1_000))).toHaveLength(1);
+  });
+
+  it('keeps the cooldown when an event carries an older time than the last firing (a late fix)', () => {
+    const rule = fromTemplate('core.home-safe', { myplace: 'home', contact: MAX });
+    const engine = engineWith([rule]);
+    const arrive = (at: number): AutomationEvent => ({ type: 'me.arrive', placeId: 'home', at });
+    const T = 10 * 3_600_000;
+    expect(engine.handle(arrive(T))).toHaveLength(1); // the OS region event, with my clock
+    expect(engine.handle(arrive(T - 90_000))).toHaveLength(0); // from a fix that came late
+    expect(engine.handle(arrive(T + 10_000))).toHaveLength(0); // my clock again
+    expect(engine.handle(arrive(T + 61_000))).toHaveLength(1);
+  });
+
+  it('measures the cooldown by the clock it is given, whatever time the events carry', () => {
+    const rule = fromTemplate('core.home-safe', { myplace: 'home', contact: MAX });
+    const engine = engineWith([rule]);
+    const arrive = (at: number): AutomationEvent => ({ type: 'me.arrive', placeId: 'home', at });
+    const T = 10 * 3_600_000;
+    expect(engine.handle(arrive(T), T)).toHaveLength(1);
+    // A late batch of fixes: leaving and arriving again, with times from minutes ago.
+    expect(engine.handle({ type: 'me.leave', placeId: 'home', at: T - 200_000 }, T + 1_000)).toHaveLength(0);
+    expect(engine.handle(arrive(T - 80_000), T + 2_000)).toHaveLength(0);
+    expect(engine.handle(arrive(T - 10_000), T + 61_000)).toHaveLength(1);
+  });
+
+  it('keeps the cooldown through a few seconds of jitter between event clocks', () => {
+    const rule = fromTemplate('core.home-safe', { myplace: 'home', contact: MAX });
+    const engine = engineWith([rule]);
+    const arrive = (at: number): AutomationEvent => ({ type: 'me.arrive', placeId: 'home', at });
+    const T = 10 * 3_600_000;
+    expect(engine.handle(arrive(T))).toHaveLength(1);
+    expect(engine.handle(arrive(T - 5_000))).toHaveLength(0);
+    expect(engine.handle(arrive(T + 30_000))).toHaveLength(0);
+  });
+
   it('ignores disabled rules', () => {
     const rule = { ...fromTemplate('core.trip-start', { contact: LISA }), enabled: false };
     expect(

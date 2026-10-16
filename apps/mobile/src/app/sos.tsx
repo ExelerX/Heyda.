@@ -1,4 +1,4 @@
-import { contactLabel, type Contact, type MySos } from '@heyda/core';
+import { contactLabel, isSosLocationActive, type Contact, type MySos } from '@heyda/core';
 import { router } from 'expo-router';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Pressable, ScrollView, Text, View, useWindowDimensions } from 'react-native';
@@ -284,7 +284,7 @@ function ActiveSos({ sos, onEnded }: { sos: MySos; onEnded: (r: 'safe' | 'cancel
 
   const fallback = runtime.node.sosFallback();
   const showSms = settings.smsFallback && smsOk && !!fallback?.phones.length;
-  const locationLive = now < sos.locationUntil;
+  const locationLive = isSosLocationActive(sos, now);
   const fg = onFilled(t);
 
   const rows = sos.recipients
@@ -344,9 +344,10 @@ function ActiveSos({ sos, onEnded }: { sos: MySos; onEnded: (r: 'safe' | 'cancel
     }
   }
 
+  // Updates that ended because the clock was set back have an end time that still lies ahead: no time then.
   let locationText: string;
   if (isDemo) locationText = 'Im Demo-Modus wird kein echter Standort gesendet.';
-  else if (!locationLive) locationText = `Standort-Updates sind seit ${hhmm(sos.locationUntil)} beendet.`;
+  else if (!locationLive) locationText = now >= sos.locationUntil ? `Standort-Updates sind seit ${hhmm(sos.locationUntil)} beendet.` : 'Standort-Updates sind beendet.';
   else if (sos.pointSentAt) locationText = `Dein genauer Standort wurde um ${hhmm(sos.pointSentAt)} gesendet und wird bis ${hhmm(sos.locationUntil)} aktualisiert.`;
   else if (!locationSupported) locationText = 'Dieses Gerät kennt deinen Standort nicht. Der Notruf ging ohne Standort raus.';
   else locationText = 'Dein Standort ist gerade nicht bekannt. Er wird nachgeschickt, sobald dein Handy ihn hat.';

@@ -5,7 +5,7 @@ import { BUILTIN_TEMPLATES, instantiateTemplate } from './automation/templates';
 import { SocialNode, TTL, type NodeEvent } from './node';
 import { createInitialState, type Alert, type NodeState } from './state';
 import { composeMessage } from './protocol/compose';
-import { encodeLinkInvite, linkCommitment } from './sync/link';
+import { encodeLinkInvite, LINK_TTL_MS, linkCommitment } from './sync/link';
 import { createLinkedState, LinkReceiver, type LinkPayload } from './sync/receiver';
 import { base64urlEncode } from './util/base64url';
 import { MemoryNetwork, MemoryTransport } from './transport/memory';
@@ -672,14 +672,14 @@ describe('SocialNode: offline and own devices', () => {
 /** The new device: shows a code, answers the first hello with its reveal, collects the account. */
 async function newDevice(
   w: ReturnType<typeof world>,
-  opts: { tempKey?: string; secret?: Uint8Array; nonce?: string; publicKeyOf?: (secretKeyHex: string) => string } = {},
+  opts: { tempKey?: string; secret?: Uint8Array; nonce?: string; expiresAt?: number; publicKeyOf?: (secretKeyHex: string) => string } = {},
 ) {
   const secret = opts.secret ?? new Uint8Array(32).fill(7);
   const invite = {
     tempKey: opts.tempKey ?? TEMP,
     relays: RELAY,
     nonce: opts.nonce ?? 'n'.repeat(20),
-    expiresAt: w.now() + 600_000,
+    expiresAt: opts.expiresAt ?? w.now() + 600_000,
     commit: linkCommitment(secret),
   };
   const transport = w.net.createTransport(invite.tempKey, w.now);
@@ -698,12 +698,27 @@ async function newDevice(
     if (step?.type === 'reveal') {
       out.digits = step.code;
       void transport.send(step.to, composeMessage(step.message, w.now()), { ttlSeconds: TTL.link, relays: step.relays });
+      // The person sees the same digits here and taps "Zahlen stimmen überein" on this device too.
+      const held = receiver.confirmCode();
+      if (held?.type === 'payload') out.payload = held.payload;
     } else if (step?.type === 'payload') {
       out.payload = step.payload;
     }
   });
   await transport.start();
   return out;
+}
+
+/** Lets a test decide, send by send, whether a message leaves, fails, or leaves and still fails. */
+function scriptSends(t: MemoryTransport, decide: (m: AppMessage) => 'ok' | 'fail' | 'lost-ack') {
+  const send = t.send.bind(t);
+  t.send = async (to, message, options) => {
+    const how = decide(message);
+    if (how === 'fail') throw new Error('offline');
+    await send(to, message, options);
+    if (how === 'lost-ack') throw new Error('no answer from the relay');
+  };
+  return t;
 }
 
 /** Makes every "random" byte predictable (and still distinct), so a test can fix all seeds. */
@@ -858,6 +873,28 @@ describe('SocialNode: linking a device with compared digits', () => {
     await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
   });
 
+  it('scanning the same code twice keeps the session, so both devices still show the same digits', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const n = await newDevice(w);
+    n.transport.running = false;
+    await lisa.startLink(n.code);
+    // The camera or a second paste delivers the same code again: same share, sent once more.
+    await lisa.startLink(` ${n.code}\n`);
+    const hellos = w.net.log.filter((e) => e.message.type === 'link.hello').map((e) => e.message);
+    expect(hellos).toHaveLength(2);
+    expect(hellos[1]).toMatchObject({ nonce: hellos[0]!.type === 'link.hello' && hellos[0]!.nonce, rE: hellos[0]!.type === 'link.hello' && hellos[0]!.rE });
+    await n.transport.start();
+    await flush();
+    expect(n.digits).toMatch(/^\d{3} \d{3}$/);
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: n.invite.expiresAt });
+    // Once the digits are there, the same code again changes nothing and sends nothing.
+    await lisa.startLink(n.code);
+    expect(w.net.log.filter((e) => e.message.type === 'link.hello')).toHaveLength(2);
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: n.invite.expiresAt });
+  });
+
   it('a swapped code gives the attacker one guess at the digits, which fails for fixed seeds', async () => {
     const random = seededRandom('swap');
     try {
@@ -892,5 +929,100 @@ describe('SocialNode: linking a device with compared digits', () => {
     } finally {
       random.mockRestore();
     }
+  });
+
+  it('keeps the session when sending the hello fails, so scanning the same code again still gives the same digits', async () => {
+    const w = world();
+    let lostAck = true;
+    const t = scriptSends(w.net.createTransport(LISA, w.now), (m) => (m.type === 'link.hello' && lostAck ? 'lost-ack' : 'ok'));
+    const lisa = w.make(LISA, 'Lisa', { transport: t });
+    await lisa.start();
+    const n = await newDevice(w);
+    n.transport.running = false; // its answer comes late
+    // The relay kept the hello, but its OK got lost: the send fails although it arrived.
+    await expect(lisa.startLink(n.code)).rejects.toThrow('Keine Verbindung');
+    expect(lisa.linkStatus).toEqual({ phase: 'waiting', expiresAt: n.invite.expiresAt });
+    lostAck = false;
+    await lisa.startLink(n.code);
+    const hellos = w.net.log.filter((e) => e.message.type === 'link.hello').map((e) => e.message);
+    expect(hellos).toHaveLength(2);
+    expect(hellos[1]).toMatchObject({ rE: hellos[0]!.type === 'link.hello' && hellos[0]!.rE });
+    await n.transport.start();
+    await flush();
+    expect(n.digits).toMatch(/^\d{3} \d{3}$/);
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: n.invite.expiresAt });
+  });
+
+  it('gets the digits after its first answer got lost, by scanning the same code again', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const n = await newDevice(w);
+    const send = n.transport.send.bind(n.transport);
+    let drop = true;
+    n.transport.send = async (to, message, options) => {
+      if (drop) return; // "sent", but never arrives
+      return send(to, message, options);
+    };
+    await lisa.startLink(n.code);
+    await flush();
+    expect(n.digits).toMatch(/^\d{3} \d{3}$/);
+    expect(lisa.linkStatus?.phase).toBe('waiting');
+    drop = false;
+    await lisa.startLink(n.code);
+    await flush();
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: n.invite.expiresAt });
+  });
+
+  it('a retry after a partly failed send fills the same transfer, so the new device still gets the account', async () => {
+    const w = world();
+    let chunkSends = 0;
+    let failOn = new Set<number>();
+    const t = scriptSends(w.net.createTransport(LISA, w.now), (m) => (m.type === 'xfer.chunk' && failOn.has(++chunkSends) ? 'fail' : 'ok'));
+    // Enough contacts that the account needs more than one chunk.
+    const contacts = Array.from({ length: 80 }, (_, i) => ({
+      key: 'c'.repeat(62) + i.toString(16).padStart(2, '0'),
+      name: `Kontakt ${i} ${'y'.repeat(25)}`,
+      relays: RELAY,
+      addedAt: 1,
+      verified: false,
+    }));
+    const lisa = w.make(LISA, 'Lisa', { transport: t, initial: { ...state(LISA, 'Lisa'), contacts } });
+    await lisa.start();
+    const n = await newDevice(w);
+    await lisa.startLink(n.code);
+    await flush();
+    expect(lisa.linkStatus?.phase).toBe('compare');
+    // Two attempts each lose the second chunk; the third one gets everything out.
+    failOn = new Set([2]);
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+    const perAttempt = chunkSends;
+    expect(perAttempt).toBeGreaterThanOrEqual(2);
+    failOn = new Set([perAttempt + 2]);
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow();
+    expect(lisa.linkStatus?.phase).toBe('compare');
+    failOn = new Set();
+    await lisa.confirmLink(LISA_SECRET);
+    await flush();
+    expect(lisa.linkStatus).toBeUndefined();
+    expect(n.payload?.accountKey).toBe(LISA);
+    expect(n.payload?.doc.contacts).toHaveLength(80);
+    const ids = new Set(w.net.log.flatMap((e) => (e.message.type === 'xfer.chunk' ? [e.message.xferId] : [])));
+    expect(ids.size).toBe(1);
+  });
+
+  it('ends the session by its own clock, whatever expiry the code claims', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    // The new device's clock runs a day ahead, so its code claims to be valid for a day.
+    const n = await newDevice(w, { expiresAt: w.now() + 24 * 3600_000 });
+    await lisa.startLink(n.code);
+    await flush();
+    expect(lisa.linkStatus).toEqual({ phase: 'compare', code: n.digits, expiresAt: w.now() + LINK_TTL_MS });
+    w.tick(LINK_TTL_MS);
+    expect(lisa.linkStatus).toBeUndefined();
+    await expect(lisa.confirmLink(LISA_SECRET)).rejects.toThrow('Die Zeit ist abgelaufen');
+    expect(w.net.log.filter((e) => e.message.type === 'xfer.chunk')).toEqual([]);
   });
 });

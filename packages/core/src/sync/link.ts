@@ -1,6 +1,6 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { z } from 'zod';
-import { Bytes32, LinkNonce } from '../protocol/messages';
+import { Bytes32, LinkNonce, RelayUrl } from '../protocol/messages';
 import { base64urlDecode, base64urlEncode } from '../util/base64url';
 import { randomId } from '../util/random';
 
@@ -19,17 +19,32 @@ import { randomId } from '../util/random';
  * 2. The existing device E scans it and keeps one pending session. It picks `rE` (32 random
  *    bytes) and sends `link.hello {n, rE}` from its account key `X` to `tk`.
  * 3. N takes only the first hello for its nonce, remembers `X`, answers `link.reveal {n, rN}`
- *    and only now shows the digits. Later hellos, from anyone, are ignored.
+ *    and only now shows the digits. Later hellos are ignored, except the very same hello from
+ *    `X` again (its answer may have been lost): that gets the same reveal, a few times at most.
  * 4. E accepts one reveal, only from `tk`, and checks it against `c`. A wrong one ends the session.
- * 5. Both show `sha256("heyda-link-v2:sas:" tk n X || rE || rN)` as 6 digits.
- * 6. The user compares and confirms on E. Only then does E send the account (identity key,
- *    contacts, settings) end-to-end encrypted to `tk`, in chunks. N takes it only from `X`
- *    and only if the identity key belongs to `X`; then the person confirms it is their account.
+ * 5. Both show the first 8 bytes of `sha256("heyda-link-v2:sas:" tk ":" n ":" X ":" || rE || rN)`
+ *    modulo 1,000,000 as 6 digits (`linkCode`).
+ * 6. The user compares and confirms on both devices. Only after the "yes" on E does E send the
+ *    account (identity key, contacts, settings) end-to-end encrypted to `tk`, in chunks (one
+ *    transfer per session, so a retry fills in what was missing). N takes it only from `X`,
+ *    only if the identity key belongs to `X` and only after the "yes" on N; then the person
+ *    confirms it is their account.
  *
  * A man in the middle must fix his share before he learns the other side's: `rN` is committed
  * before E picks `rE`, and N reveals `rN` only after the attacker sent his hello. So each
- * attempt is one guess with a 1 in 1,000,000 chance, and N accepts only one hello per code.
- * The digits protect against a swapped code only if the user really compares them.
+ * attempt is one guess with a 1 in 1,000,000 chance, and N accepts only one hello per code, so
+ * every further guess needs the person to start over on both devices. Hello and reveal travel
+ * like all messages (encrypted, the sender's key checked by the transport); they are not
+ * secret from the other side, only the order matters. Someone who sees the code and answers
+ * it first can block it (the real device then never shows digits). He could also send his own
+ * account to N, to read along with everything done there later; that is why N waits for the
+ * "yes" on N as well: the real E shows no digits then, so an attentive person says no (and the
+ * account he sent still has to pass "Ist das dein Konto?"). The digits protect only if the user
+ * really compares them.
+ *
+ * E bounds the session by its own clock as well (`LINK_TTL_MS` after the scan), since `e` comes
+ * from N's clock. Relay addresses in the code must be plain `wss://` addresses (`RelayUrl`):
+ * E contacts them right after the scan, before anything was compared.
  */
 export const LINK_PREFIX = 'heyda-link:2:';
 export const LINK_TTL_MS = 10 * 60 * 1000;
@@ -38,7 +53,7 @@ export const LINK_SECRET_BYTES = 32;
 
 const LinkInviteSchema = z.strictObject({
   t: z.string().regex(/^[0-9a-f]{64}$/),
-  r: z.array(z.string().max(200).regex(/^wss:\/\//)).min(1).max(8),
+  r: z.array(RelayUrl).min(1).max(8),
   n: LinkNonce,
   e: z.number().int().positive(),
   c: Bytes32,
@@ -78,7 +93,10 @@ export function decodeLinkInvite(text: string, now: number): DecodeLinkResult {
   }
   const p = LinkInviteSchema.safeParse(json);
   if (!p.success) return { ok: false, error: 'Der Code ist beschädigt.' };
-  if (p.data.e <= now) return { ok: false, error: 'Der Code ist abgelaufen. Lass einen neuen anzeigen.' };
+  // `e` comes from the new device's clock: if it runs late, every code looks expired here.
+  if (p.data.e <= now) {
+    return { ok: false, error: 'Der Code ist abgelaufen. Lass einen neuen anzeigen. Passiert das immer wieder, prüfe die Uhrzeit auf beiden Geräten.' };
+  }
   return { ok: true, invite: { tempKey: p.data.t, relays: p.data.r, nonce: p.data.n, expiresAt: p.data.e, commit: p.data.c } };
 }
 

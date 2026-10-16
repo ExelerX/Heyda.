@@ -41,3 +41,19 @@ export function normalizeFix(fix: unknown, now: number, toleranceMs: number = CL
   if (speed !== undefined) out.speedMps = speed;
   return out;
 }
+
+/**
+ * `normalizeFix` for fixes the OS hands over together, and never throws. When the newest lies
+ * further in the future than the tolerance, the whole batch moves back by the same amount, so
+ * the newest becomes `now` and every fix keeps its spacing. (Each one on its own would land on
+ * `now`, and then only the first, the oldest position, would count as new.) A fix the move puts
+ * at or before 1970 is dropped. Anything that is not an array gives no fixes.
+ */
+export function normalizeFixes(fixes: readonly unknown[], now: number, toleranceMs: number = CLOCK_TOLERANCE_MS): LocationFix[] {
+  if (!Array.isArray(fixes)) return [];
+  const valid = fixes.map((f) => normalizeFix(f, now, Number.POSITIVE_INFINITY)).filter((f): f is LocationFix => f !== undefined);
+  const newest = valid.reduce((max, f) => Math.max(max, f.timestamp), Number.NEGATIVE_INFINITY);
+  if (!(newest > now + toleranceMs)) return valid;
+  const shift = newest - now;
+  return valid.flatMap((f) => (f.timestamp - shift > 0 ? [{ ...f, timestamp: f.timestamp - shift }] : []));
+}

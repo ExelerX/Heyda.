@@ -86,6 +86,22 @@ describe('device link codes', () => {
     expect(decodeLinkInvite(raw({ ...fields, c: invite.commit }), 0).ok).toBe(true);
   });
 
+  it('accepts only plain relay addresses in a code, since the existing device contacts them right after the scan', () => {
+    const raw = (o: object) => 'heyda-link:2:' + base64urlEncode(new TextEncoder().encode(JSON.stringify(o)));
+    const fields = { t: B, n: 'abcdefghijklmnop', e: 10_000, c: invite.commit };
+    for (const r of ['wss://relay.example/x?y', 'wss://relay.example/#x', 'wss://user@relay.example', 'wss://relay example', 'wss://relay.example:123456']) {
+      expect(decodeLinkInvite(raw({ ...fields, r: [r] }), 0).ok).toBe(false);
+    }
+    expect(decodeLinkInvite(raw({ ...fields, r: ['wss://relay.example:8443/path'] }), 0).ok).toBe(true);
+  });
+
+  it('hints at the clock when a code has already expired', () => {
+    expect(decodeLinkInvite(encodeLinkInvite(invite), 10_000)).toEqual({
+      ok: false,
+      error: 'Der Code ist abgelaufen. Lass einen neuen anzeigen. Passiert das immer wieder, prüfe die Uhrzeit auf beiden Geräten.',
+    });
+  });
+
   it('turns away codes from the old version with a friendly hint', () => {
     const old = 'heyda-link:1:' + base64urlEncode(new TextEncoder().encode(JSON.stringify({ t: B, r: ['wss://r.example'], n: 'abcdefghijklmnop', e: 10_000 })));
     expect(decodeLinkInvite(old, 0)).toEqual({ ok: false, error: 'Dieser Code ist von einer älteren Version. Aktualisiere Heyda. auf beiden Geräten.' });
@@ -125,6 +141,20 @@ describe('link receiver', () => {
   const C = 'c'.repeat(64);
   const hello = (nonce = invite.nonce, rE = new Uint8Array(32).fill(1)) =>
     composeMessage({ type: 'link.hello', nonce, rE: base64urlEncode(rE), relays: ['wss://e.example'] }, 0);
+  const payload = (secretKey: string, extra: object = {}) => ({
+    format: 'heyda.link',
+    v: 2,
+    nonce: invite.nonce,
+    secretKey,
+    relays: ['wss://r.example'],
+    deviceId: 'device-one',
+    deviceName: 'Handy',
+    devices: [],
+    doc: buildSyncDoc(base()),
+    ...extra,
+  });
+  const chunks = (secretKey: string, extra: object = {}) =>
+    chunkPayload(`xfer-${secretKey.slice(0, 8)}`, 'link', payload(secretKey, extra)).map((c) => composeMessage(c, 0));
 
   it('refuses a secret that does not open the commitment', () => {
     expect(() => new LinkReceiver(invite, new Uint8Array(32).fill(1), () => A)).toThrow();
@@ -154,31 +184,60 @@ describe('link receiver', () => {
   });
 
   it('takes the account only from the device it answered, after it answered', () => {
-    const payload = (secretKey: string) => ({
-      format: 'heyda.link',
-      v: 2,
-      nonce: invite.nonce,
-      secretKey,
-      relays: ['wss://r.example'],
-      deviceId: 'device-one',
-      deviceName: 'Handy',
-      devices: [],
-      doc: buildSyncDoc(base()),
-    });
-    const chunks = (secretKey: string) => chunkPayload(`xfer-${secretKey.slice(0, 8)}`, 'link', payload(secretKey)).map((c) => composeMessage(c, 0));
     const r = new LinkReceiver(invite, secret, (s) => (s === 'a1'.repeat(32) ? A : C));
     // Before any hello: nothing counts, even if the account belongs to the sender.
     for (const m of chunks('a1'.repeat(32))) expect(r.handle({ from: A, message: m, receivedAt: 0 }, 0)).toBeUndefined();
     r.handle({ from: A, message: hello(), receivedAt: 0 }, 0);
+    expect(r.confirmCode()).toBeUndefined();
     // Someone else's own account, from someone else: ignored.
     for (const m of chunks('c1'.repeat(32))) expect(r.handle({ from: C, message: m, receivedAt: 0 }, 0)).toBeUndefined();
     // Old payload version: ignored.
     const v1 = chunkPayload('xfer-old-0001', 'link', { ...payload('a1'.repeat(32)), v: 1 }).map((c) => composeMessage(c, 0));
     for (const m of v1) expect(r.handle({ from: A, message: m, receivedAt: 0 }, 0)).toBeUndefined();
+    // Relay addresses in the account must be plain ones too.
+    const odd = chunkPayload('xfer-odd-relay', 'link', payload('a1'.repeat(32), { relays: ['wss://r.example/?x'] })).map((c) => composeMessage(c, 0));
+    for (const m of odd) expect(r.handle({ from: A, message: m, receivedAt: 0 }, 0)).toBeUndefined();
     const results = chunks('a1'.repeat(32)).map((m) => r.handle({ from: A, message: m, receivedAt: 0 }, 0));
     const last = results.at(-1);
     expect(last?.type).toBe('payload');
     expect(last?.type === 'payload' && last.payload.accountKey).toBe(A);
+  });
+
+  it('holds the account until the person confirmed the digits on this device too', () => {
+    // Whoever answers the code first could send their own account right away, without any
+    // digits shown on the existing device. So it counts only after a "yes" here as well.
+    const r = new LinkReceiver(invite, secret, (s) => (s === 'c1'.repeat(32) ? C : A));
+    expect(r.confirmCode()).toBeUndefined(); // nothing to confirm before the digits are shown
+    r.handle({ from: C, message: hello(), receivedAt: 0 }, 0);
+    for (const m of chunks('c1'.repeat(32))) expect(r.handle({ from: C, message: m, receivedAt: 0 }, 0)).toBeUndefined();
+    const step = r.confirmCode();
+    expect(step?.type === 'payload' && step.payload.accountKey).toBe(C);
+    expect(r.confirmCode()).toBeUndefined();
+    for (const m of chunks('c1'.repeat(32))) expect(r.handle({ from: C, message: m, receivedAt: 0 }, 0)).toBeUndefined();
+
+    // The other order: confirmed first, then the account arrives.
+    const r2 = new LinkReceiver(invite, secret, (s) => (s === 'a1'.repeat(32) ? A : C));
+    r2.handle({ from: A, message: hello(), receivedAt: 0 }, 0);
+    expect(r2.confirmCode()).toBeUndefined();
+    const results = chunks('a1'.repeat(32)).map((m) => r2.handle({ from: A, message: m, receivedAt: 0 }, 0));
+    expect(results.at(-1)?.type).toBe('payload');
+  });
+
+  it('answers the same hello from the same device again (its answer may have been lost), a few times at most', () => {
+    const r = new LinkReceiver(invite, secret, () => A);
+    const first = r.handle({ from: A, message: hello(), receivedAt: 0 }, 0);
+    expect(first?.type).toBe('reveal');
+    expect(r.handle({ from: A, message: hello(), receivedAt: 0 }, 0)).toEqual(first);
+    // Another share or another sender would be a second guess: no answer.
+    expect(r.handle({ from: A, message: hello(invite.nonce, new Uint8Array(32).fill(2)), receivedAt: 0 }, 0)).toBeUndefined();
+    expect(r.handle({ from: C, message: hello(), receivedAt: 0 }, 0)).toBeUndefined();
+    expect(r.handle({ from: A, message: hello(), receivedAt: 0 }, 0)).toEqual(first);
+    expect(r.handle({ from: A, message: hello(), receivedAt: 0 }, 0)).toBeUndefined();
+    expect(r.peerKey).toBe(A);
+
+    const late = new LinkReceiver(invite, secret, () => A);
+    late.handle({ from: A, message: hello(), receivedAt: 0 }, 0);
+    expect(late.handle({ from: A, message: hello(), receivedAt: 0 }, 10_001)).toBeUndefined();
   });
 });
 

@@ -1,8 +1,8 @@
 import { AutomationEngine, systemLocalTime, type ActionIntent, type AutomationEvent, type LocalTime } from './automation/engine';
 import type { Rule } from './automation/schema';
 import { checkinText, pingText } from './features/labels';
-import { isLiveShareActive, LIVE_CADENCE, LiveTracker, SOS_CADENCE } from './features/live';
-import { CLOCK_TOLERANCE_MS, normalizeFix } from './geo/fix';
+import { isLiveShareActive, isSosLocationActive, LIVE_CADENCE, LiveTracker, SOS_CADENCE, SOS_LOCATION_MS } from './features/live';
+import { CLOCK_TOLERANCE_MS, normalizeFix, normalizeFixes } from './geo/fix';
 import { GeofenceTracker, type Place } from './geo/geofence';
 import type { LatLon, LocationFix } from './geo/types';
 import { alertLevel, dndEndsAt, isDndActive, normalizePrefs, type AlertLevel, type NotificationPrefs } from './notify/prefs';
@@ -32,6 +32,7 @@ import {
   type Group,
   type GroupMember,
   type LinkedDevice,
+  type MySos,
   type LiveShare,
   type LocationNeeds,
   type MyStatus,
@@ -42,7 +43,7 @@ import {
   type Alarm,
 } from './state';
 import { buildSyncDoc, mergeSyncDoc, parseSyncDoc } from './sync/doc';
-import { decodeLinkInvite, linkCode, linkCommitment, randomLinkSecret, type LinkInvite } from './sync/link';
+import { decodeLinkInvite, LINK_SECRET_BYTES, LINK_TTL_MS, linkCode, linkCommitment, randomLinkSecret, type LinkInvite } from './sync/link';
 import { chunkPayload, Reassembler } from './sync/xfer';
 import type { ContactKey, IncomingMessage, Transport } from './transport/transport';
 import { base64urlDecode, base64urlEncode } from './util/base64url';
@@ -79,9 +80,19 @@ interface PendingLink {
   /** My random share. Wiped once the digits are known. */
   rE: Uint8Array;
   startedAt: number;
+  /**
+   * When it ends: the code's expiry, but never later than `LINK_TTL_MS` after the scan by my
+   * own clock, since the code's expiry comes from the new device's clock.
+   */
+  expiresAt: number;
   /** Set once the new device's reveal opened its commitment. */
   code?: string;
   sending?: boolean;
+  /**
+   * The account in chunks, made on the first "yes" and sent again as they are on a retry: one
+   * transfer, so chunks that arrived on an earlier try still count. Dropped with the session.
+   */
+  chunks?: BodyOf<'xfer.chunk'>[];
 }
 
 export interface SocialNodeOptions {
@@ -119,7 +130,8 @@ const MAX_OWN_WATCHES = 20;
 const MAX_SOS_ACKS = 50;
 /** Sender clocks are trusted for ordering only up to this far ahead of mine. */
 const MAX_CLOCK_AHEAD_MS = 10 * 60_000;
-const SOS_LOCATION_MS = 60 * 60_000;
+/** How far ahead of my clock a contact's last message time may be and still order their updates. */
+const ORDER_TRUST_AHEAD_MS = 60_000;
 const FRESH_FIX_MS = 2 * 60_000;
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
@@ -167,6 +179,8 @@ export class SocialNode {
   private readonly preciseTracker = new LiveTracker(LIVE_CADENCE);
   private readonly coarseTracker = new LiveTracker(LIVE_CADENCE);
   private readonly sosTracker = new LiveTracker(SOS_CADENCE);
+  /** My clock at the last tick or fix, to notice it jumping back. */
+  private lastNow = 0;
   /** Trips, live shares, watches and SOS alerts that ended, so late messages can't revive them. */
   private readonly ended = new RecentIds(1000);
   /** Per sender: notifications in a short window. More only land in the activity list. */
@@ -300,7 +314,7 @@ export class SocialNode {
     if (this.activeTrip) reasons.push('trip');
     const live = this.state.ghost ? [] : this.state.liveShares.filter((s) => isLiveShareActive(s, now));
     if (live.length) reasons.push('live');
-    if (this.state.sos && now < this.state.sos.locationUntil) reasons.push('sos');
+    if (this.state.sos && isSosLocationActive(this.sosWindow(this.state.sos, now), now)) reasons.push('sos');
     const high = reasons.includes('trip') || reasons.includes('sos') || live.some((s) => s.level === 'precise');
     return { mode: high ? 'high' : reasons.length ? 'low' : 'off', reasons };
   }
@@ -493,12 +507,27 @@ export class SocialNode {
     this.afterTripEnded();
   }
 
-  /** Picks up a trip that was running before the app restarted. Sends nothing. */
+  /**
+   * Picks up a trip that was running before the app restarted. Sends nothing, with one exception:
+   * when my clock was set back to before the trip started, the trip is over (as `tick()` decides
+   * while the app runs), but my contacts would still see it running until its end. Then its end
+   * goes out to them, and it is not picked up.
+   */
   resumeTrip(session: SharingSession): boolean {
-    if (this.state.ghost || this.activeTrip || !isSessionActive(session, this.now())) return false;
+    if (this.state.ghost || this.activeTrip) return false;
+    const now = this.now();
     const recipients = session.recipients.filter((k) => this.contact(k));
     if (!recipients.length) return false;
-    this.trip = new TripSharer({ ...session, recipients }, this.options.tripOptions);
+    const trip = new TripSharer({ ...session, recipients }, this.options.tripOptions);
+    if (!isSessionActive(session, now)) {
+      // A trip that simply ran out ends for my contacts on its own too: they know `expiresAt`.
+      if (session.endedAt === undefined && now < session.startedAt - CLOCK_TOLERANCE_MS) {
+        this.trip = trip;
+        for (const body of trip.expire(now)) void this.broadcastTrip(body).catch(() => {});
+      }
+      return false;
+    }
+    this.trip = trip;
     this.emit({ type: 'trip', session: this.trip.session });
     this.emitLocationNeeds();
     return true;
@@ -511,9 +540,42 @@ export class SocialNode {
    * dated in the future counts as now (see `normalizeFix`).
    */
   async onLocationFix(raw: LocationFix): Promise<void> {
+    const fix = normalizeFix(raw, this.now());
+    if (fix) await this.takeFix(fix);
+  }
+
+  /**
+   * Fixes the OS hands over together, oldest first. The same as `onLocationFix` for each, except
+   * that a batch dated in the future moves back as a whole, so its newest position stays the
+   * newest (see `normalizeFixes`).
+   */
+  async onLocationFixes(raw: readonly LocationFix[]): Promise<void> {
+    for (const fix of normalizeFixes(raw, this.now())) await this.takeFix(fix);
+  }
+
+  /**
+   * Notices my clock jumping back while the app runs and moves my own SOS location window
+   * along, so it keeps its remaining time: a person in need whose wrong clock gets corrected
+   * keeps sending their location, and a clock set back by hand cannot stretch the hour.
+   * (After a restart the jump is not known; `isSosLocationActive` then ends the window.)
+   */
+  /** My SOS as `noteClock` will see it at `now` (for read-only checks between ticks). */
+  private sosWindow(sos: MySos, now: number): MySos {
+    const back = this.lastNow - now;
+    return back > CLOCK_TOLERANCE_MS ? { ...sos, locationUntil: sos.locationUntil - back } : sos;
+  }
+
+  private noteClock(now: number): void {
+    const back = this.lastNow - now;
+    this.lastNow = now;
+    if (back <= CLOCK_TOLERANCE_MS) return;
+    const sos = this.state.sos;
+    if (sos) this.update({ sos: { ...sos, locationUntil: sos.locationUntil - back } });
+  }
+
+  private async takeFix(fix: LocationFix): Promise<void> {
     const now = this.now();
-    const fix = normalizeFix(raw, now);
-    if (!fix) return;
+    this.noteClock(now);
     // Out of order, unless the last fix now lies in the future: then the clock was set back, and
     // waiting for it to catch up would freeze location handling, so this fix becomes the reference.
     const last = this.lastFix;
@@ -737,6 +799,7 @@ export class SocialNode {
    */
   async startSos(input: { text?: string; recipients?: ContactKey[] } = {}): Promise<void> {
     const now = this.now();
+    this.noteClock(now);
     const chosen = input.recipients?.length ? input.recipients : this.emergencyContacts().map((c) => c.key);
     const existing = this.state.sos;
     const all = [...new Set([...(existing?.recipients ?? []), ...chosen])].filter((k) => this.contact(k)).slice(0, 21);
@@ -813,7 +876,7 @@ export class SocialNode {
 
   private async sendSosUpdate(fix: LocationFix): Promise<void> {
     const sos = this.state.sos;
-    if (!sos || this.now() >= sos.locationUntil) return;
+    if (!sos || !isSosLocationActive(sos, this.now())) return;
     const point = this.sosTracker.precise(fix);
     if (!point) return;
     this.update({ sos: { ...sos, pointSentAt: this.now() } });
@@ -970,34 +1033,52 @@ export class SocialNode {
    */
   get linkStatus(): LinkStatus | undefined {
     const p = this.pendingLink;
-    if (!p || p.invite.expiresAt <= this.now()) return undefined;
-    return p.code === undefined ? { phase: 'waiting', expiresAt: p.invite.expiresAt } : { phase: 'compare', code: p.code, expiresAt: p.invite.expiresAt };
+    if (!p || p.expiresAt <= this.now()) return undefined;
+    return p.code === undefined ? { phase: 'waiting', expiresAt: p.expiresAt } : { phase: 'compare', code: p.code, expiresAt: p.expiresAt };
   }
 
   /**
    * Starts linking the new device that shows this device code: picks my random share and
    * sends it to the code's one-time key. The digits appear in `linkStatus` once the new device
-   * answered. Replaces a link already in progress. Throws (in German) for bad codes.
+   * answered. Replaces a link already in progress, unless it is the same code again: then my
+   * share stays (a new one would no longer match the new device's digits) and the hello is only
+   * repeated while waiting. Throws (in German) for bad codes. A failed send keeps the session:
+   * the hello may have arrived anyway, and scanning the code again repeats the same share.
    */
   async startLink(text: string): Promise<void> {
     const d = decodeLinkInvite(text, this.now());
     if (!d.ok) throw new Error(d.error);
     if (d.invite.tempKey === this.state.self.key) throw new Error('Dieser Code passt nicht. Lass auf dem neuen Gerät einen neuen anzeigen.');
-    this.clearLink(false);
-    const session: PendingLink = { invite: d.invite, rE: randomLinkSecret(), startedAt: this.now() };
-    // Set before sending, so the answer is accepted however fast it comes.
-    this.pendingLink = session;
-    this.emitLink();
+    const current = this.pendingLink;
+    const same =
+      current !== undefined &&
+      current.expiresAt > this.now() &&
+      current.invite.tempKey === d.invite.tempKey &&
+      current.invite.nonce === d.invite.nonce &&
+      current.invite.commit === d.invite.commit;
+    if (same && current.code !== undefined) return;
+    let session: PendingLink;
+    if (same) {
+      session = current;
+    } else {
+      this.clearLink(false);
+      const startedAt = this.now();
+      session = { invite: d.invite, rE: randomLinkSecret(), startedAt, expiresAt: Math.min(d.invite.expiresAt, startedAt + LINK_TTL_MS) };
+      // Set before sending, so the answer is accepted however fast it comes.
+      this.pendingLink = session;
+      this.emitLink();
+    }
     const hello: BodyOf<'link.hello'> = {
       type: 'link.hello',
-      nonce: d.invite.nonce,
+      nonce: session.invite.nonce,
       rE: base64urlEncode(session.rE),
       relays: this.state.self.relays.filter((r) => RelayUrl.safeParse(r).success).slice(0, 8),
     };
     try {
-      await this.transport.send(d.invite.tempKey, composeMessage(hello, this.now()), { ttlSeconds: TTL.link, relays: d.invite.relays });
+      await this.transport.send(session.invite.tempKey, composeMessage(hello, this.now()), { ttlSeconds: TTL.link, relays: session.invite.relays });
     } catch {
-      if (this.pendingLink === session) this.clearLink();
+      // The relay may have kept it although no OK came back: wiping my share now would make
+      // the digits differ once the new device answers. It goes with cancel, expiry or another code.
       throw new Error('Keine Verbindung. Prüfe dein Internet und versuch es nochmal.');
     }
   }
@@ -1009,25 +1090,29 @@ export class SocialNode {
    */
   async confirmLink(secretKeyHex: string): Promise<void> {
     const p = this.pendingLink;
-    if (!p || p.invite.expiresAt <= this.now()) throw new Error('Die Zeit ist abgelaufen. Lass auf dem neuen Gerät einen neuen Code anzeigen.');
+    if (!p || p.expiresAt <= this.now()) throw new Error('Die Zeit ist abgelaufen. Lass auf dem neuen Gerät einen neuen Code anzeigen.');
     if (p.code === undefined) throw new Error('Vergleiche zuerst die Zahlen auf beiden Geräten.');
     if (p.sending) throw new Error('Dein Konto wird schon gesendet.');
     if (!/^[0-9a-f]{64}$/.test(secretKeyHex)) throw new Error('Ungültiger Schlüssel.');
-    const { self } = this.state;
-    const payload = {
-      format: 'heyda.link',
-      v: 2,
-      nonce: p.invite.nonce,
-      secretKey: secretKeyHex,
-      relays: self.relays,
-      deviceId: self.deviceId,
-      deviceName: self.deviceName,
-      devices: this.state.devices,
-      doc: buildSyncDoc(this.state),
-    };
+    if (!p.chunks) {
+      const { self } = this.state;
+      const payload = {
+        format: 'heyda.link',
+        v: 2,
+        nonce: p.invite.nonce,
+        secretKey: secretKeyHex,
+        relays: self.relays.filter((r) => RelayUrl.safeParse(r).success).slice(0, 8),
+        deviceId: self.deviceId,
+        deviceName: self.deviceName,
+        devices: this.state.devices,
+        doc: buildSyncDoc(this.state),
+      };
+      // The new device keeps at most two unfinished transfers; a new id per try would run out.
+      p.chunks = chunkPayload(randomId(), 'link', payload);
+    }
     p.sending = true;
     try {
-      for (const chunk of chunkPayload(randomId(), 'link', payload)) {
+      for (const chunk of p.chunks) {
         await this.transport.send(p.invite.tempKey, composeMessage(chunk, this.now()), { ttlSeconds: TTL.link, relays: p.invite.relays });
       }
     } catch {
@@ -1047,6 +1132,7 @@ export class SocialNode {
     const p = this.pendingLink;
     if (!p) return;
     p.rE.fill(0);
+    delete p.chunks;
     this.pendingLink = undefined;
     if (emit) this.emitLink();
   }
@@ -1058,14 +1144,14 @@ export class SocialNode {
   /** Whether a link.reveal is the one answer my pending device link waits for. */
   private awaitsReveal(from: ContactKey, m: MessageOf<'link.reveal'>): boolean {
     const p = this.pendingLink;
-    return !!p && p.code === undefined && p.invite.expiresAt > this.now() && from === p.invite.tempKey && m.nonce === p.invite.nonce;
+    return !!p && p.code === undefined && p.expiresAt > this.now() && from === p.invite.tempKey && m.nonce === p.invite.nonce;
   }
 
   private onLinkReveal(from: ContactKey, m: MessageOf<'link.reveal'>): void {
     const p = this.pendingLink;
     if (!p || !this.awaitsReveal(from, m)) return;
     const rN = base64urlDecode(m.rN);
-    if (linkCommitment(rN) !== p.invite.commit) {
+    if (rN.length !== LINK_SECRET_BYTES || linkCommitment(rN) !== p.invite.commit) {
       // The device that made the code did not keep its word: never send this one anything.
       rN.fill(0);
       this.clearLink();
@@ -1110,6 +1196,7 @@ export class SocialNode {
    */
   async tick(): Promise<void> {
     const now = this.now();
+    this.noteClock(now);
     if (this.trip && !this.trip.isEnded) {
       const end = this.trip.expire(now);
       if (end.length) {
@@ -1136,7 +1223,7 @@ export class SocialNode {
     this.checkOverdueWatches(now);
     this.pruneStatuses(now);
     this.pruneLists(now);
-    if (this.pendingLink && this.pendingLink.invite.expiresAt <= now) this.clearLink();
+    if (this.pendingLink && this.pendingLink.expiresAt <= now) this.clearLink();
     this.emitLocationNeeds();
     await this.flushOutbox();
     await this.flushSync();
@@ -1151,11 +1238,15 @@ export class SocialNode {
       const now = this.now();
       const keep: [OutboxEntry, OutboxEntry][] = [];
       let offline = false;
+      const maxWaitMs = 10 * 60_000;
       for (const e of before) {
-        // Only the time that is left, so a late retry does not keep the message on relays for longer.
-        const ttlSeconds = Math.ceil((e.firstAt + e.ttlSeconds * 1000 - now) / 1000);
+        // Only the time that is left, so a late retry does not keep the message on relays for longer
+        // (and never more than it was given, also after the clock was set back).
+        const ttlSeconds = Math.min(e.ttlSeconds, Math.ceil((e.firstAt + e.ttlSeconds * 1000 - now) / 1000));
         if (ttlSeconds <= 0) continue;
-        if (offline || (!force && (e.nextAt ?? 0) > now)) {
+        // A retry further ahead than the longest wait means the clock was set back: it is due now.
+        const waiting = e.nextAt !== undefined && e.nextAt > now && e.nextAt - now <= maxWaitMs;
+        if (offline || (!force && waiting)) {
           keep.push([e, e]);
           continue;
         }
@@ -1166,7 +1257,7 @@ export class SocialNode {
           if (!isSendable(e.message)) continue;
           offline = true;
           const attempts = e.attempts + 1;
-          keep.push([e, { ...e, attempts, nextAt: now + Math.min(10 * 60_000, 15_000 * 2 ** Math.min(attempts, 6)) }]);
+          keep.push([e, { ...e, attempts, nextAt: now + Math.min(maxWaitMs, 15_000 * 2 ** Math.min(attempts, 6)) }]);
         }
       }
       // Entries queued while this loop was sending stay too; entries dropped meanwhile stay dropped.
@@ -1392,7 +1483,7 @@ export class SocialNode {
   private onPresence(from: ContactKey, m: MessageOf<'presence'>, at: number): void {
     const prev = this.statuses.get(from)?.presence;
     const sentAt = senderTime(m.sentAt, at);
-    if (prev?.sentAt !== undefined && sentAt < prev.sentAt) return;
+    if (isOlder(sentAt, prev?.sentAt, at)) return;
     const presence: NonNullable<ContactStatus['presence']> = { updatedAt: at, sentAt };
     if (m.status && m.status.expiresAt > at) presence.status = m.status;
     if (m.dnd && (m.dnd.until === undefined || m.dnd.until > at)) presence.dnd = m.dnd;
@@ -1427,7 +1518,7 @@ export class SocialNode {
     if (this.ended.has(`trip|${from}|${m.sessionId}`)) return;
     const prev = this.statuses.get(from)?.trip;
     const sentAt = senderTime(m.sentAt, at);
-    if (prev && prev.sessionId === m.sessionId && sentAt < prev.lastSentAt) return; // relays may reorder
+    if (prev && prev.sessionId === m.sessionId && isOlder(sentAt, prev.lastSentAt, at)) return; // relays may reorder
     const base =
       prev?.sessionId === m.sessionId
         ? prev
@@ -1520,7 +1611,7 @@ export class SocialNode {
       return;
     }
     const sentAt = senderTime(m.sentAt, at);
-    if (same && sentAt < prev.lastSentAt) return;
+    if (same && isOlder(sentAt, prev.lastSentAt, at)) return;
     // Updates that overtake their start message are kept as coarse until the start arrives.
     const base = same ? prev : { shareId: m.shareId, level: 'coarse' as const };
     const point = base.level === 'precise' ? m.point : undefined;
@@ -1646,7 +1737,7 @@ export class SocialNode {
       if (!same || prev.endedAt) return;
       let next = prev;
       const sentAt = senderTime(m.sentAt, at);
-      if (m.point && sentAt >= (prev.lastSentAt ?? 0)) next = { ...next, point: m.point, pointAt: at, lastSentAt: sentAt };
+      if (m.point && !isOlder(sentAt, prev.lastSentAt, at)) next ={ ...next, point: m.point, pointAt: at, lastSentAt: sentAt };
       if (m.acks) {
         const acks = [...next.acks];
         for (const a of m.acks) {
@@ -1803,7 +1894,8 @@ export class SocialNode {
   // ---- automations -----------------------------------------------------------------------------
 
   private async runAutomations(event: AutomationEvent): Promise<void> {
-    for (const intent of this.engine.handle(event)) {
+    // Limits by my clock: a place event carries the time of its fix, which may come late.
+    for (const intent of this.engine.handle(event, this.now())) {
       // In ghost mode, rules that depend on where I am may only act on this device.
       if (this.state.ghost && !isLocalIntent(intent, this.state.prefs) && this.usesMyLocation(intent.ruleId)) continue;
       try {
@@ -2132,6 +2224,18 @@ function stampOf(c: Contact): number {
 /** The sender's clock, capped a little ahead of mine, so a clock that ran fast cannot freeze later updates. */
 function senderTime(sentAt: number, at: number): number {
   return Math.min(sentAt, at + MAX_CLOCK_AHEAD_MS);
+}
+
+/**
+ * Whether a contact's message (its `senderTime`) is older than the last one I took, so relays
+ * that reorder cannot bring back an old state. The order is trusted only while the last time is
+ * not clearly ahead of my clock. A last time further ahead means either the sender's clock ran
+ * fast (and may have been corrected since) or my clock was set back: then the new message
+ * counts, instead of none for up to `MAX_CLOCK_AHEAD_MS`. Exact replays are still caught by the
+ * seen stores.
+ */
+function isOlder(sentAt: number, lastSentAt: number | undefined, at: number): boolean {
+  return lastSentAt !== undefined && sentAt < lastSentAt && lastSentAt <= at + ORDER_TRUST_AHEAD_MS;
 }
 
 /** Actions that tell nobody anything: quiet mode counts only while it is not shared with contacts. */
