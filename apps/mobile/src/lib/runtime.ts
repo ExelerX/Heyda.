@@ -27,7 +27,7 @@ import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@heyda/transpor
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
 import { DEMO_KEYS, startDemoFriends } from './demo';
-import { cancelAlarm, deliverAlert, scheduleAlarm, setBadge } from './notifications';
+import { cancelAlarm, deliverAlert, scheduleAlarm, setBadge, setOpenThread as setNotificationThread } from './notifications';
 import { desktop, deviceLabel, isBrowserPreview, isDesktop } from './platform';
 import type { Appearance } from './theme';
 import { DesktopVault, EncryptedFileVault, MemoryVault, type Vault } from './vault';
@@ -76,6 +76,8 @@ export interface Snapshot {
   unreadTotal: number;
   activity: Alert[];
   activeTrip: SharingSession | undefined;
+  /** Minutes to the destination of my running trip, once known. */
+  activeTripEta: number | undefined;
   templates: RuleTemplate[];
   plugins: Plugin[];
   settings: Settings;
@@ -341,6 +343,7 @@ export class AppRuntime {
         unreadTotal,
         activity: this.data.activity,
         activeTrip: this.node.activeTrip,
+        activeTripEta: this.node.activeTripEta,
         isDemo: this.data.settings.demo,
         templates: [...BUILTIN_TEMPLATES, ...this.data.plugins.flatMap((p) => p.templates)],
         plugins: this.data.plugins,
@@ -371,6 +374,7 @@ export class AppRuntime {
   /** The chat on screen: its messages count as read and need no banner. */
   setOpenThread(thread: string | undefined): void {
     this.openThread = thread;
+    setNotificationThread(thread);
     if (thread) this.markRead(thread);
   }
 

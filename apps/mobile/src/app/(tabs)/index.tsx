@@ -65,10 +65,17 @@ export default function Start() {
     : 'Ruhe ist aus';
 
   async function toggleGhost(on: boolean) {
-    if (on && liveShares.length) {
+    if (on && (liveShares.length || activeTrip)) {
+      const ends = [
+        liveShares.length ? 'deine Live-Standorte' : '',
+        activeTrip ? `das Teilen deiner Ankunftszeit („${activeTrip.destinationName}“)` : '',
+      ].filter(Boolean);
+      const tripWatch = activeTrip ? state.watches.find((w) => w.tripId === activeTrip.id) : undefined;
       const ok = await confirm({
         title: 'Geistmodus einschalten?',
-        message: 'Dabei werden deine Live-Standorte beendet.',
+        message:
+          `Dabei ${liveShares.length ? 'werden' : 'wird'} ${ends.join(' und ')} beendet.` +
+          (tripWatch ? ` „Pass auf mich auf“ läuft weiter: Melde dich bis ${hhmm(tripWatch.dueAt)} mit „Gut angekommen“.` : ''),
         ok: 'Einschalten',
       });
       if (!ok) return;

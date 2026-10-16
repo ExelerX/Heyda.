@@ -163,6 +163,7 @@ function TripForm({ onStarted }: { onStarted: () => void }) {
   const [watchOn, setWatchOn] = useState(false);
   const [watchPick, setWatchPick] = useState(1);
   const [busy, setBusy] = useState(false);
+  const [ghostBusy, setGhostBusy] = useState(false);
   const [hasFix, setHasFix] = useState(false);
 
   // A first position (if allowed already, or the demo one) for the arrival estimate. Never prompts.
@@ -246,6 +247,31 @@ function TripForm({ onStarted }: { onStarted: () => void }) {
         text="Füge zuerst Familie oder Freunde hinzu. Dann kannst du ihnen zeigen, wann du ankommst."
         action={<Button title="Freund hinzufügen" icon="🤝" onPress={() => router.replace('/pair')} />}
       />
+    );
+  }
+
+  async function ghostOff() {
+    setGhostBusy(true);
+    try {
+      await runtime.node.setGhost(false);
+    } catch (e) {
+      notice('Hat nicht geklappt', errorText(e));
+    } finally {
+      setGhostBusy(false);
+    }
+  }
+
+  // Starting would fail in ghost mode (nothing about my location may leave the phone), so offer to switch it off first.
+  if (state.ghost) {
+    return (
+      <Card style={{ gap: spacing.md, borderColor: t.info }}>
+        <T variant="h2">👻 Der Geistmodus ist an</T>
+        <T variant="muted">
+          Solange er an ist, geht keine Ankunftszeit an deine Freunde – Heyda. teilt nichts über deinen Standort. Ein Notruf (SOS)
+          geht trotzdem raus.
+        </T>
+        <Button title="Geistmodus ausschalten" onPress={() => void ghostOff()} busy={ghostBusy} />
+      </Card>
     );
   }
 

@@ -1,11 +1,11 @@
 import { CAPABILITY_TEXT, importPlugin, MAX_PLUGIN_BYTES, type ImportResult, type Plugin } from '@heyda/core';
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
-import { router, Stack } from 'expo-router';
+import { Stack } from 'expo-router';
 import { useState } from 'react';
 import { Platform, Text, View } from 'react-native';
 import { SentenceText, SmallAction } from '../components/automation/cards';
-import { Banner, Bullet, errorText, Field, Narrow } from '../components/setup/kit';
+import { Banner, Bullet, errorText, Field, leave, Narrow } from '../components/setup/kit';
 import { Button, Card, Row, Screen, Section, T } from '../components/ui';
 import { confirm } from '../lib/confirm';
 import { useRuntime, useSnapshot } from '../lib/store';
@@ -30,7 +30,7 @@ const EXAMPLE = JSON.stringify(
           { name: 'place', kind: 'place_name', label: 'Schule', default: 'Schule' },
         ],
         rule: {
-          name: 'Schule: {{slot:place}}',
+          name: 'Angekommen: {{slot:place}}',
           trigger: { on: 'contact.arrive', contact: '{{slot:contact}}', place: '{{slot:place}}' },
           conditions: [{ if: 'weekday', days: [1, 2, 3, 4, 5] }],
           actions: [{ do: 'notify', title: '{{contact}} ist in der Schule', body: '{{contact}} ist bei {{place}} angekommen.' }],
@@ -140,7 +140,7 @@ export default function PluginImport() {
             <T variant="small" color={t.text}>
               {`${installed.templates.length} ${installed.templates.length === 1 ? 'neue Vorlage steht' : 'neue Vorlagen stehen'} jetzt bei den Automationen. Noch ist nichts aktiv: Richte eine Vorlage ein, wenn du sie nutzen willst.`}
             </T>
-            <Button title="Zu den Vorlagen" kind="ghost" compact onPress={() => router.back()} style={{ alignSelf: 'flex-start' }} />
+            <Button title="Zu den Vorlagen" kind="ghost" compact onPress={() => leave('/automations')} style={{ alignSelf: 'flex-start' }} />
           </Banner>
         )}
 

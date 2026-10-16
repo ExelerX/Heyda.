@@ -22,7 +22,7 @@ import {
   type Obj,
 } from '../../components/automation/catalog';
 import { ActionParams, ConditionParams, TriggerParams } from '../../components/automation/params';
-import { Banner, Bullet, errorText, Field, Narrow, NotFound, param } from '../../components/setup/kit';
+import { Banner, Bullet, errorText, Field, leave, Narrow, NotFound, param } from '../../components/setup/kit';
 import { Button, Card, Screen, T, Toggle } from '../../components/ui';
 import { confirm, notice } from '../../lib/confirm';
 import { useContactName, useRuntime, useSnapshot } from '../../lib/store';
@@ -104,7 +104,7 @@ function Builder({ initial }: { initial?: Rule }) {
     if (!result.ok) return;
     try {
       runtime.saveRule(result.rule);
-      router.back();
+      leave('/automations');
     } catch (e) {
       notice('Nicht gespeichert', errorText(e));
     }
@@ -114,7 +114,7 @@ function Builder({ initial }: { initial?: Rule }) {
     if (!initial) return;
     const ok = await confirm({ title: `„${initial.name}“ löschen?`, message: 'Die Automation ist dann weg.', ok: 'Löschen', destructive: true });
     if (!ok) return;
-    router.back();
+    leave('/automations');
     runtime.removeRule(initial.id);
   }
 

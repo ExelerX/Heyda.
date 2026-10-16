@@ -2,7 +2,7 @@ import { contactLabel, parseLocationInput, type Place } from '@heyda/core';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useState } from 'react';
 import { View } from 'react-native';
-import { Banner, Bullet, errorText, Field, Narrow, NotFound, param } from '../../components/setup/kit';
+import { Banner, Bullet, errorText, Field, leave, Narrow, NotFound, param } from '../../components/setup/kit';
 import { TileMap } from '../../components/TileMap';
 import { Button, Card, Chip, Screen, Section, T, Wrap } from '../../components/ui';
 import { confirm, notice } from '../../lib/confirm';
@@ -171,7 +171,7 @@ function PlaceEditor({ place }: { place?: Place }) {
         const want = viewers.has(c.key);
         if (has !== want) runtime.setPlaceGrant(c.key, want ? [...current, id] : current.filter((x) => x !== id));
       }
-      router.back();
+      leave('/places');
     } catch (e) {
       notice('Nicht gespeichert', errorText(e));
       setBusy(undefined);
@@ -187,7 +187,7 @@ function PlaceEditor({ place }: { place?: Place }) {
       destructive: true,
     });
     if (!ok) return;
-    router.back();
+    leave('/places');
     runtime.removePlace(place.id);
   }
 

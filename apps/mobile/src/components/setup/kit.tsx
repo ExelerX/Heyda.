@@ -1,3 +1,4 @@
+import { router, type Href } from 'expo-router';
 import { useState, type ReactNode } from 'react';
 import { Platform, Pressable, StyleSheet, Text, TextInput, View, type KeyboardTypeOptions, type StyleProp, type ViewStyle } from 'react-native';
 import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
@@ -338,4 +339,10 @@ export function errorText(e: unknown, fallback = 'Das hat leider nicht geklappt.
 /** One route param as a string (expo-router can give arrays for repeated params). */
 export function param(v: string | string[] | undefined): string {
   return (Array.isArray(v) ? v[0] : v) ?? '';
+}
+
+/** Goes back, or to `fallback` when the screen was opened directly (link, reload) and there is no way back. */
+export function leave(fallback: Href): void {
+  if (router.canGoBack()) router.back();
+  else router.replace(fallback);
 }

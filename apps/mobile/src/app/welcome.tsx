@@ -1,3 +1,4 @@
+import type { LinkPayload } from '@heyda/core';
 import * as Clipboard from 'expo-clipboard';
 import { router } from 'expo-router';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
@@ -421,7 +422,10 @@ function LinkReceive() {
   const now = useTick(1000);
   const [attempt, setAttempt] = useState(0);
   const [session, setSession] = useState<LinkSession>();
-  const [phase, setPhase] = useState<'starting' | 'waiting' | 'received' | 'error'>('starting');
+  const [phase, setPhase] = useState<'starting' | 'waiting' | 'confirm' | 'rejected' | 'received' | 'error'>('starting');
+  // The received account waits here until the person confirms it is theirs. Only in component
+  // state (gone on unmount), never logged, and dropped on "Nein" or a new attempt.
+  const [pending, setPending] = useState<LinkPayload>();
   const [error, setError] = useState<string>();
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -437,6 +441,7 @@ function LinkReceive() {
     setPhase('starting');
     setError(undefined);
     setSession(undefined);
+    setPending(undefined);
     beginLinkReceive().then(
       (s) => {
         s.result.catch(() => {});
@@ -448,29 +453,11 @@ function LinkReceive() {
         setSession(s);
         setPhase('waiting');
         s.result.then(
-          async (payload) => {
+          (payload) => {
             if (cancelled) return;
-            setPhase('received');
-            let stopped = false;
-            try {
-              // Stop this device's empty account first so it cannot save over the received one.
-              await runtimeRef.current.shutdown(false);
-              stopped = true;
-              await completeLink(payload);
-              await restartRef.current();
-              try {
-                router.replace('/');
-              } catch {
-                // Already at the start screen after the restart.
-              }
-            } catch (e) {
-              setError(errorText(e, 'Das Konto konnte nicht gespeichert werden.'));
-              setPhase('error');
-              if (stopped) {
-                notice('Verbinden hat nicht geklappt', errorText(e));
-                await restartRef.current().catch(() => {});
-              }
-            }
+            // Do not take it over yet: anyone who saw the code could have sent their account.
+            setPending(payload);
+            setPhase('confirm');
           },
           (e) => {
             if (cancelled) return;
@@ -493,6 +480,38 @@ function LinkReceive() {
 
   useEffect(() => () => clearTimeout(copyTimer.current), []);
 
+  async function accept() {
+    const payload = pending;
+    if (!payload || phase !== 'confirm') return;
+    setPending(undefined);
+    setPhase('received');
+    let stopped = false;
+    try {
+      // Stop this device's empty account first so it cannot save over the received one.
+      await runtimeRef.current.shutdown(false);
+      stopped = true;
+      await completeLink(payload);
+      await restartRef.current();
+      try {
+        router.replace('/');
+      } catch {
+        // Already at the start screen after the restart.
+      }
+    } catch (e) {
+      setError(errorText(e, 'Das Konto konnte nicht gespeichert werden.'));
+      setPhase('error');
+      if (stopped) {
+        notice('Verbinden hat nicht geklappt', errorText(e));
+        await restartRef.current().catch(() => {});
+      }
+    }
+  }
+
+  function reject() {
+    setPending(undefined);
+    setPhase('rejected');
+  }
+
   async function copy() {
     if (!session) return;
     try {
@@ -511,12 +530,25 @@ function LinkReceive() {
   return (
     <View style={{ gap: spacing.md }}>
       <T variant="title">Mit deinem Konto verbinden</T>
-      <Card style={{ gap: spacing.sm }}>
-        <Step n={1}>Öffne Heyda. auf deinem anderen Gerät, auf dem dein Konto schon läuft.</Step>
-        <Step n={2}>Tippe dort auf Ich → Meine Geräte → „Neues Gerät verbinden“.</Step>
-        <Step n={3}>Scanne diesen QR-Code. Am PC: Kopiere den Code-Text unten und füge ihn dort ein.</Step>
-        <Step n={4}>Prüfe, dass beide Geräte dieselben 6 Zahlen zeigen, und bestätige dort.</Step>
-      </Card>
+      {(phase === 'starting' || phase === 'waiting' || phase === 'error') && (
+        <Card style={{ gap: spacing.sm }}>
+          <Step n={1}>Öffne Heyda. auf deinem anderen Gerät, auf dem dein Konto schon läuft.</Step>
+          <Step n={2}>Tippe dort auf Ich → Meine Geräte → „Neues Gerät verbinden“.</Step>
+          <Step n={3}>Scanne diesen QR-Code. Am PC: Kopiere den Code-Text unten und füge ihn dort ein.</Step>
+          <Step n={4}>Prüfe, dass beide Geräte dieselben 6 Zahlen zeigen, und bestätige dort.</Step>
+        </Card>
+      )}
+
+      {phase === 'confirm' && pending && <ConfirmAccount payload={pending} onYes={() => void accept()} onNo={reject} />}
+
+      {phase === 'rejected' && (
+        <>
+          <Banner tone="warn" title="Abgebrochen">
+            Dann hat jemand anderes deinen Code benutzt. Starte neu und zeige den Code nur deinem eigenen Gerät.
+          </Banner>
+          <Button title="Neu starten" icon="🔄" onPress={() => setAttempt((a) => a + 1)} />
+        </>
+      )}
 
       {phase === 'starting' && (
         <Card style={{ alignItems: 'center', paddingVertical: spacing.xxl }}>
@@ -568,6 +600,50 @@ function LinkReceive() {
           </>
         )
       )}
+    </View>
+  );
+}
+
+/** Shows what arrived and lets the person refuse an account that is not theirs. */
+function ConfirmAccount({ payload, onYes, onNo }: { payload: LinkPayload; onYes: () => void; onNo: () => void }) {
+  const t = useTheme();
+  const contacts = Array.isArray(payload.doc.contacts) ? payload.doc.contacts : [];
+  const name = payload.doc.profileName?.trim() || 'ohne Namen';
+  const examples = contacts
+    .slice(0, 3)
+    .map((c) => (c.nickname || c.name).trim())
+    .filter(Boolean);
+  const contactText =
+    contacts.length === 0
+      ? 'noch keine'
+      : `${contacts.length}${examples.length ? ` (z. B. ${examples.join(', ')}${contacts.length > examples.length ? ', …' : ''})` : ''}`;
+  const rows: { icon: string; label: string; value: string }[] = [
+    { icon: '👤', label: 'Name', value: name },
+    { icon: '📱', label: 'Gesendet von', value: payload.deviceName },
+    { icon: '👥', label: 'Kontakte', value: contactText },
+  ];
+  return (
+    <View style={{ gap: spacing.md }}>
+      <Card style={{ gap: spacing.md, borderColor: t.accent, borderWidth: 1 }}>
+        <T variant="h2">Ist das dein Konto?</T>
+        <T variant="muted">Ein Konto ist angekommen. Es wird erst übernommen, wenn du bestätigst.</T>
+        {rows.map((r) => (
+          <Row key={r.label} gap={spacing.md} style={{ alignItems: 'flex-start' }}>
+            <Text style={{ fontSize: 20 }} accessibilityElementsHidden importantForAccessibility="no">
+              {r.icon}
+            </Text>
+            <View style={{ flex: 1 }} accessible accessibilityLabel={`${r.label}: ${r.value}`}>
+              <T variant="small">{r.label}</T>
+              <T style={{ fontWeight: '700' }}>{r.value}</T>
+            </View>
+          </Row>
+        ))}
+      </Card>
+      <Bullet icon="⚠️">
+        Kennst du den Namen oder das Gerät nicht? Dann tippe auf „Nein, abbrechen“. Sonst landet ein fremdes Konto auf diesem Gerät.
+      </Bullet>
+      <Button title="Ja, das ist mein Konto" icon="✅" onPress={onYes} />
+      <Button title="Nein, abbrechen" kind="secondary" onPress={onNo} />
     </View>
   );
 }

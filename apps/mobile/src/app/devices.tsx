@@ -20,7 +20,6 @@ function dateText(at: number): string {
 }
 
 export default function Devices() {
-  const t = useTheme();
   const runtime = useRuntime();
   const { state, isDemo } = useSnapshot();
   const [flow, setFlow] = useState<Flow>({ step: 'idle' });

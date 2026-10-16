@@ -5,7 +5,7 @@ import { View } from 'react-native';
 import { LIMITS_TEXT, triggerInfo } from '../../components/automation/catalog';
 import { SentenceText } from '../../components/automation/cards';
 import { ContactPick, NumberPick, PlacePick } from '../../components/automation/pickers';
-import { Banner, Bullet, errorText, Field, Narrow, NotFound, param } from '../../components/setup/kit';
+import { Banner, Bullet, errorText, Field, leave, Narrow, NotFound, param } from '../../components/setup/kit';
 import { Button, Card, Chip, Pill, Screen, Section, T, Wrap } from '../../components/ui';
 import { notice } from '../../lib/confirm';
 import { useContactName, useRuntime, useSnapshot } from '../../lib/store';
@@ -72,7 +72,7 @@ function TemplateForm({ template }: { template: RuleTemplate }) {
       const r = instantiateTemplate(template, values, { source: plugin ? 'plugin' : 'template' });
       if (!r.ok) return;
       runtime.saveRule(r.value);
-      router.back();
+      leave('/automations');
     } catch (e) {
       notice('Nicht gespeichert', errorText(e));
     } finally {

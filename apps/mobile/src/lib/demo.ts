@@ -69,6 +69,8 @@ export function startDemoFriends(network: MemoryNetwork, me: SocialNode): () => 
     later(9000, () => oma.sendCheckin({ to: [meKey], kind: 'home', text: 'Bin gut zuhause angekommen' }));
     later(14_000, () => max.onPlaceTransition('store', 'leave'));
     later(15_000, () => max.sendPing(meKey, 'help-carry'));
+    // So the demo also shows answering a "Wo bist du?" question.
+    later(25_000, () => max.askWhere(meKey));
   })();
 
   return () => {

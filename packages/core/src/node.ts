@@ -507,8 +507,11 @@ export class SocialNode {
 
   private async onTripFix(fix: LocationFix): Promise<void> {
     if (!this.trip || this.trip.isEnded) return;
+    const etaBefore = this.trip.lastEtaMinutes;
     for (const body of this.trip.onFix(fix)) await this.broadcastTrip(body);
     if (this.trip.isEnded) this.afterTripEnded();
+    // Screens show my own ETA too.
+    else if (this.trip.lastEtaMinutes !== etaBefore) this.emit({ type: 'trip', session: this.trip.session });
   }
 
   private async handlePlaceEvent(placeId: string, type: 'arrive' | 'leave', at: number): Promise<void> {
