@@ -50,6 +50,8 @@ import {
 import { FileStore, SecretStore, writeFileAtomic } from './storage';
 import type { SecretCipher } from './storage';
 import { createWebHandler } from './web-handler';
+import { CrashReloadPolicy, wantsSystemNotification } from './window-policy';
+import type { WindowState } from './window-policy';
 
 const APP_USER_MODEL_ID = 'io.github.exelerx.heyda';
 const WINDOW_TITLE = 'Heyda.';
@@ -68,6 +70,8 @@ let badgeCount = 0;
 let dialogOpen = false;
 // Electron only delivers 'click' while the Notification object is alive, so keep recent ones.
 const liveNotifications: Notification[] = [];
+const crashReloads = new CrashReloadPolicy();
+const CRASH_RELOAD_DELAY_MS = 1000;
 
 /** A failure whose message is safe and useful to show in the UI (no paths, no internals). */
 class BridgeError extends Error {}
@@ -246,6 +250,8 @@ function createWindow(show: boolean): BrowserWindow {
     if (show) win.show();
   });
 
+  win.webContents.on('render-process-gone', (_event, details) => onUiGone(win, details.reason, details.exitCode));
+
   if (!app.isPackaged) enableDevToolsShortcut(win);
   addEditContextMenu(win.webContents);
   win.loadURL(APP_START_URL).catch((error: unknown) => console.error('Failed to load the UI', error));
@@ -255,10 +261,43 @@ function createWindow(show: boolean): BrowserWindow {
 
 function showWindow(): BrowserWindow {
   const win = mainWindow ?? createWindow(true);
+  if (win.webContents.isCrashed()) {
+    // The user asks for the app again after it gave up reloading a crashing UI: try once more.
+    crashReloads.reset();
+    reloadUi(win);
+  }
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
   return win;
+}
+
+/**
+ * The UI process holds the relay connection and the alarm timers. If it dies while the window sits hidden in
+ * the tray, nothing arrives any more, so reload it; after repeated crashes tell the user instead of looping.
+ */
+function onUiGone(win: BrowserWindow, reason: string, exitCode: number): void {
+  if (quitting || win.isDestroyed() || reason === 'clean-exit') return;
+  console.error(`The UI process ended unexpectedly (${reason}, exit code ${exitCode})`);
+  if (crashReloads.shouldReload(Date.now())) {
+    setTimeout(() => reloadUi(win), CRASH_RELOAD_DELAY_MS);
+    return;
+  }
+  if (!Notification.isSupported()) return;
+  showNotification(
+    new Notification({
+      title: 'Heyda. wurde angehalten',
+      body: 'Die App ist mehrmals abgestürzt. Nachrichten und Alarme kommen erst wieder an, wenn du Heyda. öffnest.',
+      urgency: 'critical',
+    }),
+    () => showWindow(),
+  );
+}
+
+/** Loads the start page, not the current URL: some routes (e.g. group chats, "g:…") are not valid file paths. */
+function reloadUi(win: BrowserWindow): void {
+  if (win.isDestroyed()) return;
+  win.loadURL(APP_START_URL).catch((error: unknown) => console.error('Failed to reload the UI', error));
 }
 
 function attention(): void {
@@ -372,6 +411,8 @@ function setAutostart(on: boolean): void {
 
 function notify(n: DesktopNotification): void {
   if (!Notification.isSupported()) return;
+  // The UI already shows its own banner while it is on screen (alarms excepted, see wantsSystemNotification).
+  if (!wantsSystemNotification(n.level, mainWindowState())) return;
   const onClick = (): void => {
     showWindow();
     mainWindow?.webContents.send(NOTIFICATION_CLICK_CHANNEL, n.id);
@@ -382,6 +423,12 @@ function notify(n: DesktopNotification): void {
   } else {
     showNotification(new Notification(plainNotificationOptions(n)), onClick);
   }
+}
+
+function mainWindowState(): WindowState | null {
+  const win = mainWindow;
+  if (win === null || win.isDestroyed()) return null;
+  return { visible: win.isVisible(), focused: win.isFocused(), minimized: win.isMinimized() };
 }
 
 function plainNotificationOptions(n: DesktopNotification): NotificationConstructorOptions {

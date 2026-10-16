@@ -4,6 +4,9 @@ import {
   CONTENT_SECURITY_POLICY,
   DEFAULT_SAVE_NAME,
   InvalidArgumentError,
+  MAX_NOTIFICATION_BODY_CHARS,
+  MAX_NOTIFICATION_INPUT_CHARS,
+  MAX_NOTIFICATION_TITLE_CHARS,
   MAX_SECRET_CHARS,
   escapeXml,
   expectArgCount,
@@ -20,6 +23,7 @@ import {
   parseSuggestedFileName,
   parseVaultName,
   resolveWebPath,
+  shortenText,
   urgentToastXml,
 } from './security';
 
@@ -103,6 +107,10 @@ describe('resolveWebPath', () => {
       path: path.join(root, 'assets', '__node_modules', 'x', 'back-icon@2x.png'),
     });
     expect(resolveWebPath(root, '/assets/a%20b.png')).toEqual({ kind: 'file', path: path.join(root, 'assets', 'a b.png') });
+    // Only whole device names are refused, not names that merely start with one.
+    expect(resolveWebPath(root, '/assets/icon.png')).toEqual({ kind: 'file', path: path.join(root, 'assets', 'icon.png') });
+    expect(resolveWebPath(root, '/console.js')).toEqual({ kind: 'file', path: path.join(root, 'console.js') });
+    expect(resolveWebPath(root, '/com10.js')).toEqual({ kind: 'file', path: path.join(root, 'com10.js') });
   });
 
   it('falls back to the SPA for client-side routes', () => {
@@ -124,6 +132,13 @@ describe('resolveWebPath', () => {
       '/assets/file.js::$DATA',
       '/%E0%A4%A',
       '/./index.html',
+      // Windows device names open the device, not a file (in an unpacked build reading web/ from disk).
+      '/CON.js',
+      '/assets/nul.png',
+      '/assets/com1.json',
+      '/lpt9/app.js',
+      '/CONIN$.js',
+      '/aux%20.css',
     ]) {
       expect(resolveWebPath(root, evil), evil).toEqual({ kind: 'invalid' });
     }
@@ -187,12 +202,35 @@ describe('IPC argument validation', () => {
       { ...ok, id: '' },
       { ...ok, id: 'x'.repeat(129) },
       { ...ok, title: '' },
-      { ...ok, body: 'x'.repeat(2049) },
+      { ...ok, title: 'x'.repeat(MAX_NOTIFICATION_INPUT_CHARS + 1) },
+      { ...ok, body: 'x'.repeat(MAX_NOTIFICATION_INPUT_CHARS + 1) },
+      { ...ok, body: 42 },
       { ...ok, level: 'loud' },
       { ...ok, level: undefined },
     ]) {
-      expect(() => parseNotification(bad), JSON.stringify(bad)).toThrow(InvalidArgumentError);
+      expect(() => parseNotification(bad), JSON.stringify(bad).slice(0, 80)).toThrow(InvalidArgumentError);
     }
+  });
+
+  it('shortens long notification text instead of dropping the notification', () => {
+    // A chat message may be 4000 characters (core: chat.text / group.text) and becomes the body as it is.
+    const chat = { id: 'n2', title: 'Lisa', body: 'x'.repeat(4000), level: 'alarm' };
+    const parsed = parseNotification(chat);
+    expect(parsed.body).toHaveLength(MAX_NOTIFICATION_BODY_CHARS);
+    expect(parsed.body.endsWith('…')).toBe(true);
+    expect(parseNotification({ ...chat, title: 'T'.repeat(300) }).title).toHaveLength(MAX_NOTIFICATION_TITLE_CHARS);
+    expect(parseNotification({ ...chat, body: 'y'.repeat(MAX_NOTIFICATION_BODY_CHARS) }).body).toBe('y'.repeat(MAX_NOTIFICATION_BODY_CHARS));
+  });
+
+  it('never splits a surrogate pair when shortening', () => {
+    expect(shortenText('abc', 3)).toBe('abc');
+    expect(shortenText('abcd', 3)).toBe('ab…');
+    // '🚨' is two UTF-16 units; cutting after its first unit would leave a lone surrogate.
+    expect(shortenText('a🚨bc', 3)).toBe('a…');
+    expect(shortenText('ab🚨c', 4)).toBe('ab…');
+    const shortened = shortenText('🚨'.repeat(2000), MAX_NOTIFICATION_BODY_CHARS);
+    expect(shortened.length).toBeLessThanOrEqual(MAX_NOTIFICATION_BODY_CHARS);
+    expect(shortened).toMatch(/^(?:🚨)+…$/u);
   });
 
   it('validates badge counts and booleans', () => {
@@ -266,7 +304,7 @@ describe('parseSuggestedFileName', () => {
   });
 
   it('falls back for empty or reserved names', () => {
-    for (const name of ['', '...', 'CON', 'nul.txt', 'com1', 'LPT9.json', '/']) {
+    for (const name of ['', '...', 'CON', 'nul.txt', 'com1', 'LPT9.json', '/', 'CONOUT$', 'aux .heyda']) {
       expect(parseSuggestedFileName(name), name).toBe(DEFAULT_SAVE_NAME);
     }
     expect(() => parseSuggestedFileName('x'.repeat(256))).toThrow(InvalidArgumentError);

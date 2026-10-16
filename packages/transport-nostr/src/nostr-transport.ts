@@ -9,7 +9,7 @@ import {
 } from '@heyda/core';
 import { getConversationKey, encrypt as nip44Encrypt } from 'nostr-tools/nip44';
 import { createRumor, createSeal, unwrapEvent } from 'nostr-tools/nip59';
-import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent, type NostrEvent } from 'nostr-tools/pure';
+import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent, type NostrEvent } from 'nostr-tools/pure';
 import { SimpleRelayPool, type RelayPool } from './pool';
 
 export const GIFT_WRAP_KIND = 1059;
@@ -28,7 +28,12 @@ export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://r
 /** NIP-59 backdates wraps by up to two days to hide timing, so look back that far. */
 const WRAP_BACKDATE_S = 2 * 24 * 3600;
 const MAX_WRAP_BYTES = 64 * 1024;
-const MAX_CLOCK_SKEW_S = 10 * 60;
+/**
+ * How far a sender's clock may run ahead of mine. Generous on purpose: ten minutes silently
+ * dropped everything, an SOS included, from phones whose clock was set by hand or to the wrong
+ * time zone. Replays are bounded by `maxAgeSeconds` and the seen store, not by this.
+ */
+const MAX_CLOCK_SKEW_S = 2 * 24 * 3600;
 
 /** Remembers what was already processed, across app restarts. */
 export interface SeenStore {
@@ -80,6 +85,13 @@ export interface NostrTransportOptions {
   /** Older messages are dropped, so a relay replaying old wraps cannot confuse the app. */
   maxAgeSeconds?: number;
   onError?: (error: unknown) => void;
+  /**
+   * Whether the app acts on a message from this sender at all (`SocialNode.acceptsMessage`).
+   * Rejected messages are dropped before they are recorded as processed. Without it a
+   * stranger who knows my key can flood the bounded seen store until real ids fall out, then
+   * re-publish old wraps (anyone can fetch them from public relays) to have them handled again.
+   */
+  accept?: (from: ContactKey, message: AppMessage) => boolean;
 }
 
 export function generateIdentity(): { secretKey: Uint8Array; publicKey: string } {
@@ -170,15 +182,19 @@ export class NostrTransport implements Transport {
 
       // Checks the seal signature and that the inner author matches the seal signer.
       const rumor = unwrapEvent(event, this.opts.secretKey);
-      if (rumor.kind !== APP_RUMOR_KIND) return;
+      if (rumor.kind !== APP_RUMOR_KIND || typeof rumor.content !== 'string' || !Number.isSafeInteger(rumor.created_at)) return;
+      // The rumor is unsigned: its id is a fair key for "already processed" only if it is its hash.
+      if (getEventHash(rumor) !== rumor.id) return;
 
       const nowS = Math.floor(this.now() / 1000);
       if (rumor.created_at < nowS - this.maxAge || rumor.created_at > nowS + MAX_CLOCK_SKEW_S) return;
       if (this.seen.has(rumor.id)) return;
-      this.seen.add(rumor.id);
 
+      // Only messages the app would act on take room in the bounded seen store.
       const parsed = parseAppMessage(rumor.content);
       if (!parsed.ok) return;
+      if (this.opts.accept && !this.opts.accept(rumor.pubkey, parsed.message)) return;
+      this.seen.add(rumor.id);
       const incoming: IncomingMessage = { from: rumor.pubkey, message: parsed.message, receivedAt: this.now() };
       for (const h of this.handlers) h(incoming);
     } catch (error) {

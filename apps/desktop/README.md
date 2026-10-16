@@ -43,6 +43,7 @@ A screenshot goes to `--out` (default `smoke.png`). Packaged builds have the `no
 | `src/web-handler.ts`  | `app://heyda/` handler: static files, SPA fallback, security headers           |
 | `src/storage.ts`      | Vault files and safeStorage-encrypted secrets (atomic writes)                  |
 | `src/badge.ts`        | Red-dot PNG for the taskbar overlay, generated in code                         |
+| `src/window-policy.ts`| When to show a system notification; reloading a crashed UI (no crash loop)     |
 | `scripts/`            | `prepare-web.mjs`, `smoke.mjs`                                                  |
 
 ## How the bridge works
@@ -64,10 +65,16 @@ Data lives in `%APPDATA%\Heyda` (`app.getPath('userData')`):
 The `h-` prefix keeps names like `con` or `nul` (allowed by the contract's patterns) clear of Windows device names.
 
 Notifications use Electron's `Notification` in main; clicks show the window and are forwarded to
-`onNotificationClick`. Level `alarm` additionally focuses and flashes the window and, on Windows, tries an urgent
+`onNotificationClick`. While the window is on screen and focused, levels `normal` and `silent` get no system
+notification (the UI shows its own banner); alarms always do. Text longer than 256 (title) or 2048 (body)
+characters is shortened, not refused, so a long chat message still notifies. Level `alarm` additionally focuses and flashes the window and, on Windows, tries an urgent
 toast (`scenario="urgent"`, looping alarm sound) with a plain notification as fallback. Toasts need the Start menu
 shortcut the installer creates (it carries the AppUserModelID `io.github.exelerx.heyda`); unpackaged dev runs may
 not show them.
+
+If the UI process dies (crash, out of memory), main reloads the start page, at most 3 times in 10 minutes;
+after that it shows a notification, and opening the window tries again. The relay connection and the alarm
+timers live in that process, so without this a crash in the tray would silently stop all alerts.
 
 Closing the window hides it to the tray; only the tray's "Beenden" quits. Autostart registers a login item that
 starts the app with `--hidden`.
@@ -83,8 +90,8 @@ starts the app with `--hidden`.
 - Permissions: only `notifications` for `app://heyda`; everything else (camera, geolocation, clipboard read, HID, ...)
   is denied. Navigation away from `app://heyda` and new windows are blocked; `https:`, `tel:`, `sms:` and `geo:` links
   open in the system handler after validation, anything else is refused.
-- The `app://` handler rejects encoded slashes and backslashes, dot segments, NUL and Windows-reserved characters,
-  and verifies the resolved path stays inside `web/`.
+- The `app://` handler rejects encoded slashes and backslashes, dot segments, NUL, Windows-reserved characters and
+  device names (`CON`, `NUL.js`, ...), and verifies the resolved path stays inside `web/`.
 - Electron fuses (set by electron-builder): no `ELECTRON_RUN_AS_NODE`, no `NODE_OPTIONS`, no `--inspect`, app only
   from `app.asar` with embedded integrity validation, encrypted cookies, no extra `file://` privileges.
 - Background work: `backgroundThrottling: false` plus Chromium switches that disable timer throttling and
