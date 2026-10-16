@@ -13,10 +13,12 @@ export const MAX_MESSAGE_BYTES = 16 * 1024;
 const id = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
 const key = z.string().regex(/^[0-9a-f]{64}$/);
 const shortText = (max: number) => z.string().trim().min(1).max(max);
-const relayUrl = z
+/** Exported so every place that takes relay addresses (QR codes, rosters) accepts exactly what the wire accepts. */
+export const RelayUrl = z
   .string()
   .max(200)
   .regex(/^wss:\/\/[A-Za-z0-9.-]+(:\d{1,5})?(\/[\w./-]*)?$/, 'relay must be a wss:// URL');
+const relayUrl = RelayUrl;
 const lat = z.number().min(-90).max(90);
 const lon = z.number().min(-180).max(180);
 const time = z.number().int().nonnegative();
@@ -317,6 +319,16 @@ export function serializeAppMessage(message: AppMessage): string {
   const raw = JSON.stringify(checked);
   if (utf8Length(raw) > MAX_MESSAGE_BYTES) throw new RangeError('message too large');
   return raw;
+}
+
+/** Whether a message would pass `serializeAppMessage`, i.e. could ever be sent. */
+export function isSendable(message: AppMessage): boolean {
+  try {
+    serializeAppMessage(message);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function utf8Length(s: string): number {

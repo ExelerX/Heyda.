@@ -1,4 +1,4 @@
-import { contactLabel, type Contact, type ContactStatus } from '@heyda/core';
+import { checkinText, contactLabel, type Contact, type ContactStatus } from '@heyda/core';
 import { router, type Href } from 'expo-router';
 import { Pressable, Text, View } from 'react-native';
 import { ActivityRow } from '../../components/social/ActivityRow';
@@ -11,7 +11,8 @@ import { SosButton } from '../../components/SosButton';
 import { Avatar, Button, Card, Empty, Row, Screen, Section, T, Toggle } from '../../components/ui';
 import { confirm, notice } from '../../lib/confirm';
 import { routeForAlert } from '../../lib/routes';
-import { useRuntime, useSnapshot, useTick } from '../../lib/store';
+import { useRuntime, useSnapshot } from '../../lib/store';
+import { useNow } from '../../components/social/useNow';
 import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
 
 function greeting(now: number): string {
@@ -39,7 +40,7 @@ export default function Start() {
   const runtime = useRuntime();
   const snap = useSnapshot();
   const { state, statuses, activeTrip, isDemo, activity } = snap;
-  const now = useTick(15_000);
+  const now = useNow(15_000);
   const nameOf = (key: string) => contactLabel(state.contacts.find((c) => c.key === key));
   const contacts = sortContacts(state.contacts);
   const st = (key: string): ContactStatus => statuses[key] ?? {};
@@ -429,7 +430,10 @@ function FriendRow({ contact, status, now, first }: { contact: Contact; status: 
   let event: string | undefined;
   if (status.trip) event = `🚗 unterwegs nach „${status.trip.destinationName}“ · ${etaWords(status.trip.etaMinutes)}`;
   else if (status.lastPlace) event = `📍 ${placeEventText(status.lastPlace, now)}`;
-  else if (status.lastCheckin) event = `✅ hat sich gemeldet · ${ago(status.lastCheckin.at, now)}`;
+  else if (status.lastCheckin) {
+    const ci = status.lastCheckin;
+    event = `${checkinText(ci.kind, ci.text, ci.placeName)} · ${ago(ci.at, now)}`;
+  }
 
   const headline = [s, q ? `🌙 ${q}` : undefined].filter(Boolean).join(' · ') || undefined;
   const lines = [

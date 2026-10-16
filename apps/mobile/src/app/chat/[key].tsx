@@ -11,7 +11,8 @@ import { threadParam } from '../../components/social/params';
 import { Chip, Row, T } from '../../components/ui';
 import { notice } from '../../lib/confirm';
 import { setOpenThread as setNotificationThread } from '../../lib/notifications';
-import { useContactName, useRuntime, useSnapshot, useTick } from '../../lib/store';
+import { useContactName, useRuntime, useSnapshot } from '../../lib/store';
+import { useNow } from '../../components/social/useNow';
 import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
 
 type Item = { type: 'day'; id: string; label: string } | { type: 'msg'; id: string; entry: ChatEntry; showName: boolean };
@@ -26,7 +27,7 @@ export default function ChatScreen() {
   const runtime = useRuntime();
   const { state, chats, statuses } = useSnapshot();
   const contactName = useContactName();
-  const now = useTick(30_000);
+  const now = useNow(30_000);
   const focused = useIsFocused();
   const listRef = useRef<FlatList<Item>>(null);
   const [text, setText] = useState('');

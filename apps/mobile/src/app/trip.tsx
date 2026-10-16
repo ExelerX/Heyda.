@@ -12,7 +12,8 @@ import { contactKeyParam } from '../components/social/params';
 import { Button, Card, Chip, Empty, Hint, Row, Screen, Section, T, Toggle, Wrap } from '../components/ui';
 import { confirm, notice } from '../lib/confirm';
 import { currentLocationAccess, locationSupported, type LocationAccess } from '../lib/location';
-import { useRuntime, useSnapshot, useTick } from '../lib/store';
+import { useRuntime, useSnapshot } from '../lib/store';
+import { useNow } from '../components/social/useNow';
 import { spacing, useTheme } from '../lib/theme';
 
 const MIN = 60_000;
@@ -40,7 +41,7 @@ function ActiveTrip({ onNew }: { onNew: () => void }) {
   const t = useTheme();
   const runtime = useRuntime();
   const { state, activeTrip, isDemo } = useSnapshot();
-  const now = useTick(5000);
+  const now = useNow(5000);
   const [busy, setBusy] = useState(false);
   const [access, setAccess] = useState<LocationAccess | undefined>();
 
@@ -145,7 +146,7 @@ function TripForm({ onStarted }: { onStarted: () => void }) {
   const runtime = useRuntime();
   const params = useLocalSearchParams<{ to?: string | string[] }>();
   const { state, activeTrip, isDemo } = useSnapshot();
-  const now = useTick(30_000);
+  const now = useNow(30_000);
   const located = canLocate(isDemo);
 
   const preset = contactKeyParam(params.to);

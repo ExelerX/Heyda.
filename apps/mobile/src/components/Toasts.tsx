@@ -1,4 +1,4 @@
-import { useRouter } from 'expo-router';
+import { usePathname, useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import { Animated, PanResponder, Platform, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -8,7 +8,7 @@ import { radius, spacing, TOUCH, useTheme } from '../lib/theme';
 import { routeForToast } from './safety/alerts';
 
 const SHOW_MS = 4500;
-const MAX_VISIBLE = 3;
+const MAX_VISIBLE = 2;
 const SWIPE_OUT = 70;
 
 /**
@@ -19,6 +19,7 @@ const SWIPE_OUT = 70;
 export function ToastHost() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const pathname = usePathname();
   const runtime = useRuntime();
   const [toasts, setToasts] = useState<Toast[]>([]);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
@@ -58,7 +59,8 @@ export function ToastHost() {
       pointerEvents="box-none"
       style={{
         position: 'absolute',
-        top: insets.top + spacing.sm,
+        // Keep the close button of the full-screen SOS screen reachable.
+        top: insets.top + spacing.sm + (pathname === '/sos' ? TOUCH + spacing.md : 0),
         left: spacing.md,
         right: spacing.md,
         alignItems: 'center',

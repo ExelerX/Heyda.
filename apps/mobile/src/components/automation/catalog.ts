@@ -1,4 +1,4 @@
-import { DEFAULT_LIMITS, validateRule, type Action, type Condition, type NodeState, type Rule, type RuleSource, type Trigger } from '@heyda/core';
+import { contactLabel, DEFAULT_LIMITS, validateRule, type Action, type Condition, type NodeState, type Rule, type RuleSource, type Trigger } from '@heyda/core';
 
 /**
  * The building blocks of the rule editor: every trigger, condition and action the core
@@ -258,10 +258,12 @@ export function draftProblems(d: Draft, state: NodeState): string[] {
 }
 
 /** A short automatic name when the user leaves the name empty. */
-export function autoName(d: Draft): string {
+export function autoName(d: Draft, state: NodeState): string {
   const info = triggerInfo(d.trigger?.on);
   const action = actionInfo(d.actions[0]?.do);
-  return [info?.title, action?.title].filter(Boolean).join(' → ').slice(0, 60) || 'Meine Automation';
+  const who = state.contacts.find((c) => c.key === d.trigger?.contact);
+  const when = who && info ? info.title.replace(/^Jemand/, contactLabel(who)) : info?.title;
+  return [when, action?.title].filter(Boolean).join(' → ').slice(0, 60) || 'Meine Automation';
 }
 
 const FIELD_TEXT: Record<string, string> = {
@@ -301,7 +303,7 @@ export function buildRule(d: Draft, state: NodeState): BuildResult {
   if (problems.length || !d.trigger) return { ok: false, errors: problems };
   const input: Obj = {
     id: d.id,
-    name: (d.name.trim() || autoName(d)).slice(0, 60),
+    name: (d.name.trim() || autoName(d, state)).slice(0, 60),
     enabled: d.enabled,
     trigger: clean(d.trigger, String(d.trigger.on)),
     conditions: d.conditions.map((c) => clean(c, String(c.if))),

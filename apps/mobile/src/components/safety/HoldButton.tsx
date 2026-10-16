@@ -20,6 +20,7 @@ export function HoldButton({
   busy,
   holdMs = 2000,
   size = 220,
+  disabledText,
 }: {
   onComplete: () => void;
   onHoldChange?: (holding: boolean) => void;
@@ -28,6 +29,8 @@ export function HoldButton({
   busy?: boolean;
   holdMs?: number;
   size?: number;
+  /** Shown below the button while it is disabled, e.g. "choose someone first". */
+  disabledText?: string;
 }) {
   const t = useTheme();
   const [progress, setProgress] = useState(0);
@@ -162,7 +165,9 @@ export function HoldButton({
       >
         {busy
           ? 'Dein Notruf wird gesendet …'
-          : tapHint
+          : disabled && disabledText
+            ? disabledText
+            : tapHint
             ? 'Länger halten: so lange, bis der Ring voll ist.'
             : `${Math.round(holdMs / 1000)} Sekunden gedrückt halten, bis der Ring voll ist.`}
       </Text>

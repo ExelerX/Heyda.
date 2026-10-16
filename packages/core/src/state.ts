@@ -179,7 +179,8 @@ export interface ContactStatus {
     endReason?: 'safe' | 'cancelled';
     lastSentAt?: number;
   };
-  watches?: { watchId: string; label: string; dueAt: number; startedAt: number; firedAt?: number }[];
+  /** `quiet`: this contact used up its hourly budget of loud alarms, so it rings as a normal notification. */
+  watches?: { watchId: string; label: string; dueAt: number; startedAt: number; firedAt?: number; quiet?: boolean }[];
   lastCheckin?: { kind: CheckinKind; text?: string; placeName?: string; at: number };
   lastWhere?: {
     requestId: string;

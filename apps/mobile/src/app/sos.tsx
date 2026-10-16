@@ -11,7 +11,7 @@ import { HoldButton } from '../components/safety/HoldButton';
 import { ago, hhmm } from '../components/safety/time';
 import { Avatar, Button, Card, Hint, Row, T, Wrap } from '../components/ui';
 import { confirm, notice } from '../lib/confirm';
-import { callPhone, sendSosSms, smsAvailable } from '../lib/emergency';
+import { callEmergency, callPhone, sendSosSms, smsAvailable } from '../lib/emergency';
 import { locationSupported } from '../lib/location';
 import { isNative } from '../lib/platform';
 import { useRuntime, useSnapshot, useTick } from '../lib/store';
@@ -49,31 +49,44 @@ export default function SosScreen() {
 
 function TopBar({ running }: { running: boolean }) {
   const t = useTheme();
+  const pill = {
+    minHeight: TOUCH,
+    minWidth: TOUCH,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  } as const;
   return (
     <Row style={{ justifyContent: 'space-between', paddingHorizontal: spacing.lg, paddingTop: spacing.sm, minHeight: TOUCH + 8 }}>
-      <T variant="h2" color={t.danger}>
+      <T variant="h2" color={t.danger} style={{ flexShrink: 1 }}>
         {running ? '🆘 Notruf läuft' : '🆘 Notruf'}
       </T>
-      <Pressable
-        onPress={close}
-        accessibilityRole="button"
-        accessibilityLabel={running ? 'Schließen. Der Notruf läuft weiter.' : 'Schließen'}
-        hitSlop={8}
-        style={({ pressed }) => ({
-          minHeight: TOUCH,
-          minWidth: TOUCH,
-          paddingHorizontal: spacing.md,
-          borderRadius: radius.pill,
-          borderWidth: 1,
-          borderColor: t.border,
-          backgroundColor: pressed ? t.surfaceRaised : t.surface,
-          alignItems: 'center',
-          justifyContent: 'center',
-        })}
-      >
-        <Text style={{ color: t.text, fontSize: 15, fontWeight: '700' }}>✕ Schließen</Text>
-        {running ? <Text style={{ color: t.textMuted, fontSize: 11 }}>läuft weiter</Text> : null}
-      </Pressable>
+      <Row>
+        {isNative && (
+          // Always in reach, whatever is on screen. The phone app still asks before it dials.
+          <Pressable
+            onPress={() => void callEmergency('112').catch(() => notice('Anruf nicht möglich', 'Bitte wähle 112 direkt in deiner Telefon-App.'))}
+            accessibilityRole="button"
+            accessibilityLabel="112 anrufen"
+            hitSlop={6}
+            style={({ pressed }) => ({ ...pill, borderColor: t.danger, backgroundColor: pressed ? t.surfaceRaised : t.surface })}
+          >
+            <Text style={{ color: t.danger, fontSize: 15, fontWeight: '800' }}>📞 112</Text>
+          </Pressable>
+        )}
+        <Pressable
+          onPress={close}
+          accessibilityRole="button"
+          accessibilityLabel={running ? 'Schließen. Der Notruf läuft weiter.' : 'Schließen'}
+          hitSlop={6}
+          style={({ pressed }) => ({ ...pill, borderColor: t.border, backgroundColor: pressed ? t.surfaceRaised : t.surface })}
+        >
+          <Text style={{ color: t.text, fontSize: 15, fontWeight: '700' }}>✕ Schließen</Text>
+          {running ? <Text style={{ color: t.textMuted, fontSize: 11 }}>läuft weiter</Text> : null}
+        </Pressable>
+      </Row>
     </Row>
   );
 }
@@ -165,6 +178,7 @@ function StartSos() {
           size={size}
           busy={busy}
           disabled={!recipients.length}
+          disabledText={noContacts ? 'Füge zuerst Kontakte hinzu oder ruf die 112 an.' : 'Wähle unten zuerst, wer den Alarm bekommt.'}
           onHoldChange={setHolding}
           onComplete={() => void send()}
           onAccessibleActivate={() => setCountdown(COUNTDOWN_S)}

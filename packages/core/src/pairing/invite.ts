@@ -1,6 +1,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { z } from 'zod';
 import type { ContactKey } from '../transport/transport';
+import { RelayUrl } from '../protocol/messages';
 import { base64urlDecode, base64urlEncode } from '../util/base64url';
 import { randomId } from '../util/random';
 
@@ -17,8 +18,11 @@ const Invite = z.strictObject({
   k: z.string().regex(/^[0-9a-f]{64}$/),
   /** Display name, chosen by them. */
   n: z.string().trim().min(1).max(40),
-  /** Relays where they can be reached. */
-  r: z.array(z.string().max(200).regex(/^wss:\/\//)).max(8),
+  /**
+   * Relays where they can be reached. Same rule as on the wire: a looser one let a crafted code
+   * plant a relay that later made every group roster naming this contact unsendable.
+   */
+  r: z.array(RelayUrl).max(8),
   /** Single-use nonce; the scanner echoes it back in its hello. */
   c: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/),
   /** Expiry, epoch ms. */

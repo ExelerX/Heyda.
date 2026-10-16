@@ -7,7 +7,8 @@ import { Button, Card, Chip, Row, Screen, Section, T, Toggle, Wrap } from '../co
 import { notice } from '../lib/confirm';
 import { smsAvailable } from '../lib/emergency';
 import { isIgnoringBatteryOptimizations, keepAliveSupported, openBatteryOptimizationSettings } from '../lib/keepalive';
-import { desktop, isBrowserPreview, isDesktop } from '../lib/platform';
+import { desktop, isBrowserPreview, isDesktop, isNative } from '../lib/platform';
+import appConfig from '../../app.json';
 import { useRestart, useRuntime, useSnapshot } from '../lib/store';
 import { spacing, useTheme, type Appearance } from '../lib/theme';
 
@@ -37,7 +38,8 @@ export default function Settings() {
     if (keepAliveSupported) void isIgnoringBatteryOptimizations().then(setBatteryOk).catch(() => {});
   }, []);
 
-  const version = Constants.expoConfig?.version ?? '1.0.0';
+  // Native builds report their real version; the web bundle's embedded manifest can be stale, so use app.json there.
+  const version = (isNative ? Constants.expoConfig?.version : undefined) ?? appConfig.expo.version;
   const appearance = settings.appearance ?? 'dark';
   const cleanDevice = deviceName.trim();
   const otherDevices = state.devices.filter((d) => d.deviceId !== state.self.deviceId).length;

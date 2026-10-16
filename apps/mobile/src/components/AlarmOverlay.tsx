@@ -96,6 +96,8 @@ export function AlarmOverlay() {
   const sos = alert?.category === 'sos' || !!owner;
   const at = alert?.at;
   const more = queue.length - 1;
+  // The big icon already says it; don't repeat a leading ⏰/🆘 from the alert title.
+  const title = current.title.replace(/^(⏰|🆘)\s*/u, '');
   // Once resolved, calm colours; while ringing, white-on-red (or dark-on-red in dark mode).
   const text = resolved ? t.text : fg;
   const muted = resolved ? t.textMuted : fg;
@@ -117,7 +119,7 @@ export function AlarmOverlay() {
               {resolved ? '✅' : sos ? '🆘' : '⏰'}
             </Text>
             <Text accessibilityRole="header" style={{ color: text, fontSize: 30, fontWeight: '900', textAlign: 'center' }}>
-              {current.title}
+              {title}
             </Text>
             {current.body ? (
               <Text style={{ color: muted, fontSize: 19, fontWeight: '600', textAlign: 'center' }}>{current.body}</Text>

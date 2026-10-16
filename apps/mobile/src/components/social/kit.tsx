@@ -63,6 +63,7 @@ export function Field({
         onChangeText={onChangeText}
         maxLength={maxLength}
         multiline={multiline}
+        numberOfLines={multiline ? 3 : undefined}
         placeholderTextColor={t.textMuted}
         accessibilityLabel={rest.accessibilityLabel ?? label ?? rest.placeholder}
         style={{
@@ -76,7 +77,7 @@ export function Field({
           paddingHorizontal: spacing.md,
           paddingVertical: spacing.sm,
           textAlignVertical: multiline ? 'top' : 'center',
-          ...(multiline ? { maxHeight: 160 } : {}),
+          ...(multiline ? { minHeight: 88, maxHeight: 160 } : {}),
         }}
         {...rest}
       />

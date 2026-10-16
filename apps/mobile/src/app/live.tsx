@@ -11,7 +11,8 @@ import { canLocate, ensureFix, ensureTrackingAccess, NO_GPS_TEXT } from '../comp
 import { contactKeyParam } from '../components/social/params';
 import { Avatar, Button, Card, Chip, Empty, Hint, Row, Screen, Section, T, Wrap } from '../components/ui';
 import { confirm, notice } from '../lib/confirm';
-import { useRuntime, useSnapshot, useTick } from '../lib/store';
+import { useRuntime, useSnapshot } from '../lib/store';
+import { useNow } from '../components/social/useNow';
 import { spacing, useTheme } from '../lib/theme';
 
 const MIN = 60_000;
@@ -22,7 +23,7 @@ export default function LiveScreen() {
   const runtime = useRuntime();
   const params = useLocalSearchParams<{ to?: string | string[] }>();
   const { state, isDemo } = useSnapshot();
-  const now = useTick(15_000);
+  const now = useNow(15_000);
   const located = canLocate(isDemo);
   const preset = contactKeyParam(params.to);
 

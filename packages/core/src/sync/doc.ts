@@ -10,14 +10,17 @@ import type { Contact, Group, MyStatus, NodeState, SyncField } from '../state';
  * Trips, live shares and SOS stay on the device that runs them.
  *
  * Merging: contacts per contact (newest `updatedAt` wins, removals are remembered as
- * tombstones), groups per group (higher roster version wins), everything else per field
- * (newest change wins).
+ * tombstones), groups per group (higher roster version wins, groups I left stay left),
+ * everything else per field (newest change wins). Ties are broken the same way on every
+ * device, so all of them end up with the same data.
  */
 export interface SyncDoc {
   profileName: string;
   contacts: Contact[];
   removedContacts: { key: string; at: number }[];
   groups: Group[];
+  /** Groups I left. Optional because devices running older versions do not send it. */
+  leftGroups?: { id: string; at: number }[];
   places: Place[];
   grants: PlaceGrant[];
   rules: Rule[];
@@ -47,8 +50,10 @@ const ContactSchema = z.strictObject({
   updatedAt: time.optional(),
 });
 
+const groupId = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
+
 const GroupSchema = z.strictObject({
-  id: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/),
+  id: groupId,
   name: text(40),
   owner: hex,
   members: z.array(z.strictObject({ key: hex, name: text(40), relays: relays.optional() })).max(30),
@@ -62,6 +67,7 @@ const SyncDocSchema = z.strictObject({
   contacts: z.array(ContactSchema).max(500),
   removedContacts: z.array(z.strictObject({ key: hex, at: time })).max(1000),
   groups: z.array(GroupSchema).max(100),
+  leftGroups: z.array(z.strictObject({ id: groupId, at: time })).max(200).optional(),
   places: z
     .array(z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), name: text(60), center: latLon, radiusM: z.number().min(10).max(50_000) }))
     .max(100),
@@ -81,6 +87,7 @@ export function buildSyncDoc(s: NodeState): SyncDoc {
     contacts: s.contacts,
     removedContacts: s.removedContacts,
     groups: s.groups,
+    leftGroups: s.leftGroups,
     places: s.places,
     grants: s.grants,
     rules: s.rules,
@@ -98,6 +105,18 @@ export function parseSyncDoc(input: unknown): SyncDoc | undefined {
 }
 
 const TOMBSTONE_KEEP_MS = 90 * 24 * 3600 * 1000;
+const LEFT_GROUP_KEEP_MS = 180 * 24 * 3600 * 1000;
+
+/** JSON with sorted keys, so the same data compares equal however its objects were built. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_, v: unknown) =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : v,
+  );
+}
+
+const stamp = (c: Contact) => c.updatedAt ?? c.addedAt;
 
 /** Returns the state changes needed to take in a doc from another of my devices. */
 export function mergeSyncDoc(s: NodeState, doc: SyncDoc, now: number): Partial<NodeState> {
@@ -112,21 +131,35 @@ export function mergeSyncDoc(s: NodeState, doc: SyncDoc, now: number): Partial<N
   const byKey = new Map<string, Contact>();
   for (const c of [...s.contacts, ...doc.contacts]) {
     const prev = byKey.get(c.key);
-    if (!prev || (c.updatedAt ?? c.addedAt) > (prev.updatedAt ?? prev.addedAt)) byKey.set(c.key, c);
+    if (!prev || stamp(c) > stamp(prev) || (stamp(c) === stamp(prev) && canonicalJson(c) > canonicalJson(prev))) byKey.set(c.key, c);
   }
-  const contacts = [...byKey.values()].filter((c) => (tombstones.get(c.key) ?? -1) < (c.updatedAt ?? c.addedAt));
-  if (JSON.stringify(contacts) !== JSON.stringify(s.contacts)) patch.contacts = contacts;
+  const contacts = [...byKey.values()].filter((c) => (tombstones.get(c.key) ?? -1) < stamp(c));
+  if (canonicalJson(contacts) !== canonicalJson(s.contacts)) patch.contacts = contacts;
   const removedContacts = [...tombstones].map(([key, at]) => ({ key, at }));
-  if (JSON.stringify(removedContacts) !== JSON.stringify(s.removedContacts)) patch.removedContacts = removedContacts;
+  if (canonicalJson(removedContacts) !== canonicalJson(s.removedContacts)) patch.removedContacts = removedContacts;
+
+  // Groups I left on any device stay left, or another device would hand them back.
+  const left = new Map<string, number>();
+  for (const l of [...s.leftGroups, ...(doc.leftGroups ?? [])]) {
+    if (now - l.at < LEFT_GROUP_KEEP_MS) left.set(l.id, Math.max(left.get(l.id) ?? 0, l.at));
+  }
+  const leftGroups = [...left].map(([id, at]) => ({ id, at }));
+  if (canonicalJson(leftGroups) !== canonicalJson(s.leftGroups)) patch.leftGroups = leftGroups;
 
   // Groups: higher version (or same version, newer update) wins.
   const groups = new Map<string, Group>(s.groups.map((g) => [g.id, g]));
   for (const g of doc.groups) {
     const prev = groups.get(g.id);
-    if (!prev || g.version > prev.version || (g.version === prev.version && g.updatedAt > prev.updatedAt)) groups.set(g.id, g);
+    if (
+      !prev ||
+      g.version > prev.version ||
+      (g.version === prev.version && (g.updatedAt > prev.updatedAt || (g.updatedAt === prev.updatedAt && canonicalJson(g) > canonicalJson(prev))))
+    ) {
+      groups.set(g.id, g);
+    }
   }
-  const mergedGroups = [...groups.values()];
-  if (JSON.stringify(mergedGroups) !== JSON.stringify(s.groups)) patch.groups = mergedGroups;
+  const mergedGroups = [...groups.values()].filter((g) => !left.has(g.id));
+  if (canonicalJson(mergedGroups) !== canonicalJson(s.groups)) patch.groups = mergedGroups;
 
   // Plain fields: newest change wins.
   const take = <F extends SyncField>(field: F, apply: () => void) => {
@@ -143,6 +176,6 @@ export function mergeSyncDoc(s: NodeState, doc: SyncDoc, now: number): Partial<N
   take('prefs', () => (patch.prefs = doc.prefs));
   take('sosMessage', () => (patch.sosMessage = doc.sosMessage));
   take('status', () => (patch.status = doc.status));
-  if (JSON.stringify(rev) !== JSON.stringify(s.syncRev)) patch.syncRev = rev;
+  if (canonicalJson(rev) !== canonicalJson(s.syncRev)) patch.syncRev = rev;
   return patch;
 }

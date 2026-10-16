@@ -34,6 +34,11 @@ export const MAX_SAVE_FILE_BYTES = MAX_VAULT_BYTES;
 export const MAX_OPEN_FILE_BYTES = 5 * 1024 * 1024;
 export const MAX_SECRET_CHARS = 4096;
 export const MAX_BADGE_COUNT = 1_000_000;
+/** Longer notification text is shortened to these lengths... */
+export const MAX_NOTIFICATION_TITLE_CHARS = 256;
+export const MAX_NOTIFICATION_BODY_CHARS = 2048;
+/** ...and refused only above this one. */
+export const MAX_NOTIFICATION_INPUT_CHARS = 16_384;
 
 const VAULT_NAME = /^[a-z0-9-]{1,40}$/;
 const SECRET_NAME = /^[a-z0-9.-]{1,60}$/;
@@ -115,6 +120,8 @@ export type WebTarget =
 
 // Characters Windows does not allow in file names, plus anything that could change the meaning of a path.
 const FORBIDDEN_SEGMENT_CHARS = /[\u0000-\u001f\u007f\\/:*?"<>|]/;
+// Device names; Windows ignores the extension and spaces before it ("nul.txt", "CON .js").
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$) *(\..*)?$/i;
 
 /**
  * Maps a URL pathname to a file below `root`. Paths with a known file extension are assets
@@ -131,6 +138,9 @@ export function resolveWebPath(root: string, pathname: string, p: typeof path = 
   const last = segments.at(-1);
   if (last === undefined) return { kind: 'file', path: p.join(root, 'index.html') };
   if (mimeTypeFor(last) === undefined) return { kind: 'spa' };
+
+  // A device name (CON, NUL, COM1, ...) opens the device instead of a file on Windows, whatever the folder.
+  if (segments.some((segment) => WINDOWS_RESERVED_NAME.test(segment))) return { kind: 'invalid' };
 
   const resolvedRoot = p.resolve(root);
   const full = p.resolve(resolvedRoot, ...segments);
@@ -233,10 +243,21 @@ export function parseNotification(value: unknown): DesktopNotification {
   const { id, title, body, level } = value as Record<string, unknown>;
   return {
     id: boundedString(id, 1, 128, 'notification id'),
-    title: boundedString(title, 1, 256, 'notification title'),
-    body: boundedString(body, 0, 2048, 'notification body'),
+    // Chat messages may be 4000 characters and become the body as they are. Shorten long text instead of
+    // refusing it: a refused call means no notification at all, also for an urgent message.
+    title: shortenText(boundedString(title, 1, MAX_NOTIFICATION_INPUT_CHARS, 'notification title'), MAX_NOTIFICATION_TITLE_CHARS),
+    body: shortenText(boundedString(body, 0, MAX_NOTIFICATION_INPUT_CHARS, 'notification body'), MAX_NOTIFICATION_BODY_CHARS),
     level: parseLevel(level),
   };
+}
+
+/** Cuts `text` to at most `max` UTF-16 units, ending in "…", without splitting a surrogate pair. */
+export function shortenText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max - 1; // room for the ellipsis
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end--; // a high surrogate whose partner would be cut off
+  return `${text.slice(0, end)}…`;
 }
 
 function parseLevel(value: unknown): NotificationLevel {
@@ -318,7 +339,6 @@ function isValidGeo(rest: string): boolean {
 // ---------------------------------------------------------------------------------------------
 // Files and Windows toasts
 
-const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/i;
 export const DEFAULT_SAVE_NAME = 'heyda-backup';
 
 /** Turns a renderer-suggested name into a plain file name that is valid on Windows. */

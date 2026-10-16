@@ -1,4 +1,4 @@
-import { AutomationEngine, systemLocalTime, type AutomationEvent, type LocalTime } from './automation/engine';
+import { AutomationEngine, systemLocalTime, type ActionIntent, type AutomationEvent, type LocalTime } from './automation/engine';
 import type { Rule } from './automation/schema';
 import { checkinText, pingText } from './features/labels';
 import { LIVE_CADENCE, LiveTracker, SOS_CADENCE } from './features/live';
@@ -10,7 +10,9 @@ import { snapToGrid } from './privacy/coarse-grid';
 import { PrivacyPolicy, type PlaceGrant } from './privacy/policy';
 import { composeMessage } from './protocol/compose';
 import {
+  isSendable,
   MAX_GROUP_MEMBERS,
+  RelayUrl,
   type AppMessage,
   type AppMessageBody,
   type BodyOf,
@@ -92,6 +94,10 @@ export const MAX_WATCH_MS = 48 * 3600_000;
 export const MIN_WATCH_MS = 5 * 60_000;
 const MAX_OUTBOX = 500;
 const MAX_WATCHES_PER_CONTACT = 10;
+const MAX_OWN_WATCHES = 20;
+const MAX_SOS_ACKS = 50;
+/** Sender clocks are trusted for ordering only up to this far ahead of mine. */
+const MAX_CLOCK_AHEAD_MS = 10 * 60_000;
 const SOS_LOCATION_MS = 60 * 60_000;
 const FRESH_FIX_MS = 2 * 60_000;
 const HOUR = 3600_000;
@@ -99,6 +105,8 @@ const DAY = 24 * HOUR;
 
 /** Message types whose newer copy replaces an older one still waiting in the outbox. */
 const REPLACEABLE = new Set(['presence', 'session.update', 'live.update', 'sos.update']);
+/** Queued messages that tell where I am or was. Ghost mode and ending a share drop them. */
+const LOCATION_TYPES = new Set(['session.update', 'live.update', 'place.event']);
 
 /** A map link for a location, for phones without the app. */
 export function osmLink(p: LatLon): string {
@@ -146,6 +154,10 @@ export class SocialNode {
   private readonly sosAlarmLimiter = new RateLimiter(6, HOUR);
   private readonly whereLimiter = new RateLimiter(5, HOUR);
   private readonly askLimiter = new RateLimiter(5, HOUR);
+  /** Per contact: loud watch alarms (they ring through quiet mode). More ring as normal notifications. */
+  private readonly watchAlarmLimiter = new RateLimiter(4, HOUR);
+  /** Per contact: name and relay changes, each of which is saved and synced to my other devices. */
+  private readonly helloLimiter = new RateLimiter(10, HOUR);
   private trip: TripSharer | undefined;
   private lastFix: LocationFix | undefined;
   private unsubscribe: (() => void) | undefined;
@@ -300,7 +312,13 @@ export class SocialNode {
   async setGhost(ghost: boolean): Promise<void> {
     if (ghost === this.state.ghost) return;
     this.update({ ghost });
-    if (ghost) await this.stopLive();
+    if (ghost) {
+      // Also what was queued while offline, or it would still leave once the phone is back online.
+      this.dropQueued((e) => LOCATION_TYPES.has(e.message.type));
+      await this.stopLive();
+      // A trip would keep GPS running and still announce the arrival.
+      await this.stopTrip();
+    }
     this.emitLocationNeeds();
   }
 
@@ -400,16 +418,24 @@ export class SocialNode {
   }
 
   async removeContact(key: ContactKey): Promise<void> {
-    if (!this.contact(key)) return;
+    const c = this.contact(key);
+    if (!c) return;
     if (this.state.liveShares.some((s) => s.contactKey === key)) await this.stopLive(key);
     for (const w of this.statuses.get(key)?.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
     this.statuses.delete(key);
-    this.update({
-      contacts: this.state.contacts.filter((c) => c.key !== key),
-      removedContacts: [...this.state.removedContacts.filter((t) => t.key !== key), { key, at: this.now() }].slice(-1000),
-      grants: this.state.grants.filter((g) => g.contactKey !== key),
-      whereInbox: this.state.whereInbox.filter((w) => w.from !== key),
-    });
+    this.dropQueued((e) => e.to === key && (LOCATION_TYPES.has(e.message.type) || e.message.type === 'where.reply'));
+    const grants = this.state.grants.filter((g) => g.contactKey !== key);
+    this.update(
+      {
+        contacts: this.state.contacts.filter((x) => x.key !== key),
+        // Later than the contact's last change even if another device's clock runs ahead, or the removal would lose.
+        removedContacts: [...this.state.removedContacts.filter((t) => t.key !== key), { key, at: Math.max(this.now(), stampOf(c) + 1) }].slice(-1000),
+        grants,
+        whereInbox: this.state.whereInbox.filter((w) => w.from !== key),
+      },
+      // Synced, so another device does not keep the grant and hand it back if they are added again.
+      grants.length !== this.state.grants.length ? ['grants'] : [],
+    );
     this.markSync();
   }
 
@@ -422,6 +448,7 @@ export class SocialNode {
     level?: SessionLevel;
     durationMs?: number;
   }): Promise<SharingSession> {
+    if (this.state.ghost) throw new Error('Der Geistmodus ist an. Schalte ihn aus, um deinen Standort zu teilen.');
     const known = input.recipients.filter((k) => this.contact(k));
     if (!known.length) throw new RangeError('Wähle mindestens einen Kontakt.');
     if (this.activeTrip) await this.stopTrip();
@@ -444,7 +471,7 @@ export class SocialNode {
 
   /** Picks up a trip that was running before the app restarted. Sends nothing. */
   resumeTrip(session: SharingSession): boolean {
-    if (this.activeTrip || !isSessionActive(session, this.now())) return false;
+    if (this.state.ghost || this.activeTrip || !isSessionActive(session, this.now())) return false;
     const recipients = session.recipients.filter((k) => this.contact(k));
     if (!recipients.length) return false;
     this.trip = new TripSharer({ ...session, recipients }, this.options.tripOptions);
@@ -532,6 +559,8 @@ export class SocialNode {
     const ending = this.state.liveShares.filter((s) => !contactKey || s.contactKey === contactKey);
     if (!ending.length) return;
     this.update({ liveShares: this.state.liveShares.filter((s) => !ending.includes(s)) });
+    const ended = new Set(ending.map((s) => s.shareId));
+    this.dropQueued((e) => e.message.type === 'live.update' && ended.has(e.message.shareId));
     for (const s of ending) await this.sendTo(s.contactKey, { type: 'live.end', shareId: s.shareId, reason }, TTL.live);
     this.emitLocationNeeds();
   }
@@ -568,12 +597,19 @@ export class SocialNode {
 
   // ---- check-ins and watches -------------------------------------------------------------------
 
-  /** "Gut angekommen", "Alles okay", "Bin zuhause". Also ends my running watches. */
+  /**
+   * "Gut angekommen", "Alles okay", "Bin zuhause". Also ends my running watches.
+   * Without `placeName` the place I'm at is added, except in ghost mode.
+   */
   async sendCheckin(input: { to: ContactKey[]; kind: CheckinKind; text?: string; placeName?: string }): Promise<void> {
+    await this.checkin(input, !this.state.ghost);
+  }
+
+  private async checkin(input: { to: ContactKey[]; kind: CheckinKind; text?: string; placeName?: string }, addPlace: boolean): Promise<void> {
     const to = [...new Set(input.to)].filter((k) => this.contact(k));
     if (!to.length) throw new RangeError('Wähle mindestens einen Kontakt.');
     const text = input.text?.trim() ? cleanText(input.text, 140) : undefined;
-    const placeName = input.placeName?.trim() ? cleanText(input.placeName, 60) : this.currentPlace()?.name;
+    const placeName = input.placeName?.trim() ? cleanText(input.placeName, 60) : addPlace ? this.currentPlace()?.name : undefined;
     const id = await this.sendMany(to, { type: 'checkin', kind: input.kind, text, placeName }, TTL.chat);
     for (const k of to) this.recordSent(k, `${id.slice(0, 40)}-${k.slice(0, 8)}`, checkinText(input.kind, text, placeName), 'ping');
     if (input.kind !== 'custom') {
@@ -590,10 +626,16 @@ export class SocialNode {
     const to = [...new Set(input.to)].filter((k) => this.contact(k));
     if (!to.length) throw new RangeError('Wähle mindestens einen Kontakt.');
     checkWatchTime(input.dueAt, now);
+    // Refused instead of dropping an old watch (whose alarm would then ring with no way to end it),
+    // and capped like the recipient's phone caps it, which would otherwise ignore the new one silently.
+    const active = this.state.watches;
+    if (active.length >= MAX_OWN_WATCHES || to.some((k) => active.filter((w) => w.recipients.includes(k)).length >= MAX_WATCHES_PER_CONTACT)) {
+      throw new RangeError('Es laufen schon zu viele „Pass auf mich auf“. Beende zuerst eines.');
+    }
     const label = cleanText(input.label || 'Unterwegs', 60);
     const watchId = randomId();
     this.update({
-      watches: [...this.state.watches, { watchId, recipients: to, label, dueAt: input.dueAt, startedAt: now, tripId: input.tripId }].slice(-20),
+      watches: [...active, { watchId, recipients: to, label, dueAt: input.dueAt, startedAt: now, tripId: input.tripId }],
     });
     await this.sendMany(to, { type: 'watch.start', watchId, label, dueAt: input.dueAt }, watchTtl(input.dueAt, now));
     this.scheduleOwnWatchAlarms(watchId);
@@ -978,25 +1020,31 @@ export class SocialNode {
     try {
       const before = new Set(this.state.outbox);
       const now = this.now();
-      const keep: OutboxEntry[] = [];
+      const keep: [OutboxEntry, OutboxEntry][] = [];
       let offline = false;
       for (const e of before) {
-        if (now > e.firstAt + e.ttlSeconds * 1000) continue;
+        // Only the time that is left, so a late retry does not keep the message on relays for longer.
+        const ttlSeconds = Math.ceil((e.firstAt + e.ttlSeconds * 1000 - now) / 1000);
+        if (ttlSeconds <= 0) continue;
         if (offline || (!force && (e.nextAt ?? 0) > now)) {
-          keep.push(e);
+          keep.push([e, e]);
           continue;
         }
         try {
-          await this.transport.send(e.to, e.message, { ttlSeconds: e.ttlSeconds });
+          await this.transport.send(e.to, e.message, { ttlSeconds });
         } catch {
+          // A message the wire format rejects fails forever; keeping it would hold up everything behind it.
+          if (!isSendable(e.message)) continue;
           offline = true;
           const attempts = e.attempts + 1;
-          keep.push({ ...e, attempts, nextAt: now + Math.min(10 * 60_000, 15_000 * 2 ** Math.min(attempts, 6)) });
+          keep.push([e, { ...e, attempts, nextAt: now + Math.min(10 * 60_000, 15_000 * 2 ** Math.min(attempts, 6)) }]);
         }
       }
-      // Entries queued while this loop was sending stay too.
+      // Entries queued while this loop was sending stay too; entries dropped meanwhile stay dropped.
+      const current = new Set(this.state.outbox);
       const added = this.state.outbox.filter((e) => !before.has(e));
-      this.update({ outbox: [...keep, ...added].slice(-MAX_OUTBOX) });
+      const kept = keep.filter(([orig]) => current.has(orig)).map(([, next]) => next);
+      this.update({ outbox: [...kept, ...added].slice(-MAX_OUTBOX) });
     } finally {
       this.flushingOutbox = false;
     }
@@ -1004,7 +1052,31 @@ export class SocialNode {
 
   // ---- incoming --------------------------------------------------------------------------------
 
+  /**
+   * Whether this device acts on a message from `from` at all. Only contacts can reach it;
+   * group members who are not my contacts may write in a group whose owner is a contact of
+   * mine (the owner vouched for them), and a stranger may answer a QR code I showed.
+   * A transport can call this to keep strangers' messages out of its list of processed ones.
+   */
+  acceptsMessage(from: ContactKey, message: AppMessage): boolean {
+    if (from === this.state.self.key || this.contact(from)) return true;
+    switch (message.type) {
+      case 'hello':
+        return message.inviteNonce !== undefined && this.state.openInvites.some((i) => i.nonce === message.inviteNonce);
+      case 'group.text':
+      case 'group.leave':
+        return this.isMember(message.groupId, from);
+      case 'group.update':
+        return this.group(message.groupId)?.owner === from;
+      default:
+        return false;
+    }
+  }
+
   private async handleIncoming({ from, message }: IncomingMessage): Promise<void> {
+    // Before the duplicate filter, so a stranger's flood cannot push contacts' ids out of it
+    // and get an old message of theirs, replayed from a relay, handled a second time.
+    if (!this.acceptsMessage(from, message)) return;
     if (!this.seen.add(`${from}|${message.id}`)) return;
 
     if (from === this.state.self.key) {
@@ -1014,17 +1086,6 @@ export class SocialNode {
     if (message.type === 'hello') {
       this.handleHello(from, message);
       return;
-    }
-    // Only contacts can reach this device. Group members who are not my contacts may
-    // write in a group whose owner is a contact of mine (the owner vouched for them).
-    if (!this.contact(from)) {
-      if (message.type === 'group.text' || message.type === 'group.leave') {
-        if (!this.isMember(message.groupId, from)) return;
-      } else if (message.type === 'group.update') {
-        if (this.group(message.groupId)?.owner !== from) return;
-      } else {
-        return;
-      }
     }
 
     const at = this.now();
@@ -1089,9 +1150,8 @@ export class SocialNode {
   private handleHello(from: ContactKey, message: MessageOf<'hello'>): void {
     const existing = this.contact(from);
     if (existing) {
-      if (existing.name !== message.name || JSON.stringify(existing.relays) !== JSON.stringify(message.relays)) {
-        this.editContact(from, { name: message.name, relays: message.relays });
-      }
+      const changed = existing.name !== message.name || JSON.stringify(existing.relays) !== JSON.stringify(message.relays);
+      if (changed && this.helloLimiter.allow(from, this.now())) this.editContact(from, { name: message.name, relays: message.relays });
       return;
     }
     // A stranger may only become a contact by answering a QR code this device showed.
@@ -1147,19 +1207,41 @@ export class SocialNode {
     if (!doc) return;
     const deviceName = typeof p.deviceName === 'string' ? p.deviceName.trim().slice(0, 40) : '';
     this.upsertDevice(p.deviceId, deviceName || 'Gerät');
-    const patch = mergeSyncDoc(this.state, doc, this.now());
+    const now = this.now();
+    const patch = mergeSyncDoc(this.state, doc, now);
     if (patch.places) this.geofence.setPlaces(patch.places);
     if (patch.contacts) {
-      for (const key of [...this.statuses.keys()]) if (!patch.contacts.some((c) => c.key === key)) this.statuses.delete(key);
+      const kept = new Set(patch.contacts.map((c) => c.key));
+      for (const [key, status] of [...this.statuses]) {
+        if (kept.has(key)) continue;
+        for (const w of status.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
+        this.statuses.delete(key);
+      }
+      // A live share with someone removed on another device would keep the GPS running for nobody.
+      const liveShares = this.state.liveShares.filter((l) => kept.has(l.contactKey));
+      if (liveShares.length !== this.state.liveShares.length) patch.liveShares = liveShares;
     }
     if (Object.keys(patch).length) this.update(patch);
-    // If I know something the other device does not, answer with my version.
-    const mine = buildSyncDoc(this.state);
-    const theirsOlder =
-      (Object.keys(mine.rev) as SyncField[]).some((f) => (mine.rev[f] ?? 0) > (doc.rev[f] ?? 0)) ||
-      JSON.stringify(mine.contacts) !== JSON.stringify(doc.contacts) ||
-      JSON.stringify(mine.groups) !== JSON.stringify(doc.groups);
-    if (theirsOlder) this.markSync();
+    if (patch.liveShares) this.emitLocationNeeds();
+    // Answer only if the other device would change something by taking my version. Comparing
+    // the lists directly made two devices whose lists merely differed in order (or tied) send
+    // each other their whole settings forever.
+    const theirs: NodeState = {
+      ...this.state,
+      self: { ...this.state.self, name: doc.profileName },
+      contacts: doc.contacts,
+      removedContacts: doc.removedContacts,
+      groups: doc.groups,
+      leftGroups: doc.leftGroups ?? [],
+      places: doc.places,
+      grants: doc.grants,
+      rules: doc.rules,
+      prefs: doc.prefs,
+      sosMessage: doc.sosMessage,
+      status: doc.status,
+      syncRev: doc.rev,
+    };
+    if (Object.keys(mergeSyncDoc(theirs, buildSyncDoc(this.state), now)).length) this.markSync();
   }
 
   private upsertDevice(deviceId: string, name: string): void {
@@ -1171,8 +1253,9 @@ export class SocialNode {
 
   private onPresence(from: ContactKey, m: MessageOf<'presence'>, at: number): void {
     const prev = this.statuses.get(from)?.presence;
-    if (prev?.sentAt !== undefined && m.sentAt < prev.sentAt) return;
-    const presence: NonNullable<ContactStatus['presence']> = { updatedAt: at, sentAt: m.sentAt };
+    const sentAt = senderTime(m.sentAt, at);
+    if (prev?.sentAt !== undefined && sentAt < prev.sentAt) return;
+    const presence: NonNullable<ContactStatus['presence']> = { updatedAt: at, sentAt };
     if (m.status && m.status.expiresAt > at) presence.status = m.status;
     if (m.dnd && (m.dnd.until === undefined || m.dnd.until > at)) presence.dnd = m.dnd;
     this.setStatus(from, { presence });
@@ -1194,7 +1277,7 @@ export class SocialNode {
         level: m.level,
         expiresAt: Math.min(m.expiresAt, at + DAY),
         updatedAt: at,
-        lastSentAt: same ? prev.lastSentAt : m.sentAt,
+        lastSentAt: same ? prev.lastSentAt : senderTime(m.sentAt, at),
       },
     });
     if (same) return;
@@ -1205,7 +1288,8 @@ export class SocialNode {
   private async onTripUpdate(from: ContactKey, m: MessageOf<'session.update'>, at: number): Promise<void> {
     if (this.ended.has(`trip|${from}|${m.sessionId}`)) return;
     const prev = this.statuses.get(from)?.trip;
-    if (prev && prev.sessionId === m.sessionId && m.sentAt < prev.lastSentAt) return; // relays may reorder
+    const sentAt = senderTime(m.sentAt, at);
+    if (prev && prev.sessionId === m.sessionId && sentAt < prev.lastSentAt) return; // relays may reorder
     const base =
       prev?.sessionId === m.sessionId
         ? prev
@@ -1219,7 +1303,7 @@ export class SocialNode {
       ...(cell ? { cell } : {}),
       ...(point ? { point } : {}),
       updatedAt: at,
-      lastSentAt: m.sentAt,
+      lastSentAt: sentAt,
     };
     this.setStatus(from, { trip });
     if (m.etaMinutes !== undefined) {
@@ -1283,7 +1367,7 @@ export class SocialNode {
           level: m.level,
           expiresAt: m.expiresAt,
           updatedAt: at,
-          lastSentAt: same ? prev.lastSentAt : m.sentAt,
+          lastSentAt: same ? prev.lastSentAt : senderTime(m.sentAt, at),
         },
       });
       if (!same) {
@@ -1297,13 +1381,14 @@ export class SocialNode {
       }
       return;
     }
-    if (same && m.sentAt < prev.lastSentAt) return;
+    const sentAt = senderTime(m.sentAt, at);
+    if (same && sentAt < prev.lastSentAt) return;
     // Updates that overtake their start message are kept as coarse until the start arrives.
     const base = same ? prev : { shareId: m.shareId, level: 'coarse' as const };
     const point = base.level === 'precise' ? m.point : undefined;
     if (!point && !m.cell) return;
     this.setStatus(from, {
-      live: { ...base, ...(point ? { point } : {}), ...(m.cell ? { cell: m.cell } : {}), updatedAt: at, lastSentAt: m.sentAt },
+      live: { ...base, ...(point ? { point } : {}), ...(m.cell ? { cell: m.cell } : {}), updatedAt: at, lastSentAt: sentAt },
     });
   }
 
@@ -1322,7 +1407,14 @@ export class SocialNode {
     const existing = watches.find((w) => w.watchId === m.watchId);
     if (existing && existing.dueAt === m.dueAt && existing.label === m.label) return;
     if (!existing && watches.length >= MAX_WATCHES_PER_CONTACT) return;
-    const next = { watchId: m.watchId, label: m.label, dueAt: m.dueAt, startedAt: existing?.startedAt ?? at };
+    // A watch that already rang rings again only when its deadline really moves into the future.
+    if (existing?.firedAt !== undefined && m.dueAt <= at) return;
+    // Watch alarms ring through quiet mode, so each new ring takes one from a small hourly
+    // budget per contact; past it they ring as normal notifications. Moving the deadline of a
+    // watch that has not rung yet adds no ring and keeps its loudness.
+    const pending = existing !== undefined && existing.firedAt === undefined && existing.dueAt > at;
+    const quiet = pending ? existing.quiet === true : !this.watchAlarmLimiter.allow(from, at);
+    const next = { watchId: m.watchId, label: m.label, dueAt: m.dueAt, startedAt: existing?.startedAt ?? at, ...(quiet ? { quiet } : {}) };
     this.setStatus(from, { watches: [...watches.filter((w) => w.watchId !== m.watchId), next] });
     const c = this.contact(from);
     const dndThen = isDndActive(this.state.prefs.dnd, m.dueAt, this.localTime);
@@ -1333,7 +1425,7 @@ export class SocialNode {
         at: m.dueAt,
         title: `⏰ ${this.name(from)} hat sich nicht gemeldet`,
         body: `„${m.label}“ war bis ${this.hhmm(m.dueAt)} geplant. Frag nach, ob alles okay ist.`,
-        level: alertLevel({ category: 'watch', favorite: c?.favorite, muted: c?.muted }, this.state.prefs, dndThen),
+        level: alertLevel({ category: quiet ? 'trip' : 'watch', favorite: c?.favorite, muted: c?.muted }, this.state.prefs, dndThen),
       },
     });
     this.alert({
@@ -1366,7 +1458,7 @@ export class SocialNode {
         // Same id as the scheduled alarm, so the platform shows one notification, not two.
         this.alert({
           id: `watch:${key}:${w.watchId}`,
-          category: 'watch',
+          category: w.quiet ? 'trip' : 'watch',
           title: `⏰ ${this.name(key)} hat sich nicht gemeldet`,
           body: `„${w.label}“ war bis ${this.hhmm(w.dueAt)} geplant. Frag nach, ob alles okay ist.`,
           from: key,
@@ -1383,7 +1475,8 @@ export class SocialNode {
     const prev = this.statuses.get(from)?.sos;
     const same = prev?.sosId === m.sosId;
     if (m.type === 'sos.start') {
-      if (this.ended.has(`sos|${from}|${m.sosId}`)) return;
+      // `endedAt` survives a restart, the `ended` list does not: a late copy must not revive it.
+      if (this.ended.has(`sos|${from}|${m.sosId}`) || (same && prev.endedAt !== undefined)) return;
       this.setStatus(from, {
         sos: {
           sosId: m.sosId,
@@ -1393,7 +1486,7 @@ export class SocialNode {
           pointAt: m.point ? at : same ? prev.pointAt : undefined,
           others: m.others.filter((o) => o.key !== this.state.self.key && o.key !== from),
           acks: same ? prev.acks : [],
-          lastSentAt: m.sentAt,
+          lastSentAt: senderTime(m.sentAt, at),
         },
       });
       if (same) return;
@@ -1414,10 +1507,13 @@ export class SocialNode {
     if (m.type === 'sos.update') {
       if (!same || prev.endedAt) return;
       let next = prev;
-      if (m.point && m.sentAt >= (prev.lastSentAt ?? 0)) next = { ...next, point: m.point, pointAt: at, lastSentAt: m.sentAt };
+      const sentAt = senderTime(m.sentAt, at);
+      if (m.point && sentAt >= (prev.lastSentAt ?? 0)) next = { ...next, point: m.point, pointAt: at, lastSentAt: sentAt };
       if (m.acks) {
         const acks = [...next.acks];
         for (const a of m.acks) {
+          // Bounded: every update may name 20 new helpers, and the sender can send as many as it likes.
+          if (acks.length >= MAX_SOS_ACKS) break;
           if (a.key === this.state.self.key || acks.some((x) => x.key === a.key)) continue;
           acks.push({ key: a.key, name: this.contact(a.key) ? this.name(a.key) : a.name, at, text: a.text });
           this.alert({ category: 'checkin', title: `${a.name} kümmert sich um ${this.name(from)}`, body: a.text ?? 'Hilfe ist unterwegs.', from, thread: from, ref: { sosId: m.sosId, sosOwner: from } });
@@ -1568,6 +1664,8 @@ export class SocialNode {
 
   private async runAutomations(event: AutomationEvent): Promise<void> {
     for (const intent of this.engine.handle(event)) {
+      // In ghost mode, rules that depend on where I am may only act on this device.
+      if (this.state.ghost && !isLocalIntent(intent, this.state.prefs) && this.usesMyLocation(intent.ruleId)) continue;
       try {
         switch (intent.kind) {
           case 'notify':
@@ -1580,7 +1678,8 @@ export class SocialNode {
             await this.sendChat(intent.to, intent.text);
             break;
           case 'send_checkin':
-            await this.sendCheckin({ to: intent.to, kind: intent.checkinKind, text: intent.text });
+            // Never adds the place I'm at by itself: the trigger may be a contact without a grant for it.
+            await this.checkin({ to: intent.to, kind: intent.checkinKind, text: intent.text }, false);
             break;
           case 'set_dnd':
             await this.setDnd(intent.minutes);
@@ -1599,6 +1698,11 @@ export class SocialNode {
         // A failing action (e.g. a removed contact) must not stop the others.
       }
     }
+  }
+
+  private usesMyLocation(ruleId: string): boolean {
+    const r = this.state.rules.find((x) => x.id === ruleId);
+    return !r || r.trigger.on.startsWith('me.') || r.conditions.some((c) => c.if === 'me.at' || c.if === 'me.not_at');
   }
 
   // ---- sending ---------------------------------------------------------------------------------
@@ -1674,9 +1778,16 @@ export class SocialNode {
     try {
       await this.transport.send(to, message, { ttlSeconds });
     } catch {
+      // Not offline but unsendable (e.g. a relay address the wire rejects): retrying cannot help.
+      if (!isSendable(message)) return;
       const now = this.now();
       this.enqueue({ to, message, ttlSeconds, firstAt: now, attempts: 1, nextAt: now + 15_000 });
     }
+  }
+
+  private dropQueued(drop: (e: OutboxEntry) => boolean): void {
+    const outbox = this.state.outbox.filter((e) => !drop(e));
+    if (outbox.length !== this.state.outbox.length) this.update({ outbox });
   }
 
   private enqueue(entry: OutboxEntry): void {
@@ -1719,7 +1830,9 @@ export class SocialNode {
     if (existing) return existing;
     if (this.state.contacts.length >= MAX_CONTACTS) throw new RangeError('Du hast die maximale Anzahl an Kontakten erreicht.');
     const now = this.now();
-    const contact: Contact = { ...input, addedAt: now, verified: false, updatedAt: now };
+    // Newer than an old removal, which may come from a device whose clock runs ahead.
+    const removedAt = this.state.removedContacts.find((t) => t.key === input.key)?.at ?? 0;
+    const contact: Contact = { ...input, addedAt: now, verified: false, updatedAt: Math.max(now, removedAt + 1) };
     this.update({
       contacts: [...this.state.contacts, contact],
       removedContacts: this.state.removedContacts.filter((t) => t.key !== input.key),
@@ -1736,7 +1849,10 @@ export class SocialNode {
   private editContact(key: ContactKey, patch: Partial<Contact>): void {
     if (!this.contact(key)) return;
     const now = this.now();
-    this.update({ contacts: this.state.contacts.map((c) => (c.key === key ? stripUndefined({ ...c, ...patch, updatedAt: now }) : c)) });
+    // Newest wins when my devices sync. Always newer than the last change, even one made on a
+    // device whose clock runs ahead, or this edit would be overwritten by the older one.
+    const edit = (c: Contact) => stripUndefined({ ...c, ...patch, updatedAt: Math.max(now, stampOf(c) + 1) });
+    this.update({ contacts: this.state.contacts.map((c) => (c.key === key ? edit(c) : c)) });
     this.markSync();
   }
 
@@ -1851,7 +1967,11 @@ function rosterBody(g: Group): BodyOf<'group.update'> {
     groupId: g.id,
     name: g.name,
     owner: g.owner,
-    members: g.members.map((m) => ({ key: m.key, name: m.name, ...(m.relays?.length ? { relays: m.relays.slice(0, 8) } : {}) })),
+    members: g.members.map((m) => {
+      // A relay the wire rejects (e.g. from an old QR code) would make the whole roster unsendable.
+      const relays = (m.relays ?? []).filter((r) => RelayUrl.safeParse(r).success).slice(0, 8);
+      return { key: m.key, name: m.name, ...(relays.length ? { relays } : {}) };
+    }),
     version: g.version,
   };
 }
@@ -1860,6 +1980,20 @@ function replaceKey(e: OutboxEntry): string {
   const m = e.message as { type: string; sessionId?: string; shareId?: string; sosId?: string };
   const acksOnly = m.type === 'sos.update' && !(e.message as { point?: unknown }).point ? '|acks' : '';
   return `${e.to}|${m.type}|${m.sessionId ?? m.shareId ?? m.sosId ?? ''}${acksOnly}`;
+}
+
+function stampOf(c: Contact): number {
+  return c.updatedAt ?? c.addedAt;
+}
+
+/** The sender's clock, capped a little ahead of mine, so a clock that ran fast cannot freeze later updates. */
+function senderTime(sentAt: number, at: number): number {
+  return Math.min(sentAt, at + MAX_CLOCK_AHEAD_MS);
+}
+
+/** Actions that tell nobody anything: quiet mode counts only while it is not shared with contacts. */
+function isLocalIntent(intent: ActionIntent, prefs: NotificationPrefs): boolean {
+  return intent.kind === 'notify' || (intent.kind === 'set_dnd' && !prefs.dnd.share);
 }
 
 function toPoint(fix: LocationFix): Point {

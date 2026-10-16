@@ -10,7 +10,8 @@ import { LIMITS } from '../components/social/limits';
 import { QrCode } from '../components/QrCode';
 import { Button, Card, Hint, Row, Screen, T } from '../components/ui';
 import { isDesktop, isNative } from '../lib/platform';
-import { useRuntime, useSnapshot, useTick } from '../lib/store';
+import { useRuntime, useSnapshot } from '../lib/store';
+import { useNow } from '../components/social/useNow';
 import { radius, spacing, useTheme } from '../lib/theme';
 
 type Tab = 'show' | 'scan';
@@ -59,7 +60,7 @@ function ShowCode() {
   const t = useTheme();
   const runtime = useRuntime();
   const { width } = useWindowDimensions();
-  const now = useTick(1000);
+  const now = useNow(1000);
   const [invite, setInvite] = useState(() => ({ text: runtime.node.createInvite(), expiresAt: Date.now() + INVITE_TTL_MS }));
   const [copied, setCopied] = useState(false);
   const left = invite.expiresAt - now;

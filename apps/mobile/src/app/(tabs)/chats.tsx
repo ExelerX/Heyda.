@@ -5,7 +5,8 @@ import { listTime } from '../../components/social/format';
 import { CountBadge, ListCard, ListRow, Narrow } from '../../components/social/kit';
 import { ThreadAvatar } from '../../components/social/ThreadAvatar';
 import { Button, Empty, Row, Screen, T } from '../../components/ui';
-import { useContactName, useSnapshot, useTick } from '../../lib/store';
+import { useContactName, useSnapshot } from '../../lib/store';
+import { useNow } from '../../components/social/useNow';
 import { spacing, useTheme } from '../../lib/theme';
 
 interface ThreadRow {
@@ -22,7 +23,7 @@ export default function Chats() {
   const t = useTheme();
   const { state, chats, unread } = useSnapshot();
   const contactName = useContactName();
-  const now = useTick(60_000);
+  const now = useNow(60_000);
 
   const rows: ThreadRow[] = [
     ...state.contacts.map((c): ThreadRow => ({

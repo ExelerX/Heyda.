@@ -2,7 +2,9 @@ import type { Alert } from '@heyda/core';
 import type { Href } from 'expo-router';
 
 /** Where tapping an alert (in the activity list or as a notification) leads. */
-export function routeForAlert(alert: Pick<Alert, 'category' | 'from' | 'thread' | 'ref'>, selfKey: string): Href {
+export function routeForAlert(alert: Pick<Alert, 'category' | 'from' | 'thread' | 'ref'> & { id?: string }, selfKey: string): Href {
+  // My own "Pass auf mich auf" reminders carry no sender.
+  if (alert.id?.startsWith('mywatch:') || (alert.category === 'watch' && !alert.from)) return '/watch';
   const owner = alert.ref?.sosOwner;
   if (owner === selfKey) return '/sos';
   if (owner) return { pathname: '/sos-alert/[key]', params: { key: owner } };

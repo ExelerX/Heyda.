@@ -22,7 +22,8 @@ import { Avatar, Button, Card, Chip, Hint, Pill, Row, Screen, Section, T, Toggle
 import { confirm, notice } from '../../lib/confirm';
 import { callPhone, openInMaps } from '../../lib/emergency';
 import { isNative } from '../../lib/platform';
-import { useRuntime, useSnapshot, useTick } from '../../lib/store';
+import { useRuntime, useSnapshot } from '../../lib/store';
+import { useNow } from '../../components/social/useNow';
 import { spacing, useTheme } from '../../lib/theme';
 
 const PINGS: PingKind[] = PING_KINDS.filter((k) => k !== 'custom');
@@ -36,7 +37,7 @@ export default function ContactDetails() {
   const justAdded = param(params.added) === '1';
   const runtime = useRuntime();
   const { state, statuses, activeTrip } = useSnapshot();
-  const now = useTick(15_000);
+  const now = useNow(15_000);
   const contact = key ? state.contacts.find((c) => c.key === key) : undefined;
 
   const [nickname, setNickname] = useState(contact?.nickname ?? '');
@@ -424,7 +425,7 @@ export default function ContactDetails() {
             {c.verified ? (
               <Pill text="✓ Verifiziert" color={t.success} />
             ) : (
-              <Button title="Verifiziert" icon="✅" kind="secondary" compact onPress={() => void verify()} />
+              <Button title="Als verifiziert markieren" icon="✅" kind="secondary" compact onPress={() => void verify()} />
             )}
           </Card>
           <T variant="small">

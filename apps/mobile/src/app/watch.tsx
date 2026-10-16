@@ -1,13 +1,14 @@
 import { MAX_WATCH_MS, MIN_WATCH_MS, type MyWatch } from '@heyda/core';
 import { router } from 'expo-router';
-import { useState } from 'react';
-import { Platform, Text, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { Platform, ScrollView, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { BigButton } from '../components/safety/BigButton';
 import { ContactPicker, defaultRecipients, namesOf, NoContacts, stillContacts } from '../components/safety/ContactPicker';
 import { Field } from '../components/safety/Field';
 import { Stepper } from '../components/safety/Stepper';
 import { clockWithDay, countdown, spanText } from '../components/safety/time';
-import { Button, Card, Chip, Hint, Pill, Row, Screen, Section, T, Wrap } from '../components/ui';
+import { Button, Card, Chip, Hint, Pill, Row, Section, T, Wrap } from '../components/ui';
 import { confirm, notice } from '../lib/confirm';
 import { isDesktop } from '../lib/platform';
 import { useRuntime, useSnapshot, useTick } from '../lib/store';
@@ -45,7 +46,8 @@ export default function WatchScreen() {
   const [minutes, setMinutes] = useState(30);
   const [recipients, setRecipients] = useState<string[]>(() => defaultRecipients(state.contacts));
   const [busy, setBusy] = useState(false);
-  const [started, setStarted] = useState<string>();
+  const [started, setStarted] = useState<{ watchId: string; text: string }>();
+  const scroll = useRef<ScrollView>(null);
 
   const watches = [...state.watches].sort((a, b) => a.dueAt - b.dueAt);
   const to = stillContacts(recipients, state.contacts);
@@ -62,11 +64,14 @@ export default function WatchScreen() {
     try {
       const at = Date.now() + totalMin * MIN;
       const name = label.trim() || 'Unterwegs';
-      await runtime.node.startWatch({ to, label: name, dueAt: at });
-      setStarted(
-        `„${name}“ läuft. Wenn du dich bis ${clockWithDay(at)} Uhr nicht meldest, ${to.length === 1 ? 'bekommt' : 'bekommen'} ${namesOf(to, state.contacts)} einen Alarm.`,
-      );
+      const watchId = await runtime.node.startWatch({ to, label: name, dueAt: at });
+      setStarted({
+        watchId,
+        text: `„${name}“ läuft. Wenn du dich bis ${clockWithDay(at)} Uhr nicht meldest, ${to.length === 1 ? 'bekommt' : 'bekommen'} ${namesOf(to, state.contacts)} einen Alarm.`,
+      });
       setLabel('');
+      // Show the new countdown at the top.
+      scroll.current?.scrollTo({ y: 0, animated: true });
     } catch (e) {
       notice('Nicht gestartet', errorText(e));
     } finally {
@@ -75,96 +80,102 @@ export default function WatchScreen() {
   }
 
   return (
-    <Screen edges={['bottom']}>
-      <View style={{ width: '100%', maxWidth: 720, alignSelf: 'center', gap: spacing.md }}>
-        <Card style={{ gap: spacing.xs }}>
-          <T>Du sagst, bis wann du dich meldest – zum Beispiel, wenn du nachts nach Hause gehst.</T>
-          <T variant="muted">
-            Meldest du dich bis dahin nicht, bekommen die gewählten Personen einen Alarm, auch in ihrem Ruhemodus.
-          </T>
-        </Card>
+    <SafeAreaView style={{ flex: 1, backgroundColor: t.bg }} edges={['bottom']}>
+      <ScrollView
+        ref={scroll}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={{ padding: spacing.lg, paddingBottom: spacing.xxl * 2 }}
+      >
+        <View style={{ width: '100%', maxWidth: 720, alignSelf: 'center', gap: spacing.md }}>
+          <Card style={{ gap: spacing.xs }}>
+            <T>Du sagst, bis wann du dich meldest – zum Beispiel, wenn du nachts nach Hause gehst.</T>
+            <T variant="muted">
+              Meldest du dich bis dahin nicht, bekommen die gewählten Personen einen Alarm, auch in ihrem Ruhemodus.
+            </T>
+          </Card>
 
-        {watches.length > 0 && (
-          <Section title={watches.length === 1 ? 'Läuft gerade' : `${watches.length} laufen gerade`}>
-            {watches.map((w) => (
-              <WatchCard key={w.watchId} watch={w} now={now} />
-            ))}
-          </Section>
-        )}
-
-        {state.contacts.length === 0 ? (
-          <NoContacts text="Damit jemand auf dich aufpassen kann, füge zuerst Freunde oder Familie hinzu." />
-        ) : (
-          <>
-            <Section title={watches.length ? 'Noch eins starten' : 'Wofür?'}>
-              <Wrap>
-                {LABELS.map((l) => (
-                  <Chip key={l.text} icon={l.icon} label={l.text} selected={label.trim() === l.text} onPress={() => setLabel(l.text)} />
-                ))}
-              </Wrap>
-              <Field
-                value={label}
-                onChangeText={setLabel}
-                placeholder="oder selbst schreiben, z. B. Konzert"
-                maxLength={60}
-                accessibilityLabel="Wofür"
-              />
+          {watches.length > 0 && (
+            <Section title={watches.length === 1 ? 'Läuft gerade' : `${watches.length} laufen gerade`}>
+              {watches.map((w) => (
+                <WatchCard key={w.watchId} watch={w} now={now} />
+              ))}
             </Section>
+          )}
 
-            <Section title="Bis wann meldest du dich?">
-              <Wrap>
-                {DUE.map((d) => (
-                  <Chip key={d.min} label={d.label} selected={due === d.min} onPress={() => setDue(d.min)} />
-                ))}
-                <Chip label="Eigene Zeit" icon="✏️" selected={due === CUSTOM} onPress={() => setDue(CUSTOM)} />
-              </Wrap>
-              {due === CUSTOM && (
-                <Card>
-                  <Row style={{ alignItems: 'flex-start' }}>
-                    <Stepper label="Stunden" unit="Std." value={hours} onChange={setHours} min={0} max={48} />
-                    <Stepper label="Minuten" unit="Min." value={minutes} onChange={setMinutes} min={0} max={55} step={5} />
-                  </Row>
-                  {tooShort && <T color={t.danger}>Mindestens 5 Minuten.</T>}
-                  {tooLong && <T color={t.danger}>Höchstens 48 Stunden.</T>}
-                </Card>
-              )}
-              {!tooShort && !tooLong && (
-                <T variant="muted">
-                  Du meldest dich bis <T style={{ fontWeight: '800' }}>{clockWithDay(dueAt, now)} Uhr</T> (in {spanText(totalMin * MIN)}).
-                </T>
-              )}
-            </Section>
+          {state.contacts.length === 0 ? (
+            <NoContacts text="Damit jemand auf dich aufpassen kann, füge zuerst Freunde oder Familie hinzu." />
+          ) : (
+            <>
+              <Section title={watches.length ? 'Noch eins starten' : 'Wofür?'}>
+                <Wrap>
+                  {LABELS.map((l) => (
+                    <Chip key={l.text} icon={l.icon} label={l.text} selected={label.trim() === l.text} onPress={() => setLabel(l.text)} />
+                  ))}
+                </Wrap>
+                <Field
+                  value={label}
+                  onChangeText={setLabel}
+                  placeholder="oder selbst schreiben, z. B. Konzert"
+                  maxLength={60}
+                  accessibilityLabel="Wofür"
+                />
+              </Section>
 
-            <Section title="Wer passt auf?">
-              <ContactPicker contacts={state.contacts} selected={to} onChange={setRecipients} label="Wer passt auf" />
-            </Section>
+              <Section title="Bis wann meldest du dich?">
+                <Wrap>
+                  {DUE.map((d) => (
+                    <Chip key={d.min} label={d.label} selected={due === d.min} onPress={() => setDue(d.min)} />
+                  ))}
+                  <Chip label="Eigene Zeit" icon="✏️" selected={due === CUSTOM} onPress={() => setDue(CUSTOM)} />
+                </Wrap>
+                {due === CUSTOM && (
+                  <Card>
+                    <Row style={{ alignItems: 'flex-start' }}>
+                      <Stepper label="Stunden" unit="Std." value={hours} onChange={setHours} min={0} max={48} />
+                      <Stepper label="Minuten" unit="Min." value={minutes} onChange={setMinutes} min={0} max={55} step={5} />
+                    </Row>
+                    {tooShort && <T color={t.danger}>Mindestens 5 Minuten.</T>}
+                    {tooLong && <T color={t.danger}>Höchstens 48 Stunden.</T>}
+                  </Card>
+                )}
+                {!tooShort && !tooLong && (
+                  <T variant="muted">
+                    Du meldest dich bis <T style={{ fontWeight: '800' }}>{clockWithDay(dueAt, now)} Uhr</T> (in {spanText(totalMin * MIN)}).
+                  </T>
+                )}
+              </Section>
 
-            <View style={{ marginTop: spacing.lg, gap: spacing.md }}>
-              {started && (
-                <Card style={{ borderColor: t.success }}>
-                  <T color={t.success}>✓ {started}</T>
-                </Card>
-              )}
-              <BigButton
-                title="Pass auf mich auf starten"
-                icon="🛡️"
-                onPress={() => void start()}
-                disabled={!ready}
-                busy={busy}
-              />
-              <Hint>
-                10 Minuten vorher erinnert dich dein {isDesktop ? 'Computer' : 'Handy'}. Melden kannst du dich hier oder mit „Kurz
-                melden“ (z. B. „Gut angekommen“).
-                {Platform.OS === 'ios'
-                  ? ' Die Alarme sind auf den Geräten der anderen geplant und klingeln pünktlich, auch wenn dein iPhone aus ist.'
-                  : ' Der Alarm ist auf den Geräten der anderen geplant und kommt auch, wenn dein Handy aus ist oder kein Netz hat.'}
-              </Hint>
-              <Button title="Mein Notruf (SOS)" icon="🆘" kind="ghost" compact onPress={() => router.push('/sos')} />
-            </View>
-          </>
-        )}
-      </View>
-    </Screen>
+              <Section title="Wer passt auf?">
+                <ContactPicker contacts={state.contacts} selected={to} onChange={setRecipients} label="Wer passt auf" />
+              </Section>
+
+              <View style={{ marginTop: spacing.lg, gap: spacing.md }}>
+                {started && watches.some((w) => w.watchId === started.watchId) && (
+                  <Card style={{ borderColor: t.success }}>
+                    <T color={t.success}>✓ {started.text}</T>
+                  </Card>
+                )}
+                <BigButton
+                  title="Pass auf mich auf starten"
+                  icon="🛡️"
+                  onPress={() => void start()}
+                  disabled={!ready}
+                  busy={busy}
+                />
+                <Hint>
+                  10 Minuten vorher erinnert dich dein {isDesktop ? 'Computer' : 'Handy'}. Melden kannst du dich hier oder mit „Kurz
+                  melden“ (z. B. „Gut angekommen“).
+                  {Platform.OS === 'ios'
+                    ? ' Die Alarme sind auf den Geräten der anderen geplant und klingeln pünktlich, auch wenn dein iPhone aus ist.'
+                    : ' Der Alarm ist auf den Geräten der anderen geplant und kommt auch, wenn dein Handy aus ist oder kein Netz hat.'}
+                </Hint>
+                <Button title="Mein Notruf (SOS)" icon="🆘" kind="ghost" compact onPress={() => router.push('/sos')} />
+              </View>
+            </>
+          )}
+        </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 

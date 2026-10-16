@@ -264,10 +264,21 @@ export function Banner({ tone = 'info', icon, title, children }: { tone?: 'info'
             {title}
           </T>
         ) : null}
-        {typeof children === 'string' ? <T variant="small" color={t.text}>{children}</T> : children}
+        {isPlainText(children) ? (
+          <T variant="small" color={t.text}>
+            {children}
+          </T>
+        ) : (
+          children
+        )}
       </View>
     </View>
   );
+}
+
+function isPlainText(children: ReactNode): boolean {
+  const plain = (c: unknown) => typeof c === 'string' || typeof c === 'number';
+  return plain(children) || (Array.isArray(children) && children.every(plain));
 }
 
 /** Numbered step in an explanation ("1. Öffne …"). */

@@ -205,7 +205,15 @@ export function TileMap({ markers, height = 280, center, zoom, onPress, tileUrl 
           ])}
         </Svg>
       )}
-      {placed.map(({ m, left, top, color }) => (
+      {placed.map(({ m, left, top, color, cell }) =>
+        // A coarse (grid) location is an area, not a point: no dot in its middle, only its label.
+        cell > 0 ? (
+          <View key={m.id} pointerEvents="none" style={[styles.areaLabel, { left: left - 100, top: top - 11 }]}>
+            <Text numberOfLines={1} style={[styles.label, { marginLeft: 0, color: t.text, backgroundColor: t.surface, borderColor: color, borderWidth: 1 }]}>
+              {m.label}
+            </Text>
+          </View>
+        ) : (
         <View key={m.id} pointerEvents="none" style={[styles.marker, { left: left - 9, top: top - 9 }]}>
           <View style={styles.dotBox}>
             {m.kind === 'sos' && (
@@ -215,7 +223,8 @@ export function TileMap({ markers, height = 280, center, zoom, onPress, tileUrl 
           </View>
           <Text numberOfLines={1} style={[styles.label, { color: t.text, backgroundColor: t.surface }]}>{m.label}</Text>
         </View>
-      ))}
+        ),
+      )}
       <View
         ref={surface}
         style={[StyleSheet.absoluteFill, WEB_SURFACE]}
@@ -277,6 +286,7 @@ const styles = StyleSheet.create({
   tile: { position: 'absolute', width: 256, height: 256 }, // no border: it would shift the image
   tileImage: { width: 256, height: 256 },
   marker: { position: 'absolute', width: 200, flexDirection: 'row', alignItems: 'center' },
+  areaLabel: { position: 'absolute', width: 200, alignItems: 'center' },
   dotBox: { width: 18, height: 18, alignItems: 'center', justifyContent: 'center' },
   dot: { width: 14, height: 14, borderRadius: 7, borderWidth: 2 },
   me: { width: 18, height: 18, borderRadius: 9, borderWidth: 3 },

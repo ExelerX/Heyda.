@@ -52,6 +52,12 @@ export function startDemoFriends(network: MemoryNetwork, me: SocialNode): () => 
     max.setGrants([{ contactKey: meKey, placeIds: ['store'] }]);
     oma.setPlaces([{ id: 'oma-home', name: 'Zuhause', center: OMA, radiusM: 80 }]);
 
+    // Lisa answers an SOS, so the demo shows what happens after sending one.
+    lisa.on((e) => {
+      if (e.type === 'alert' && e.alert.ref?.sosOwner === meKey && e.alert.category === 'sos') {
+        later(4000, () => lisa.ackSos(meKey, 'Bin unterwegs, rufe dich gleich an!'));
+      }
+    });
     later(800, () => max.setMyStatus({ text: 'Beim Sport', emoji: '🏋️', hours: 2 }));
     later(1500, () => max.onPlaceTransition('store', 'arrive'));
     later(2500, () => lisa.sendChat(meKey, 'Bin gleich unterwegs zu dir 🚗'));

@@ -12,7 +12,7 @@ import { spacing, TOUCH, useTheme } from '../lib/theme';
 type Flow = { step: 'idle' } | { step: 'scan'; error?: string } | { step: 'compare'; code: string; digits: string } | { step: 'sending'; code: string; digits: string } | { step: 'sent'; known: number } | { step: 'failed'; error: string };
 
 function deviceIcon(name: string): string {
-  return /pc|windows|computer|laptop|mac/i.test(name) ? '💻' : '📱';
+  return /pc|windows|computer|laptop|mac|browser/i.test(name) ? '💻' : '📱';
 }
 
 function dateText(at: number): string {
