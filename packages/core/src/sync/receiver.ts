@@ -200,5 +200,7 @@ export function createLinkedState(
     ...merged,
     self: { ...merged.self, name: payload.doc.profileName || merged.self.name },
     devices: [...others, { deviceId: payload.deviceId, name: payload.deviceName, linkedAt: now }],
+    // My other device already handled what relays still hold from before: no alarms for it here.
+    historyBefore: now,
   };
 }

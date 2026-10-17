@@ -28,6 +28,7 @@ export default function Backup() {
             <Bullet icon="⚡">Automationen und Plugins</Bullet>
             <Bullet icon="⚙️">Einstellungen, Ruhezeiten und dein Notruf-Text</Bullet>
             <Bullet icon="💬">Die letzten 100 Nachrichten pro Chat (ältere nicht)</Bullet>
+            <Bullet icon="⏸️">Nicht drin: Live-Standort und Notruf, die gerade laufen. Sie starten nach dem Wiederherstellen nicht von selbst.</Bullet>
             <Bullet icon="🔒">
               Ohne dein Passwort kann niemand die Datei öffnen, auch wir nicht. Vergisst du es, ist die Sicherung verloren. Schreib es dir auf.
             </Bullet>

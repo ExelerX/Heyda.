@@ -104,6 +104,8 @@ export interface OutboxEntry {
   attempts: number;
   /** Earliest time for the next try. */
   nextAt?: number;
+  /** Where to send it instead of the recipient's known relays (they may be gone from my contacts by then). */
+  relays?: string[];
 }
 
 export interface NodeState {
@@ -135,6 +137,12 @@ export interface NodeState {
   removedContacts: { key: ContactKey; at: number }[];
   /** Groups I left, so a late roster update does not add me back. */
   leftGroups: { id: string; at: number }[];
+  /**
+   * When this device got the account (linked or restored from a backup). Relays still hold the
+   * days before: those messages fill in chats and statuses but ring and trigger nothing, since my
+   * other device (or the old phone) already handled them. Absent on a device that created the account.
+   */
+  historyBefore?: number;
 }
 
 export type SyncField = 'profile' | 'places' | 'grants' | 'rules' | 'prefs' | 'sosMessage' | 'status';
@@ -183,6 +191,8 @@ export interface ContactStatus {
     /** The sender's clock of the newest message of this alert, and of the newest start (sent again when pressed again). */
     lastSentAt?: number;
     startSentAt?: number;
+    /** Sent before this device got the account: rings at this time if no end came by then. */
+    ringAt?: number;
   };
   /**
    * `quiet`: this contact used up its hourly budget of loud alarms, so it rings as a normal notification.
@@ -288,6 +298,7 @@ export function normalizeState(s: Partial<NodeState> & Pick<NodeState, 'self'>):
     syncRev: s.syncRev ?? {},
     removedContacts: arr(s.removedContacts),
     leftGroups: arr(s.leftGroups),
+    ...(typeof s.historyBefore === 'number' && Number.isFinite(s.historyBefore) ? { historyBefore: s.historyBefore } : {}),
   };
 }
 

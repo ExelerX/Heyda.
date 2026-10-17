@@ -146,10 +146,21 @@ const PRIORITY_TYPES = new Set(['sos.start', 'sos.update', 'sos.end', 'sos.ack',
 /** Failed sends to this many different people in a row, with no success in between, mean I am offline. */
 const OFFLINE_AFTER_FAILURES = 3;
 
+/** Messages sent this long before this device got the account still count as new: senders' clocks differ a little. */
+const HISTORY_MARGIN_MS = 5 * 60_000;
+/** An open SOS sent before this device got the account rings this long after it came, unless its end follows. */
+const HISTORY_SOS_WAIT_MS = 2 * 60_000;
+/** How long a contact's SOS that was never ended is kept. */
+const SOS_KEEP_MS = 3 * DAY;
+
 /** Message types whose newer copy replaces an older one still waiting in the outbox. */
 const REPLACEABLE = new Set(['presence', 'session.update', 'live.update', 'sos.update']);
 /** Queued messages that tell where I am or was. Ghost mode and ending a share drop them. */
 const LOCATION_TYPES = new Set(['session.update', 'live.update', 'place.event']);
+/** Every message that may carry where I am. Never sent to someone who stopped being a contact after it was queued. */
+const CARRIES_LOCATION = new Set([...LOCATION_TYPES, 'where.reply', 'sos.start', 'sos.update']);
+/** Ends of what someone sees from me. Still sent after I removed them, so nothing stays open on their phone. */
+const END_TYPES = new Set(['live.end', 'session.end', 'watch.end', 'sos.end']);
 
 /** A map link for a location, for phones without the app. */
 export function osmLink(p: LatLon): string {
@@ -220,6 +231,12 @@ export class SocialNode {
   private running = false;
   private redeliverQueued = false;
   private pendingLink: PendingLink | undefined;
+  /**
+   * Set while the synchronous part of handling a message sent before this device got the account
+   * runs (see `NodeState.historyBefore`): `alert` and `runAutomations` then do nothing. Handlers
+   * must raise alerts and start automations before their first `await` (they all do).
+   */
+  private replaying = false;
 
   constructor(private readonly options: SocialNodeOptions) {
     this.state = JSON.parse(JSON.stringify(options.initialState)) as NodeState;
@@ -479,11 +496,7 @@ export class SocialNode {
   async removeContact(key: ContactKey): Promise<void> {
     const c = this.contact(key);
     if (!c) return;
-    if (this.state.liveShares.some((s) => s.contactKey === key)) await this.stopLive(key);
-    for (const w of this.statuses.get(key)?.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
-    this.statuses.delete(key);
-    this.loudWatchRings.delete(key);
-    this.dropQueued((e) => e.to === key && (LOCATION_TYPES.has(e.message.type) || e.message.type === 'where.reply'));
+    const ends = this.endEverythingWith(key);
     const grants = this.state.grants.filter((g) => g.contactKey !== key);
     this.update(
       {
@@ -491,12 +504,78 @@ export class SocialNode {
         // Later than the contact's last change even if another device's clock runs ahead, or the removal would lose.
         removedContacts: [...this.state.removedContacts.filter((t) => t.key !== key), { key, at: Math.max(this.now(), stampOf(c) + 1) }].slice(-1000),
         grants,
-        whereInbox: this.state.whereInbox.filter((w) => w.from !== key),
       },
       // Synced, so another device does not keep the grant and hand it back if they are added again.
       grants.length !== this.state.grants.length ? ['grants'] : [],
     );
     this.markSync();
+    await ends;
+  }
+
+  /**
+   * Someone stops being a contact, removed here or on another of my devices: what this device
+   * still runs with them ends for them too. My live share, trip, watches and SOS get their end, so
+   * their phone stops showing them and no watch alarm rings there later; nothing else still queued
+   * for them goes out (group messages aside, they belong to the group), and their questions and
+   * statuses are dropped. Their relays are taken now, while they are still known. Everything
+   * here changes at once; the returned promise settles when the ends went out or were queued.
+   */
+  private endEverythingWith(key: ContactKey): Promise<void> {
+    const relays = this.relaysFor(key);
+    const ends: { body: AppMessageBody; ttl: number }[] = [];
+    this.dropQueued((e) => e.to === key && !END_TYPES.has(e.message.type) && !e.message.type.startsWith('group.'));
+
+    const shares = this.state.liveShares.filter((s) => s.contactKey === key);
+    for (const s of shares) ends.push({ body: { type: 'live.end', shareId: s.shareId, reason: 'stopped' }, ttl: TTL.live });
+
+    const watches: NodeState['watches'] = [];
+    for (const w of this.state.watches) {
+      if (!w.recipients.includes(key)) {
+        watches.push(w);
+        continue;
+      }
+      ends.push({ body: { type: 'watch.end', watchId: w.watchId, reason: 'cancelled' }, ttl: TTL.chat });
+      const recipients = w.recipients.filter((k) => k !== key);
+      if (recipients.length) watches.push({ ...w, recipients });
+      else {
+        this.emit({ type: 'alarm.cancel', id: `mywatch:${w.watchId}:remind` });
+        this.emit({ type: 'alarm.cancel', id: `mywatch:${w.watchId}:due` });
+      }
+    }
+
+    let sos = this.state.sos;
+    if (sos?.recipients.includes(key)) {
+      // The protocol knows no "removed": "cancelled" is the end that claims the least.
+      ends.push({ body: { type: 'sos.end', sosId: sos.sosId, reason: 'cancelled' }, ttl: TTL.sos });
+      const recipients = sos.recipients.filter((k) => k !== key);
+      sos = recipients.length ? { ...sos, recipients, acks: sos.acks.filter((a) => a.key !== key) } : undefined;
+    }
+
+    this.update({
+      liveShares: this.state.liveShares.filter((s) => s.contactKey !== key),
+      watches,
+      sos,
+      whereInbox: this.state.whereInbox.filter((w) => w.from !== key),
+      whereAsked: this.state.whereAsked.filter((w) => w.from !== key),
+    });
+
+    const trip = this.trip && !this.trip.isEnded && this.trip.session.recipients.includes(key) ? this.trip : undefined;
+    if (trip) {
+      ends.push({ body: { type: 'session.end', sessionId: trip.session.id, reason: 'stopped' }, ttl: TTL.trip });
+      trip.dropRecipient(key);
+      if (trip.session.recipients.length) this.emit({ type: 'trip', session: trip.session });
+      else {
+        // Nobody is left to get it, and it would keep the GPS running for nothing.
+        trip.stopMessage();
+        this.afterTripEnded();
+      }
+    }
+
+    for (const w of this.statuses.get(key)?.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
+    this.statuses.delete(key);
+    this.loudWatchRings.delete(key);
+    this.emitLocationNeeds();
+    return Promise.all(ends.map(({ body, ttl }) => this.deliver(key, composeMessage(body, this.now()), ttl, relays))).then(() => {});
   }
 
   // ---- trips ---------------------------------------------------------------------------------
@@ -525,6 +604,7 @@ export class SocialNode {
 
   async stopTrip(): Promise<void> {
     if (!this.trip || this.trip.isEnded) return;
+    this.dropQueuedTripUpdates(this.trip.session.id);
     await this.broadcastTrip(this.trip.stopMessage());
     this.afterTripEnded();
   }
@@ -539,6 +619,7 @@ export class SocialNode {
     if (this.state.ghost || this.activeTrip) return false;
     const now = this.now();
     const recipients = session.recipients.filter((k) => this.contact(k));
+    if (!recipients.length || !isSessionActive(session, now)) this.dropQueuedTripUpdates(session.id);
     if (!recipients.length) return false;
     const trip = new TripSharer({ ...session, recipients }, this.options.tripOptions);
     if (!isSessionActive(session, now)) {
@@ -1244,6 +1325,7 @@ export class SocialNode {
     if (watches.length !== this.state.watches.length) this.update({ watches });
     this.checkOverdueWatches(now);
     this.pruneStatuses(now);
+    this.ringHeldSos(now);
     this.pruneLists(now);
     if (this.pendingLink && this.pendingLink.expiresAt <= now) this.clearLink();
     this.emitLocationNeeds();
@@ -1273,6 +1355,8 @@ export class SocialNode {
         // (and never more than it was given, also after the clock was set back).
         const ttlSeconds = Math.min(e.ttlSeconds, Math.ceil((e.firstAt + e.ttlSeconds * 1000 - now) / 1000));
         if (ttlSeconds <= 0) continue;
+        // They stopped being a contact after it was queued: where I am never goes to them.
+        if (CARRIES_LOCATION.has(e.message.type) && !this.contact(e.to)) continue;
         // A retry further ahead than the longest wait means the clock was set back: it is due now.
         const waiting = e.nextAt !== undefined && e.nextAt > now && e.nextAt - now <= maxWaitMs;
         if (failuresInARow >= OFFLINE_AFTER_FAILURES || failed.has(e.to) || (!force && waiting)) {
@@ -1280,7 +1364,7 @@ export class SocialNode {
           continue;
         }
         try {
-          await this.transport.send(e.to, e.message, { ttlSeconds });
+          await this.transport.send(e.to, e.message, { ttlSeconds, ...(e.relays?.length ? { relays: e.relays } : {}) });
           failuresInARow = 0;
           this.unreachable.delete(e.to);
         } catch {
@@ -1342,6 +1426,29 @@ export class SocialNode {
       this.onLinkReveal(from, message);
       return;
     }
+    const at = this.now();
+    // From before this device got the account: it fills in chats and statuses, but rings nothing.
+    this.replaying = this.isHistory(message.sentAt, at);
+    let handled: Promise<void> | void;
+    try {
+      handled = this.dispatch(from, message, at);
+    } finally {
+      this.replaying = false;
+    }
+    await handled;
+  }
+
+  /**
+   * Whether a message was sent before this device got the account (see `NodeState.historyBefore`).
+   * Never while my clock reads earlier than that moment: it was set back since, and every message
+   * would look old.
+   */
+  private isHistory(sentAt: number, at: number): boolean {
+    const before = this.state.historyBefore;
+    return before !== undefined && before <= at + CLOCK_TOLERANCE_MS && senderTime(sentAt, at) < before - HISTORY_MARGIN_MS;
+  }
+
+  private dispatch(from: ContactKey, message: AppMessage, at: number): Promise<void> | void {
     if (from === this.state.self.key) {
       this.handleOwn(message);
       return;
@@ -1351,7 +1458,6 @@ export class SocialNode {
       return;
     }
 
-    const at = this.now();
     switch (message.type) {
       case 'presence':
         return this.onPresence(from, message, at);
@@ -1384,19 +1490,17 @@ export class SocialNode {
       case 'where.reply':
         return this.onWhereReply(from, message, at);
       case 'chat.text': {
-        const urgent = message.urgent === true && this.urgentLimiter.allow(from, at);
+        const urgent = this.isUrgent(from, message.urgent, at);
         this.emit({ type: 'chat', thread: from, entry: { id: message.id, from, text: message.text, at, kind: 'text', urgent: urgent || undefined } });
         this.alert({ category: 'chat', title: this.name(from), body: message.text, from, thread: from, urgent });
-        await this.runAutomations({ type: 'contact.message', contact: from, text: message.text, at });
-        return;
+        return this.runAutomations({ type: 'contact.message', contact: from, text: message.text, at });
       }
       case 'ping': {
-        const urgent = message.urgent === true && this.urgentLimiter.allow(from, at);
+        const urgent = this.isUrgent(from, message.urgent, at);
         const text = pingText(message.kind, message.text);
         this.emit({ type: 'chat', thread: from, entry: { id: message.id, from, text, at, kind: 'ping', urgent: urgent || undefined } });
         this.alert({ category: 'ping', title: this.name(from), body: text, from, thread: from, urgent });
-        await this.runAutomations({ type: 'contact.ping', contact: from, kind: message.kind, text: message.text, at });
-        return;
+        return this.runAutomations({ type: 'contact.ping', contact: from, kind: message.kind, text: message.text, at });
       }
       case 'group.update':
         return this.onGroupUpdate(from, message);
@@ -1409,6 +1513,11 @@ export class SocialNode {
         // new device's one-time key, never to an account.
         return;
     }
+  }
+
+  /** "Urgent" breaks through quiet mode, a few times an hour per sender; old messages use none of that. */
+  private isUrgent(from: ContactKey, urgent: boolean | undefined, at: number): boolean {
+    return urgent === true && !this.replaying && this.urgentLimiter.allow(from, at);
   }
 
   private handleHello(from: ContactKey, message: MessageOf<'hello'>): void {
@@ -1475,19 +1584,13 @@ export class SocialNode {
     const patch = mergeSyncDoc(this.state, doc, now);
     if (patch.places) this.geofence.setPlaces(patch.places);
     if (patch.contacts) {
+      // Removed on another device: what this device runs with them ends here too, before they go.
       const kept = new Set(patch.contacts.map((c) => c.key));
-      for (const [key, status] of [...this.statuses]) {
-        if (kept.has(key)) continue;
-        for (const w of status.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
-        this.statuses.delete(key);
-        this.loudWatchRings.delete(key);
-      }
-      // A live share with someone removed on another device would keep the GPS running for nobody.
-      const liveShares = this.state.liveShares.filter((l) => kept.has(l.contactKey));
-      if (liveShares.length !== this.state.liveShares.length) patch.liveShares = liveShares;
+      const known = [...this.state.contacts.map((c) => c.key), ...this.statuses.keys(), ...this.state.liveShares.map((l) => l.contactKey)];
+      const gone = new Set(known.filter((k) => !kept.has(k)));
+      for (const key of gone) void this.endEverythingWith(key);
     }
     if (Object.keys(patch).length) this.update(patch);
-    if (patch.liveShares) this.emitLocationNeeds();
     // Answer only if the other device would change something by taking my version. Comparing
     // the lists directly made two devices whose lists merely differed in order (or tied) send
     // each other their whole settings forever.
@@ -1799,13 +1902,20 @@ export class SocialNode {
       // when pressed again) must not bring back its text and helpers.
       if (prev && !same && isOlder(sentAt, prev.lastSentAt, at)) return;
       if (same && isOlder(sentAt, prev.startSentAt, at)) return;
+      // Sent before this device got the account (see `replaying`): relays hand over its end, if
+      // there is one, in any order. It rings a moment later, from `tick`, only if none came by then.
+      const history = this.replaying;
+      if (history && !same && at - sentAt > SOS_KEEP_MS) return;
       // Nor its location, if a newer one came with an update in between.
       const newest = !same || !isOlder(sentAt, prev.lastSentAt, at);
       const point = newest && m.point ? m.point : same ? prev.point : undefined;
+      // Pressed again since: it rings now, like any new SOS.
+      const ringAt = same ? (history ? prev.ringAt : undefined) : history ? at + HISTORY_SOS_WAIT_MS : undefined;
       this.setStatus(from, {
         sos: {
           sosId: m.sosId,
-          startedAt: same ? prev.startedAt : at,
+          // An old one keeps its own age, so it is dropped when an open SOS would have been.
+          startedAt: same ? prev.startedAt : history ? Math.min(sentAt, at) : at,
           text: m.text,
           point,
           pointAt: point && point === m.point ? at : same ? prev.pointAt : undefined,
@@ -1813,23 +1923,12 @@ export class SocialNode {
           acks: same ? prev.acks : [],
           lastSentAt: newest ? sentAt : prev.lastSentAt,
           startSentAt: sentAt,
+          ...(ringAt !== undefined ? { ringAt } : {}),
         },
       });
-      if (same) return;
-      // An SOS always rings. Only a flood of them from one person is turned down to a normal
-      // notification, which still nothing can switch off.
-      const alarm = this.sosAlarmLimiter.allow(from, at);
-      this.alert({
-        id: `sos:${from}:${m.sosId}`,
-        category: 'sos',
-        overBudget: !alarm,
-        title: `🆘 ${this.name(from)} braucht Hilfe!`,
-        body: m.text ?? (m.point ? 'Der Standort ist dabei. Tippe, um ihn zu sehen.' : 'Bitte melde dich sofort.'),
-        from,
-        thread: from,
-        ref: { sosId: m.sosId, sosOwner: from },
-      });
-      await this.runAutomations({ type: 'contact.sos', contact: from, at });
+      if (history || (same && prev.ringAt === undefined)) return;
+      this.sosAlarm(from, m.sosId, m.text, m.point !== undefined, at);
+      if (!same) await this.runAutomations({ type: 'contact.sos', contact: from, at });
       return;
     }
     if (m.type === 'sos.update') {
@@ -1853,7 +1952,10 @@ export class SocialNode {
     }
     this.ended.add(`sos|${from}|${m.sosId}`);
     if (!same || prev.endedAt) return;
-    this.setStatus(from, { sos: { ...prev, endedAt: at, endReason: m.reason } });
+    const { ringAt, ...ended } = prev;
+    this.setStatus(from, { sos: { ...ended, endedAt: at, endReason: m.reason } });
+    // Its alarm never rang here (it came from before this device got the account): nothing to call off.
+    if (ringAt !== undefined) return;
     this.alert({
       category: 'sos',
       followUp: true,
@@ -1863,6 +1965,32 @@ export class SocialNode {
       thread: from,
       ref: { sosId: m.sosId, sosOwner: from },
     });
+  }
+
+  /** An SOS always rings. Only a flood of them from one person is turned down to a normal notification, which still nothing can switch off. */
+  private sosAlarm(from: ContactKey, sosId: string, text: string | undefined, withPoint: boolean, at: number): void {
+    const alarm = this.sosAlarmLimiter.allow(from, at);
+    this.alert({
+      id: `sos:${from}:${sosId}`,
+      category: 'sos',
+      overBudget: !alarm,
+      title: `🆘 ${this.name(from)} braucht Hilfe!`,
+      body: text ?? (withPoint ? 'Der Standort ist dabei. Tippe, um ihn zu sehen.' : 'Bitte melde dich sofort.'),
+      from,
+      thread: from,
+      ref: { sosId, sosOwner: from },
+    });
+  }
+
+  /** Rings an SOS sent before this device got the account once its wait is over and no end came. */
+  private ringHeldSos(now: number): void {
+    for (const [key, status] of [...this.statuses]) {
+      const sos = status.sos;
+      if (sos?.ringAt === undefined || now < sos.ringAt || sos.endedAt !== undefined) continue;
+      const { ringAt: _rung, ...rest } = sos;
+      this.setStatus(key, { sos: rest });
+      this.sosAlarm(key, sos.sosId, sos.text, sos.point !== undefined, now);
+    }
   }
 
   private onSosAck(from: ContactKey, m: MessageOf<'sos.ack'>, at: number): void {
@@ -1896,11 +2024,14 @@ export class SocialNode {
   }
 
   private onWhereRequest(from: ContactKey, m: MessageOf<'where.request'>, at: number): void {
+    const chat: NodeEvent = { type: 'chat', thread: from, entry: { id: m.id, from, text: '📍 Wo bist du?', at, kind: 'ping' } };
+    // Asked before this device got the account: answered (or not) on my other device back then.
+    if (this.replaying) return this.emit(chat);
     if (!this.whereLimiter.allow(from, at)) return;
     this.update({
       whereInbox: [...this.state.whereInbox.filter((w) => w.from !== from && at - w.at < DAY), { from, requestId: m.requestId, at }].slice(-50),
     });
-    this.emit({ type: 'chat', thread: from, entry: { id: m.id, from, text: '📍 Wo bist du?', at, kind: 'ping' } });
+    this.emit(chat);
     this.alert({
       category: 'where',
       title: `${this.name(from)} fragt: Wo bist du?`,
@@ -1974,7 +2105,7 @@ export class SocialNode {
   private onGroupText(from: ContactKey, m: MessageOf<'group.text'>, at: number): void {
     const g = this.group(m.groupId);
     if (!g || g.dissolved || !this.isMember(m.groupId, from)) return;
-    const urgent = m.urgent === true && this.urgentLimiter.allow(from, at);
+    const urgent = this.isUrgent(from, m.urgent, at);
     const thread = `g:${m.groupId}`;
     this.emit({ type: 'chat', thread, entry: { id: m.id, from, text: m.text, at, kind: 'text', urgent: urgent || undefined } });
     this.alert({ category: 'group', title: `${this.name(from)} in ${g.name}`, body: m.text, from, thread, urgent, ref: { groupId: g.id } });
@@ -1993,6 +2124,8 @@ export class SocialNode {
   // ---- automations -----------------------------------------------------------------------------
 
   private async runAutomations(event: AutomationEvent): Promise<void> {
+    // Something from before this device got the account: my other device acted on it back then.
+    if (this.replaying) return;
     // Limits by my clock: a place event carries the time of its fix, which may come late.
     for (const intent of this.engine.handle(event, this.now())) {
       // In ghost mode, rules that depend on where I am may only act on this device.
@@ -2050,8 +2183,14 @@ export class SocialNode {
     await this.sendMany(to, body, TTL.trip);
   }
 
+  /** Where I was during a trip that ended never goes out after its end (e.g. once the phone is back online). */
+  private dropQueuedTripUpdates(sessionId: string): void {
+    this.dropQueued((e) => e.message.type === 'session.update' && e.message.sessionId === sessionId);
+  }
+
   private afterTripEnded(): void {
     const trip = this.trip;
+    if (trip) this.dropQueuedTripUpdates(trip.session.id);
     this.emit({ type: 'trip', session: undefined });
     this.emitLocationNeeds();
     if (trip?.endReason === 'arrived') {
@@ -2105,15 +2244,17 @@ export class SocialNode {
     await this.deliver(this.state.self.key, composeMessage(body, this.now()), ttlSeconds);
   }
 
-  private async deliver(to: ContactKey, message: AppMessage, ttlSeconds: number): Promise<void> {
+  /** `relays`: where to send it instead of the recipient's known relays, also when it is retried later. */
+  private async deliver(to: ContactKey, message: AppMessage, ttlSeconds: number, relays?: string[]): Promise<void> {
+    const via = relays?.length ? relays : undefined;
     try {
-      await this.transport.send(to, message, { ttlSeconds });
+      await this.transport.send(to, message, { ttlSeconds, ...(via ? { relays: via } : {}) });
       this.unreachable.delete(to);
     } catch {
       // Not offline but unsendable (e.g. a relay address the wire rejects): retrying cannot help.
       if (!isSendable(message)) return;
       const now = this.now();
-      this.enqueue({ to, message, ttlSeconds, firstAt: now, attempts: 1, nextAt: now + 15_000 });
+      this.enqueue({ to, message, ttlSeconds, firstAt: now, attempts: 1, nextAt: now + 15_000, ...(via ? { relays: via } : {}) });
     }
   }
 
@@ -2151,6 +2292,9 @@ export class SocialNode {
   private alert(
     input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean; followUp?: boolean; overBudget?: boolean },
   ): void {
+    // From before this device got the account: my other device showed it back then. Its time
+    // here would be wrong too, so it does not even go into the activity list.
+    if (this.replaying) return;
     const now = this.now();
     const { urgent, id, followUp, overBudget, ...rest } = input;
     const c = input.from ? this.contact(input.from) : undefined;
@@ -2236,7 +2380,7 @@ export class SocialNode {
         if (p.dnd?.until !== undefined && now >= p.dnd.until) delete p.dnd;
         if (JSON.stringify(p) !== JSON.stringify(s.presence)) patch.presence = p;
       }
-      if (s.sos && ((s.sos.endedAt !== undefined && now - s.sos.endedAt > DAY) || now - s.sos.startedAt > 3 * DAY)) patch.sos = undefined;
+      if (s.sos && ((s.sos.endedAt !== undefined && now - s.sos.endedAt > DAY) || now - s.sos.startedAt > SOS_KEEP_MS)) patch.sos = undefined;
       if (s.watches?.some((w) => now > watchRingTime(w) + WATCH_KEEP_MS)) {
         patch.watches = s.watches.filter((w) => now <= watchRingTime(w) + WATCH_KEEP_MS);
       }

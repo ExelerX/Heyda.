@@ -1,5 +1,8 @@
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { scryptAsync } from '@noble/hashes/scrypt.js';
+import { TTL } from '../node';
+import { composeMessage } from '../protocol/compose';
+import { normalizeState, type NodeState, type OutboxEntry } from '../state';
 
 /**
  * Password-protected backup file, e.g. for moving to a new phone.
@@ -102,4 +105,38 @@ export async function decryptBackup(
   } catch {
     return { ok: false, error: 'Die Sicherung ist beschädigt.' };
   }
+}
+
+/**
+ * The state a backup file keeps: the account and settings, without what only made sense on this
+ * device at that moment (messages waiting to go out, open questions and invites, running live
+ * shares and SOS). Restored weeks later, a live share would start sending my location again to
+ * someone I stopped sharing with, and an old SOS would look like it is still running.
+ */
+export function backupState(s: NodeState): NodeState {
+  return { ...s, outbox: [], whereInbox: [], whereAsked: [], openInvites: [], liveShares: [], sos: undefined };
+}
+
+/**
+ * The state of a device restored from a backup at `now`, also for files made by older versions,
+ * which still hold running live shares and SOS: those shares end for their contacts on the first
+ * start (a `live.end` waits in the outbox) instead of sending location again, and the SOS is
+ * dropped, since pressing SOS again would reuse its id, which contacts take as over already. My
+ * watches stay: they end on their own after their time, and until then "Alles okay" can still end
+ * one my contacts would otherwise be alarmed about. Older messages still on relays count as
+ * history (see `NodeState.historyBefore`).
+ */
+export function restoredState(s: Partial<NodeState> & Pick<NodeState, 'self'>, now: number): NodeState {
+  const state = normalizeState(s);
+  const contacts = new Set(state.contacts.map((c) => c.key));
+  const outbox: OutboxEntry[] = state.liveShares
+    .filter((l) => contacts.has(l.contactKey))
+    .map((l) => ({
+      to: l.contactKey,
+      message: composeMessage({ type: 'live.end', shareId: l.shareId, reason: 'stopped' }, now),
+      ttlSeconds: TTL.live,
+      firstAt: now,
+      attempts: 0,
+    }));
+  return { ...backupState(state), outbox, historyBefore: now };
 }

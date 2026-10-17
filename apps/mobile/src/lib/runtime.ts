@@ -1,5 +1,6 @@
 import {
   BUILTIN_TEMPLATES,
+  backupState,
   MemoryNetwork,
   SocialNode,
   createInitialState,
@@ -8,6 +9,7 @@ import {
   importPlugin,
   normalizeState,
   randomId,
+  restoredState,
   safetyNumber,
   type Alarm,
   type BackupContents,
@@ -487,6 +489,9 @@ export class AppRuntime {
     this.data.chats = chats;
     this.data.unread = unread;
     this.data.statuses = statuses;
+    // Their messages, places and answers live on in the activity list too: the chat is meant to be gone.
+    this.data.activity = this.data.activity.filter((a) => a.from !== key && a.thread !== key && a.ref?.sosOwner !== key);
+    this.changed();
     await this.node.removeContact(key);
   }
 
@@ -535,7 +540,8 @@ export class AppRuntime {
   async exportBackup(password: string, onProgress?: (f: number) => void): Promise<Uint8Array> {
     if (this.isDemo) throw new Error('Im Demo-Modus gibt es nichts zu sichern.');
     const chats = Object.fromEntries(Object.entries(this.data.chats).map(([k, v]) => [k, v.slice(-100)]));
-    const state = { ...this.data.state, outbox: [], whereInbox: [], whereAsked: [], openInvites: [] };
+    // Without running live shares and SOS: restored weeks later, they would start again by themselves.
+    const state = backupState(this.data.state);
     return encryptBackup(
       {
         format: 'heyda.backup',
@@ -704,10 +710,9 @@ export async function restoreBackupContents(contents: BackupContents): Promise<{
   if (!data?.state?.self || !/^[0-9a-f]{64}$/.test(contents.identity)) return { ok: false, error: 'Die Sicherung enthält keine App-Daten.' };
   const secret = hexToBytes(contents.identity);
   const key = getPublicKey(secret);
-  const state = normalizeState({
-    ...data.state,
-    self: { ...data.state.self, key, deviceId: newDeviceId(), deviceName: deviceLabel() },
-  });
+  // Live shares and SOS from older backup files end instead of starting again; messages still on
+  // relays from before now fill in chats and statuses without ringing (see core `restoredState`).
+  const state = restoredState({ ...data.state, self: { ...data.state.self, key, deviceId: newDeviceId(), deviceName: deviceLabel() } }, Date.now());
   await writeAccount(secret, state, {
     plugins: Array.isArray(data.plugins) ? data.plugins : [],
     settings: { ...DEFAULT_SETTINGS, ...data.settings, onboarded: true, demo: false },

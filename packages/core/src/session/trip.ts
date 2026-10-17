@@ -5,6 +5,7 @@ import { EtaEstimator, type TravelMode } from '../eta/estimator';
 import { CoarseLocator, DEFAULT_CELL_M } from '../privacy/coarse-grid';
 import { bucketEtaMinutes } from '../privacy/eta-rounding';
 import type { AppMessageBody } from '../protocol/messages';
+import type { ContactKey } from '../transport/transport';
 import { isSessionActive, type SharingSession } from './session';
 
 export interface TripOptions {
@@ -30,11 +31,10 @@ export class TripSharer {
   private lastPointAt = -Infinity;
   private ended = false;
   private reason: 'arrived' | 'stopped' | 'expired' | undefined;
+  private current: SharingSession;
 
-  constructor(
-    readonly session: SharingSession,
-    options: TripOptions = {},
-  ) {
+  constructor(session: SharingSession, options: TripOptions = {}) {
+    this.current = session;
     this.estimator = session.destination
       ? new EtaEstimator(session.destination, { mode: options.mode })
       : undefined;
@@ -44,6 +44,15 @@ export class TripSharer {
         : undefined;
     this.arrivalRadiusM = options.arrivalRadiusM ?? 75;
     this.preciseIntervalMs = options.preciseIntervalMs ?? 30_000;
+  }
+
+  get session(): SharingSession {
+    return this.current;
+  }
+
+  /** Someone no longer gets this trip, e.g. because they stopped being a contact. */
+  dropRecipient(key: ContactKey): void {
+    this.current = { ...this.current, recipients: this.current.recipients.filter((k) => k !== key) };
   }
 
   get isEnded(): boolean {
