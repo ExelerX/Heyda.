@@ -18,6 +18,7 @@ import {
   parseBoolean,
   parseExternalUrl,
   parseNotification,
+  parseRequestId,
   parseSecretName,
   parseSecretValue,
   parseSuggestedFileName,
@@ -244,6 +245,14 @@ describe('IPC argument validation', () => {
     }
     expect(parseBoolean(true)).toBe(true);
     expect(() => parseBoolean('true')).toThrow(InvalidArgumentError);
+  });
+
+  it('validates save request ids', () => {
+    expect(parseRequestId(1)).toBe(1);
+    expect(parseRequestId(Number.MAX_SAFE_INTEGER)).toBe(Number.MAX_SAFE_INTEGER);
+    for (const bad of [0, -1, 1.5, Number.NaN, Infinity, '1', null, undefined, Number.MAX_SAFE_INTEGER + 2]) {
+      expect(() => parseRequestId(bad), String(bad)).toThrow(InvalidArgumentError);
+    }
   });
 });
 

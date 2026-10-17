@@ -28,6 +28,13 @@ export interface HeydaDesktopBridge {
   attention(): Promise<void>;
   setBadge(count: number): Promise<void>;
 
+  /**
+   * The shell asks the UI to save now: when the window goes to the tray, before quitting and when
+   * Windows ends the session (the page never counts as hidden, so it cannot tell by itself).
+   * Quitting waits for what `cb` returns, a few seconds at most.
+   */
+  onSaveRequest(cb: () => Promise<void> | void): () => void;
+
   getAutostart(): Promise<boolean>;
   setAutostart(on: boolean): Promise<void>;
 
@@ -37,7 +44,7 @@ export interface HeydaDesktopBridge {
   openExternal(url: string): Promise<void>;
 }
 
-export type InvokeMethod = Exclude<keyof HeydaDesktopBridge, 'version' | 'platform' | 'onNotificationClick'>;
+export type InvokeMethod = Exclude<keyof HeydaDesktopBridge, 'version' | 'platform' | 'onNotificationClick' | 'onSaveRequest'>;
 
 export const INVOKE_CHANNELS = {
   vaultRead: 'heyda:vault-read',
@@ -60,6 +67,12 @@ export type InvokeChannel = (typeof INVOKE_CHANNELS)[InvokeMethod];
 
 /** Main → renderer: the user clicked the notification with this id. */
 export const NOTIFICATION_CLICK_CHANNEL = 'heyda:notification-click';
+
+/** Main → renderer: save now (see `onSaveRequest`); carries a request id to answer with. */
+export const SAVE_REQUEST_CHANNEL = 'heyda:save-request';
+
+/** Renderer → main (invoke, from the preload only): the save asked for with this id is over. */
+export const SAVE_DONE_CHANNEL = 'heyda:save-done';
 
 /** Main passes the app version to the preload through `additionalArguments`. */
 export const VERSION_ARG_PREFIX = '--heyda-version=';

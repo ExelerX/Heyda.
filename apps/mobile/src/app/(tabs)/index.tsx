@@ -1,10 +1,11 @@
 import { checkinText, contactLabel, type Contact, type ContactStatus } from '@heyda/core';
 import { router, type Href } from 'expo-router';
-import { Pressable, Text, View } from 'react-native';
+import { useState } from 'react';
+import { Linking, Platform, Pressable, Text, View } from 'react-native';
 import { ActivityRow } from '../../components/social/ActivityRow';
 import { joinNames, sortContacts } from '../../components/social/contacts';
 import { arrivalAt, levelWords, placeEventText, quietText, statusText, watchText } from '../../components/social/describe';
-import { ago, errorText, etaWords, hhmm, inTime, remaining } from '../../components/social/format';
+import { ago, durationWords, errorText, etaWords, hhmm, inTime, remaining } from '../../components/social/format';
 import { Banner, ListCard, ListRow, Narrow } from '../../components/social/kit';
 import { ThreadAvatar } from '../../components/social/ThreadAvatar';
 import { SosButton } from '../../components/SosButton';
@@ -155,6 +156,8 @@ export default function Start() {
             onPress={() => router.push(contactHref(contact.key))}
           />
         ))}
+
+        {snap.clockAheadMs !== undefined ? <ClockBanner aheadMs={snap.clockAheadMs} /> : null}
 
         <ListCard>
           <ListRow first onPress={() => router.push('/status')} label={`Mein Status: ${myStatus ?? 'keiner'}. Ändern`}>
@@ -342,6 +345,72 @@ export default function Start() {
         ) : null}
       </Narrow>
     </Screen>
+  );
+}
+
+/** Hidden with ✕ until the app starts again; it comes back then if the clock is still off. */
+let clockBannerHidden = false;
+
+/** "12 Min.", "3 Std.", "2 Tage" */
+function clockOffWords(ms: number): string {
+  const abs = Math.abs(ms);
+  if (abs >= 48 * 3600_000) return `${Math.round(abs / (24 * 3600_000))} Tage`;
+  return durationWords(abs >= 3 * 3600_000 ? Math.round(abs / 3600_000) * 3600_000 : abs);
+}
+
+/** My clock is off (from GPS times, see `SocialNode.clockAheadMs`): what others send me and I send them may get lost. */
+function ClockBanner({ aheadMs }: { aheadMs: number }) {
+  const t = useTheme();
+  const [hidden, setHidden] = useState(clockBannerHidden);
+  if (hidden) return null;
+  const title = 'Deine Uhrzeit stimmt nicht';
+  const text = `Deine Uhr geht etwa ${clockOffWords(aheadMs)} ${aheadMs > 0 ? 'vor' : 'nach'}. Stell sie auf automatisch, sonst kommen Nachrichten vielleicht nicht an.`;
+  const hint = Platform.OS === 'ios' ? 'Einstellungen › Allgemein › Datum & Uhrzeit' : undefined;
+
+  async function openSettings() {
+    try {
+      await Linking.sendIntent('android.settings.DATE_SETTINGS');
+    } catch {
+      await Linking.openSettings().catch(() => notice('Einstellungen nicht geöffnet', 'Öffne die Einstellungen und suche nach „Datum und Uhrzeit“.'));
+    }
+  }
+
+  return (
+    <View style={{ borderRadius: radius.md, borderWidth: 1.5, borderColor: t.accent, backgroundColor: t.surface, padding: spacing.md, gap: spacing.sm }}>
+      <Row gap={spacing.md} style={{ alignItems: 'flex-start' }}>
+        <Text style={{ fontSize: 26 }} accessible={false}>
+          🕐
+        </Text>
+        <View style={{ flex: 1, gap: 2 }} accessible accessibilityLiveRegion="polite" accessibilityLabel={[title, text, hint].filter(Boolean).join('. ')}>
+          <T variant="h2" color={t.accent}>
+            {title}
+          </T>
+          <T variant="small" color={t.text}>
+            {text}
+          </T>
+          {hint ? <T variant="small">{hint}</T> : null}
+        </View>
+        <Pressable
+          onPress={() => {
+            clockBannerHidden = true;
+            setHidden(true);
+          }}
+          accessibilityRole="button"
+          accessibilityLabel="Hinweis zur Uhrzeit ausblenden"
+          hitSlop={spacing.sm}
+          style={({ pressed }) => ({ minWidth: TOUCH, minHeight: TOUCH, marginTop: -spacing.sm, marginRight: -spacing.sm, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.6 : 1 })}
+        >
+          <Text style={{ color: t.textMuted, fontSize: 18, fontWeight: '700' }} accessible={false}>
+            ✕
+          </Text>
+        </Pressable>
+      </Row>
+      {Platform.OS === 'android' ? (
+        <View style={{ alignSelf: 'flex-start' }}>
+          <Button title="Uhrzeit einstellen" kind="secondary" compact onPress={() => void openSettings()} />
+        </View>
+      ) : null}
+    </View>
   );
 }
 

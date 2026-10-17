@@ -24,6 +24,7 @@ const BRIDGE_METHODS = [
   'vaultRead', 'vaultWrite', 'vaultDelete',
   'secretGet', 'secretSet', 'secretDelete',
   'notify', 'onNotificationClick', 'attention', 'setBadge',
+  'onSaveRequest',
   'getAutostart', 'setAutostart',
   'saveFile', 'openFile', 'openExternal',
 ];

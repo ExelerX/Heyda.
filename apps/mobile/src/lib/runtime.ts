@@ -282,6 +282,8 @@ export class AppRuntime {
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
   /** When `SEEN_FILE` was last written. */
   private seenSavedAt = 0;
+  /** The last write started (see `write`): they run one at a time, and `shutdown` waits for it. */
+  private writing: Promise<void> = Promise.resolve();
   private tickTimer: ReturnType<typeof setInterval> | undefined;
   private stopDemo: (() => void) | undefined;
   private openThread: string | undefined;
@@ -684,6 +686,9 @@ export class AppRuntime {
     this.disposed = true;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
+    // A save already under way ends first: neither file may be written again after the wipe, or
+    // over what a restore or link writes next (on Windows a save takes several steps).
+    await this.writing;
   }
 
   /**
@@ -727,11 +732,21 @@ export class AppRuntime {
   }
 
   /**
+   * One write at a time, in order: two at once could finish the wrong way round and leave an older
+   * copy of the seen store's file on disk after a newer one let the journal forget its ids.
+   */
+  private write(allSeen = false): Promise<void> {
+    const run = this.writing.then(() => this.writeNow(allSeen));
+    this.writing = run.catch(() => {});
+    return run;
+  }
+
+  /**
    * Writes the app data, and the seen store's own file when `allSeen` or due (see `SEEN_FILE`).
    * That file is taken before the app data and written after it, so it never knows of a message
    * whose effects the app data lacks: a crash in between can only make the journal repeat ids.
    */
-  private async write(allSeen = false): Promise<void> {
+  private async writeNow(allSeen: boolean): Promise<void> {
     const now = Date.now();
     const due = allSeen || now - this.seenSavedAt >= SEEN_SAVE_MS || now < this.seenSavedAt || this.seen.journalSize() > SEEN_JOURNAL_MAX;
     const full = due ? this.seen.snapshot() : undefined;
@@ -1034,6 +1049,13 @@ onAlarmDone((id, at) => {
       await r.flushIfDirty();
     })
     .catch(() => {});
+});
+
+// Windows: the page never goes to the background (it keeps running in the tray), so the shell asks
+// for a save when the window goes to the tray, before quitting and when Windows shuts down. The
+// seen store's own file is written then too. Only a runtime that exists saves; none is made for it.
+desktop?.onSaveRequest(async () => {
+  await runtime?.then((r) => r.flush()).catch(() => {});
 });
 
 /** The single runtime, created and started on first use (also from background tasks). */

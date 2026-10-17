@@ -55,6 +55,10 @@ export interface HeydaDesktopBridge {
   attention(): Promise<void>;                     // show + focus + flash the window
   setBadge(count: number): Promise<void>;         // unread count (taskbar overlay / tray tooltip)
 
+  // The shell asks the UI to save now: window closed to the tray, before quitting, Windows ending
+  // the session (the page never counts as hidden). Quitting waits for cb, at most 3 s.
+  onSaveRequest(cb: () => Promise<void> | void): () => void;
+
   getAutostart(): Promise<boolean>;
   setAutostart(on: boolean): Promise<void>;       // start hidden in the tray at login
 

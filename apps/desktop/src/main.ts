@@ -24,7 +24,7 @@ import type {
 import { readFileSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { redDotPng } from './badge';
-import { INVOKE_CHANNELS, NOTIFICATION_CLICK_CHANNEL, VERSION_ARG_PREFIX } from './contract';
+import { INVOKE_CHANNELS, NOTIFICATION_CLICK_CHANNEL, SAVE_DONE_CHANNEL, SAVE_REQUEST_CHANNEL, VERSION_ARG_PREFIX } from './contract';
 import type { DesktopNotification, InvokeChannel } from './contract';
 import {
   APP_SCHEME,
@@ -41,12 +41,14 @@ import {
   parseBoolean,
   parseExternalUrl,
   parseNotification,
+  parseRequestId,
   parseSecretName,
   parseSecretValue,
   parseSuggestedFileName,
   parseVaultName,
   urgentToastXml,
 } from './security';
+import { QuitGate, SaveRequests } from './save-request';
 import { FileStore, SecretStore, writeFileAtomic } from './storage';
 import type { SecretCipher } from './storage';
 import { createWebHandler } from './web-handler';
@@ -72,6 +74,10 @@ let dialogOpen = false;
 const liveNotifications: Notification[] = [];
 const crashReloads = new CrashReloadPolicy();
 const CRASH_RELOAD_DELAY_MS = 1000;
+const saveRequests = new SaveRequests();
+const quitGate = new QuitGate();
+/** The longest a quit waits for the UI to save (it holds the app's data). */
+const SAVE_WAIT_MS = 3000;
 
 /** A failure whose message is safe and useful to show in the UI (no paths, no internals). */
 class BridgeError extends Error {}
@@ -103,8 +109,10 @@ function main(): void {
     if (!argv.includes(HIDDEN_ARG)) afterStart(() => showWindow());
   });
   app.on('web-contents-created', (_event, contents) => hardenWebContents(contents));
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
     quitting = true;
+    // The UI saves what it has first (a few seconds at most), then the quit starts again.
+    if (!quitGate.mayQuit(() => requestSave(SAVE_WAIT_MS), () => setImmediate(() => app.quit()))) event.preventDefault();
   });
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
@@ -236,11 +244,16 @@ function createWindow(show: boolean): BrowserWindow {
     if (quitting) return;
     event.preventDefault();
     win.hide();
+    // Like a phone app going to the background. It keeps running, but may be ended from here on.
+    void requestSave(SAVE_WAIT_MS);
     void showTrayHintOnce();
   });
-  // Never block a Windows shutdown or log-off with the hide-to-tray behaviour.
+  // Never block a Windows shutdown or log-off with the hide-to-tray behaviour. Windows does not
+  // quit the app the usual way (no 'before-quit'), so the UI is asked to save now, as early as it
+  // can be, without holding the shutdown up.
   win.on('query-session-end', () => {
     quitting = true;
+    void requestSave(SAVE_WAIT_MS);
   });
   win.on('session-end', () => {
     quitting = true;
@@ -302,6 +315,16 @@ function onUiGone(win: BrowserWindow, reason: string, exitCode: number): void {
 function reloadUi(win: BrowserWindow): void {
   if (win.isDestroyed()) return;
   win.loadURL(APP_START_URL).catch((error: unknown) => console.error('Failed to reload the UI', error));
+}
+
+/**
+ * Asks the UI to save what it holds now (see `onSaveRequest`). Resolves once it did, or after
+ * `timeoutMs`; at once without a working UI.
+ */
+function requestSave(timeoutMs: number): Promise<void> {
+  const win = mainWindow;
+  if (win === null || win.isDestroyed() || win.webContents.isCrashed()) return Promise.resolve();
+  return saveRequests.request((id) => win.webContents.send(SAVE_REQUEST_CHANNEL, id), timeoutMs);
 }
 
 function attention(): void {
@@ -538,6 +561,7 @@ async function registerBridge(): Promise<void> {
   handle(INVOKE_CHANNELS.notify, 1, ([n]) => notify(parseNotification(n)));
   handle(INVOKE_CHANNELS.attention, 0, () => attention());
   handle(INVOKE_CHANNELS.setBadge, 1, ([count]) => setBadge(parseBadgeCount(count)));
+  handle(SAVE_DONE_CHANNEL, 1, ([id]) => saveRequests.done(parseRequestId(id)));
 
   handle(INVOKE_CHANNELS.getAutostart, 0, () => getAutostart());
   handle(INVOKE_CHANNELS.setAutostart, 1, ([on]) => setAutostart(parseBoolean(on)));
@@ -552,7 +576,7 @@ async function registerBridge(): Promise<void> {
   });
 }
 
-function handle(channel: InvokeChannel, argCount: number, handler: (args: unknown[]) => unknown): void {
+function handle(channel: InvokeChannel | typeof SAVE_DONE_CHANNEL, argCount: number, handler: (args: unknown[]) => unknown): void {
   ipcMain.handle(channel, async (event, ...args: unknown[]) => {
     if (!isTrustedSender(event)) throw new Error('Heyda.: untrusted sender');
     try {

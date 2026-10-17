@@ -1,6 +1,6 @@
 import { decryptBackup } from '@heyda/core';
 import { router } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { View } from 'react-native';
 import { confirm, notice } from '../../lib/confirm';
 import { pickBackupFile } from '../../lib/files';
@@ -20,9 +20,11 @@ function sizeText(bytes: number): string {
 
 /**
  * Restores an encrypted backup: pick the file, enter the password, wait for the key
- * derivation, then the app restarts with the restored account.
+ * derivation, then the app restarts with the restored account. `children` go above the button
+ * (more choices, e.g. starting with Windows); `beforeReplace` runs once the password proved right,
+ * before anything on this device is replaced.
  */
-export function RestoreFlow({ warnReplace }: { warnReplace: boolean }) {
+export function RestoreFlow({ warnReplace, children, beforeReplace }: { warnReplace: boolean; children?: ReactNode; beforeReplace?: () => Promise<void> }) {
   const t = useTheme();
   const runtime = useRuntime();
   const restart = useRestart();
@@ -70,6 +72,7 @@ export function RestoreFlow({ warnReplace }: { warnReplace: boolean }) {
         setPhase('idle');
         return;
       }
+      await beforeReplace?.().catch(() => {});
       // Stop the running app before its data is replaced, so it cannot save over the restored data.
       await runtime.shutdown(false);
       stopped = true;
@@ -146,6 +149,7 @@ export function RestoreFlow({ warnReplace }: { warnReplace: boolean }) {
           onSubmitEditing={() => void restore()}
         />
       </View>
+      {children}
       {busy && (
         <ProgressBar
           value={phase === 'done' ? 1 : progress}

@@ -72,13 +72,7 @@ export default function Welcome() {
         {step === 'name' && <NameStep name={name} setName={setName} onNext={() => setStep('permissions')} />}
         {step === 'permissions' && <Permissions name={name} />}
         {step === 'link' && <LinkReceive />}
-        {step === 'restore' && (
-          <View style={{ gap: spacing.md }}>
-            <T variant="title">Sicherung wiederherstellen</T>
-            <T variant="muted">Hol dein Konto mit Kontakten, Orten und Automationen aus einer Sicherungsdatei zurück.</T>
-            <RestoreFlow warnReplace={runtime.settings.onboarded && !runtime.isDemo} />
-          </View>
-        )}
+        {step === 'restore' && <RestoreStep warnReplace={runtime.settings.onboarded && !runtime.isDemo} />}
       </Narrow>
     </Screen>
   );
@@ -310,17 +304,39 @@ function PermissionCard({ icon, title, children }: { icon: string; title: string
   );
 }
 
-/** Windows: start with Windows, for a new account and for one linked from another device alike. */
+const AUTOSTART_DETAIL = 'Dann läuft Heyda. nach jedem Neustart still im Infobereich, und Notrufe und Alarme kommen auch hier an.';
+
+/** Windows: start with Windows, for a new account, one linked from another device and a restored one alike. */
 function AutostartCard({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
     <PermissionCard icon="🖥️" title="Mit Windows starten">
-      <Toggle
-        label="Empfohlen"
-        detail="Dann läuft Heyda. nach jedem Neustart still im Infobereich, und Notrufe und Alarme kommen auch hier an."
-        value={value}
-        onChange={onChange}
-      />
+      <Toggle label="Empfohlen" detail={AUTOSTART_DETAIL} value={value} onChange={onChange} />
     </PermissionCard>
+  );
+}
+
+// ---- restore a backup ------------------------------------------------------------------------
+
+function RestoreStep({ warnReplace }: { warnReplace: boolean }) {
+  // Offered with the account, as when starting a new one or linking.
+  const [autostart, setAutostart] = useState(true);
+  return (
+    <View style={{ gap: spacing.md }}>
+      <T variant="title">Sicherung wiederherstellen</T>
+      <T variant="muted">Hol dein Konto mit Kontakten, Orten und Automationen aus einer Sicherungsdatei zurück.</T>
+      <RestoreFlow
+        warnReplace={warnReplace}
+        // Can be changed later under Ruhe or in the tray menu.
+        beforeReplace={autostartSupported ? () => desktop!.setAutostart(autostart) : undefined}
+      >
+        {autostartSupported && (
+          <View style={{ gap: spacing.sm }}>
+            <T variant="h2">3. Mit Windows starten</T>
+            <Toggle label="Empfohlen" detail={AUTOSTART_DETAIL} value={autostart} onChange={setAutostart} />
+          </View>
+        )}
+      </RestoreFlow>
+    </View>
   );
 }
 

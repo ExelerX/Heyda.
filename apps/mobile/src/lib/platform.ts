@@ -14,6 +14,8 @@ export interface HeydaDesktopBridge {
   onNotificationClick(cb: (id: string) => void): () => void;
   attention(): Promise<void>;
   setBadge(count: number): Promise<void>;
+  /** The shell asks for a save: window to the tray, quitting, Windows shutting down. Quitting waits for `cb` (a few seconds at most). */
+  onSaveRequest(cb: () => Promise<void> | void): () => void;
   getAutostart(): Promise<boolean>;
   setAutostart(on: boolean): Promise<void>;
   saveFile(suggestedName: string, dataB64: string): Promise<boolean>;

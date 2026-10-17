@@ -8,6 +8,8 @@ import type {
   HeydaDesktopBridge,
   INVOKE_CHANNELS,
   NOTIFICATION_CLICK_CHANNEL,
+  SAVE_DONE_CHANNEL,
+  SAVE_REQUEST_CHANNEL,
   VERSION_ARG_PREFIX,
 } from './contract';
 
@@ -28,6 +30,8 @@ const CHANNELS: typeof INVOKE_CHANNELS = {
   openExternal: 'heyda:open-external',
 };
 const CLICK_CHANNEL: typeof NOTIFICATION_CLICK_CHANNEL = 'heyda:notification-click';
+const SAVE_REQUEST: typeof SAVE_REQUEST_CHANNEL = 'heyda:save-request';
+const SAVE_DONE: typeof SAVE_DONE_CHANNEL = 'heyda:save-done';
 const VERSION_PREFIX: typeof VERSION_ARG_PREFIX = '--heyda-version=';
 
 // Clicks that arrive before the UI subscribed (e.g. right after a hidden autostart) are kept briefly.
@@ -43,6 +47,16 @@ ipcRenderer.on(CLICK_CHANNEL, (_event: IpcRendererEvent, id: unknown) => {
     return;
   }
   for (const listener of clickListeners) deliverClick(listener, id);
+});
+
+// The shell asks for a save (window to the tray, quitting, Windows shutting down) and waits for the
+// answer before it quits: it always comes, also when a listener failed or none is there yet.
+const saveListeners = new Set<() => Promise<void> | void>();
+
+ipcRenderer.on(SAVE_REQUEST, (_event: IpcRendererEvent, id: unknown) => {
+  if (typeof id !== 'number') return;
+  const runs = [...saveListeners].map((listener) => Promise.resolve().then(listener));
+  void Promise.allSettled(runs).then(() => invoke(SAVE_DONE, id).catch(() => undefined));
 });
 
 function deliverClick(listener: (id: string) => void, id: string): void {
@@ -89,6 +103,14 @@ const bridge: HeydaDesktopBridge = {
   },
   attention: () => invoke(CHANNELS.attention),
   setBadge: (count) => invoke(CHANNELS.setBadge, count),
+
+  onSaveRequest: (cb) => {
+    if (typeof cb !== 'function') throw new TypeError('onSaveRequest expects a function');
+    saveListeners.add(cb);
+    return () => {
+      saveListeners.delete(cb);
+    };
+  },
 
   getAutostart: () => invoke(CHANNELS.getAutostart),
   setAutostart: (on) => invoke(CHANNELS.setAutostart, on),

@@ -207,6 +207,12 @@ export function parseBadgeCount(value: unknown): number {
   return value;
 }
 
+/** The id of a save request the UI answers (see `SaveRequests`). */
+export function parseRequestId(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new InvalidArgumentError('request id');
+  return value;
+}
+
 /** Standard-alphabet base64 with padding, decoded to at most `maxBytes`. */
 export function parseBase64(value: unknown, maxBytes: number): Buffer {
   if (typeof value !== 'string' || value.length > base64Length(maxBytes) || !isBase64(value)) {
