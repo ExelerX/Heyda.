@@ -597,7 +597,8 @@ describe('SocialNode: groups', () => {
     await flush();
     await lisa.editGroup(group.id, { members: [MAX] });
     await flush();
-    expect(mia.getState().groups).toEqual([]);
+    // Gone from her list; a hidden copy keeps its version, so Lisa can add her back later.
+    expect(mia.getState().groups.filter((g) => !g.dissolved)).toEqual([]);
     expect(max.getState().groups[0]?.members.map((m) => m.name)).toEqual(['Lisa', 'Max']);
 
     await max.leaveGroup(group.id);

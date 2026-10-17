@@ -25,6 +25,7 @@ import {
 import { createSession, isSessionActive, type SessionLevel, type SharingSession } from './session/session';
 import { TripSharer, type TripOptions } from './session/trip';
 import {
+  capGroups,
   contactLabel,
   type Alert,
   type Contact,
@@ -33,6 +34,7 @@ import {
   type GroupMember,
   type LinkedDevice,
   type MySos,
+  type MyWatch,
   type LiveShare,
   type LocationNeeds,
   type MyStatus,
@@ -517,8 +519,9 @@ export class SocialNode {
    * still runs with them ends for them too. My live share, trip, watches and SOS get their end, so
    * their phone stops showing them and no watch alarm rings there later; nothing else still queued
    * for them goes out (group messages aside, they belong to the group), and their questions and
-   * statuses are dropped. Their relays are taken now, while they are still known. Everything
-   * here changes at once; the returned promise settles when the ends went out or were queued.
+   * statuses are dropped. I leave the groups they own. Their relays are taken now, while they are
+   * still known. Everything here changes at once; the returned promise settles when the ends went
+   * out or were queued.
    */
   private endEverythingWith(key: ContactKey): Promise<void> {
     const relays = this.relaysFor(key);
@@ -551,10 +554,21 @@ export class SocialNode {
       sos = recipients.length ? { ...sos, recipients, acks: sos.acks.filter((a) => a.key !== key) } : undefined;
     }
 
+    // Groups they own: I leave them, or they would stay half working (neither they nor the people
+    // only they vouched for reach me there any more, see `acceptsMessage`). Kept hidden with their
+    // version (see `Group.dissolved`), so they can add me again once we are connected again.
+    const now = this.now();
+    const groups = this.state.groups.map((g) => {
+      if (g.owner !== key || g.dissolved) return g;
+      ends.push({ body: { type: 'group.leave', groupId: g.id }, ttl: TTL.chat });
+      return { ...g, members: g.members.filter((m) => m.key === key), updatedAt: now, dissolved: true };
+    });
+
     this.update({
       liveShares: this.state.liveShares.filter((s) => s.contactKey !== key),
       watches,
       sos,
+      groups,
       whereInbox: this.state.whereInbox.filter((w) => w.from !== key),
       whereAsked: this.state.whereAsked.filter((w) => w.from !== key),
     });
@@ -798,22 +812,45 @@ export class SocialNode {
   // ---- check-ins and watches -------------------------------------------------------------------
 
   /**
-   * "Gut angekommen", "Alles okay", "Bin zuhause". Also ends my running watches.
-   * Without `placeName` the place I'm at is added, except in ghost mode.
+   * "Gut angekommen", "Alles okay", "Bin zuhause". Also ends my running watches, those my other
+   * devices started too. Without `placeName`, the place I'm at is added if everyone it goes to may
+   * see that place (`checkinPlace`), unless `autoPlace` is false.
    */
-  async sendCheckin(input: { to: ContactKey[]; kind: CheckinKind; text?: string; placeName?: string }): Promise<void> {
-    await this.checkin(input, !this.state.ghost);
+  async sendCheckin(input: { to: ContactKey[]; kind: CheckinKind; text?: string; placeName?: string; autoPlace?: boolean }): Promise<void> {
+    const { autoPlace = true, ...rest } = input;
+    await this.checkin(rest, { addPlace: autoPlace, ends: 'all' });
   }
 
-  private async checkin(input: { to: ContactKey[]; kind: CheckinKind; text?: string; placeName?: string }, addPlace: boolean): Promise<void> {
+  /**
+   * The place a check-in to these people adds by itself: the one I'm at, if each of them has a
+   * grant for it. Never in ghost mode.
+   */
+  checkinPlace(to: ContactKey[]): string | undefined {
+    const place = this.currentPlace();
+    if (!place || !to.length) return undefined;
+    const allowed = new Set(this.policy.placeEventRecipients(place.id, this.now()));
+    return to.every((k) => allowed.has(k)) ? place.name : undefined;
+  }
+
+  /**
+   * `ends`: which of my watches the check-in ends. `all` when I check in myself. An automation
+   * for arriving at one of my places ends only the watches whose people all get its check-in
+   * (`covered`); any other one ends `none`, since a contact may have set it off.
+   */
+  private async checkin(
+    input: { to: ContactKey[]; kind: CheckinKind; text?: string; placeName?: string },
+    opts: { addPlace: boolean; ends: 'all' | 'covered' | 'none' },
+  ): Promise<void> {
     const to = [...new Set(input.to)].filter((k) => this.contact(k));
     if (!to.length) throw new RangeError('Wähle mindestens einen Kontakt.');
     const text = input.text?.trim() ? cleanText(input.text, 140) : undefined;
-    const placeName = input.placeName?.trim() ? cleanText(input.placeName, 60) : addPlace ? this.currentPlace()?.name : undefined;
+    const placeName = input.placeName?.trim() ? cleanText(input.placeName, 60) : opts.addPlace ? this.checkinPlace(to) : undefined;
     const id = await this.sendMany(to, { type: 'checkin', kind: input.kind, text, placeName }, TTL.chat);
     for (const k of to) this.recordSent(k, `${id.slice(0, 40)}-${k.slice(0, 8)}`, checkinText(input.kind, text, placeName), 'ping');
-    if (input.kind !== 'custom') {
-      for (const w of [...this.state.watches]) await this.endWatch(w.watchId, 'ok');
+    if (input.kind === 'custom' || opts.ends === 'none') return;
+    for (const w of [...this.state.watches]) {
+      if (opts.ends === 'covered' && !w.recipients.every((k) => to.includes(k))) continue;
+      await this.endWatch(w.watchId, 'ok');
     }
   }
 
@@ -834,11 +871,11 @@ export class SocialNode {
     }
     const label = cleanText(input.label || 'Unterwegs', 60);
     const watchId = randomId();
-    this.update({
-      watches: [...active, { watchId, recipients: to, label, dueAt: input.dueAt, startedAt: now, tripId: input.tripId }],
-    });
+    const watch: MyWatch = { watchId, recipients: to, label, dueAt: input.dueAt, startedAt: now, changedAt: now, tripId: input.tripId };
+    this.update({ watches: [...active, watch] });
     await this.sendMany(to, { type: 'watch.start', watchId, label, dueAt: input.dueAt }, watchTtl(input.dueAt, now));
     this.scheduleOwnWatchAlarms(watchId);
+    await this.syncWatch(watch);
     return watchId;
   }
 
@@ -848,18 +885,61 @@ export class SocialNode {
     if (!w) return;
     const now = this.now();
     checkWatchTime(dueAt, now);
-    this.update({ watches: this.state.watches.map((x) => (x.watchId === watchId ? { ...x, dueAt } : x)) });
+    const next: MyWatch = { ...w, dueAt, changedAt: now };
+    this.update({ watches: this.state.watches.map((x) => (x.watchId === watchId ? next : x)) });
     await this.sendMany(w.recipients, { type: 'watch.start', watchId, label: w.label, dueAt }, watchTtl(dueAt, now));
     this.scheduleOwnWatchAlarms(watchId);
+    await this.syncWatch(next);
   }
 
   async endWatch(watchId: string, reason: 'ok' | 'cancelled'): Promise<void> {
     const w = this.state.watches.find((x) => x.watchId === watchId);
     if (!w) return;
+    this.ended.add(`mywatch|${watchId}`);
     this.update({ watches: this.state.watches.filter((x) => x.watchId !== watchId) });
     this.emit({ type: 'alarm.cancel', id: `mywatch:${watchId}:remind` });
     this.emit({ type: 'alarm.cancel', id: `mywatch:${watchId}:due` });
     await this.sendMany(w.recipients, { type: 'watch.end', watchId, reason }, TTL.chat);
+    await this.syncWatch(w, true);
+  }
+
+  /** Tells my other devices about one of my watches, so any of them can end it (see `onSyncWatch`). */
+  private async syncWatch(w: MyWatch, ended?: true): Promise<void> {
+    if (!this.state.devices.length) return;
+    const { watchId, label, dueAt, startedAt } = w;
+    const body: BodyOf<'sync.watch'> = { type: 'sync.watch', deviceId: this.state.self.deviceId, watchId, recipients: w.recipients.slice(0, 100), label, dueAt, startedAt };
+    await this.sendToSelf(ended ? { ...body, ended } : body, TTL.sync);
+  }
+
+  /**
+   * One of my watches, started, moved or ended on another of my devices. It runs here too: a
+   * check-in on this device ends it for the people watching, also while the other device is off,
+   * and this device reminds me before it is due.
+   */
+  private onSyncWatch(m: MessageOf<'sync.watch'>): void {
+    const now = this.now();
+    const existing = this.state.watches.find((w) => w.watchId === m.watchId);
+    if (m.ended) {
+      this.ended.add(`mywatch|${m.watchId}`);
+      if (!existing) return;
+      this.update({ watches: this.state.watches.filter((w) => w.watchId !== m.watchId) });
+      this.emit({ type: 'alarm.cancel', id: `mywatch:${m.watchId}:remind` });
+      this.emit({ type: 'alarm.cancel', id: `mywatch:${m.watchId}:due` });
+      return;
+    }
+    // A late copy must not bring back a watch that ended, nor an older deadline.
+    if (this.ended.has(`mywatch|${m.watchId}`) || now >= m.dueAt + WATCH_KEEP_MS) return;
+    const sentAt = senderTime(m.sentAt, now);
+    if (existing && isOlder(sentAt, existing.changedAt, now)) return;
+    if (!existing && this.state.watches.length >= 2 * MAX_OWN_WATCHES) return;
+    const { watchId, recipients, label, dueAt, startedAt } = m;
+    const next: MyWatch = { watchId, recipients, label, dueAt, startedAt, changedAt: sentAt, ...(existing?.tripId ? { tripId: existing.tripId } : {}) };
+    this.update({ watches: existing ? this.state.watches.map((w) => (w === existing ? next : w)) : [...this.state.watches, next] });
+    if (dueAt > now) this.scheduleOwnWatchAlarms(watchId);
+    else {
+      this.emit({ type: 'alarm.cancel', id: `mywatch:${watchId}:remind` });
+      this.emit({ type: 'alarm.cancel', id: `mywatch:${watchId}:due` });
+    }
   }
 
   private scheduleOwnWatchAlarms(watchId: string): void {
@@ -1050,7 +1130,7 @@ export class SocialNode {
   // ---- groups ----------------------------------------------------------------------------------
 
   async createGroup(name: string, memberKeys: ContactKey[]): Promise<Group> {
-    if (this.state.groups.length >= MAX_GROUPS) throw new RangeError('Du hast schon sehr viele Gruppen.');
+    if (this.liveGroups().length >= MAX_GROUPS) throw new RangeError('Du hast schon sehr viele Gruppen.');
     const group: Group = {
       id: randomId(),
       name: cleanText(name, 40),
@@ -1059,7 +1139,7 @@ export class SocialNode {
       version: 1,
       updatedAt: this.now(),
     };
-    this.update({ groups: [...this.state.groups, group] });
+    this.update({ groups: capGroups([...this.state.groups, group], MAX_GROUPS) });
     this.markSync();
     await this.broadcastRoster(group, []);
     return group;
@@ -1080,7 +1160,7 @@ export class SocialNode {
     this.update({ groups: this.state.groups.map((x) => (x.id === groupId ? next : x)) });
     this.markSync();
     const removed = g.members.filter((m) => !members.some((x) => x.key === m.key)).map((m) => m.key);
-    await this.broadcastRoster(next, removed);
+    await this.broadcastRoster(next, removed, g.name);
   }
 
   /** Leaves a group. If I own it, the group is dissolved for everyone. */
@@ -1123,9 +1203,19 @@ export class SocialNode {
     return [self, ...members];
   }
 
-  private async broadcastRoster(g: Group, removed: ContactKey[]): Promise<void> {
-    const to = [...g.members.map((m) => m.key), ...removed].filter((k) => k !== this.state.self.key);
-    await this.sendMany(to, rosterBody(g), TTL.chat, true);
+  /**
+   * The roster goes to everyone in the group. People just taken off learn only that they are out:
+   * they get the name they knew and the owner alone, not who else is in it or was just added.
+   */
+  private async broadcastRoster(g: Group, removed: ContactKey[], previousName = g.name): Promise<void> {
+    const to = g.members.map((m) => m.key).filter((k) => k !== this.state.self.key);
+    const out = rosterBody({ ...g, name: previousName, members: g.members.filter((m) => m.key === g.owner) });
+    await Promise.all([this.sendMany(to, rosterBody(g), TTL.chat, true), removed.length ? this.sendMany(removed, out, TTL.chat, true) : undefined]);
+  }
+
+  /** Groups I am in, without the hidden copies of groups I was taken off. */
+  private liveGroups(): Group[] {
+    return this.state.groups.filter((g) => !g.dissolved);
   }
 
   // ---- my other devices -----------------------------------------------------------------------
@@ -1393,8 +1483,9 @@ export class SocialNode {
 
   /**
    * Whether this device acts on a message from `from` at all. Only contacts can reach it;
-   * group members who are not my contacts may write in a group whose owner is a contact of
-   * mine (the owner vouched for them), and a stranger may answer a QR code I showed.
+   * group members who are not my contacts may write in a group whose owner is me or still a
+   * contact of mine (the owner vouches for them), and leave a group I own. An owner I removed
+   * as a contact can only let me go. A stranger may answer a QR code I showed.
    * A transport can call this to keep strangers' messages out of its list of processed ones.
    */
   acceptsMessage(from: ContactKey, message: AppMessage): boolean {
@@ -1402,11 +1493,19 @@ export class SocialNode {
     switch (message.type) {
       case 'hello':
         return message.inviteNonce !== undefined && this.state.openInvites.some((i) => i.nonce === message.inviteNonce);
-      case 'group.text':
+      case 'group.text': {
+        const owner = this.group(message.groupId)?.owner;
+        return this.isMember(message.groupId, from) && owner !== undefined && (owner === this.state.self.key || !!this.contact(owner));
+      }
       case 'group.leave':
-        return this.isMember(message.groupId, from);
+        // Only the owner acts on it.
+        return this.isMember(message.groupId, from) && this.group(message.groupId)?.owner === this.state.self.key;
       case 'group.update':
-        return this.group(message.groupId)?.owner === from;
+        // From an owner who is no longer my contact: only taking me off, or dissolving the group.
+        return (
+          this.group(message.groupId)?.owner === from &&
+          (message.dissolved === true || !message.members.some((m) => m.key === this.state.self.key))
+        );
       case 'link.reveal':
         // The one-time key of a device I am linking, answering my hello once, for that code only.
         return this.awaitsReveal(from, message);
@@ -1549,6 +1648,9 @@ export class SocialNode {
           thread: message.thread,
           entry: { id: message.msgId, from: 'me', text: message.text, at: Math.min(message.at, this.now()), kind: message.kind },
         });
+        return;
+      case 'sync.watch':
+        if (message.deviceId !== self.deviceId) this.onSyncWatch(message);
         return;
       case 'link.done': {
         if (message.deviceId === self.deviceId) return;
@@ -2063,43 +2165,67 @@ export class SocialNode {
     this.alert({ category: 'where', title: this.name(from), body: text, from, thread: from });
   }
 
-  private onGroupUpdate(from: ContactKey, m: MessageOf<'group.update'>): void {
+  private onGroupUpdate(from: ContactKey, m: MessageOf<'group.update'>): Promise<void> | void {
     if (m.owner !== from) return;
     const g = this.group(m.groupId);
     if (g && (g.owner !== from || m.version <= g.version)) return;
     const meIn = m.members.some((x) => x.key === this.state.self.key);
     if (!g) {
-      if (this.state.leftGroups.some((x) => x.id === m.groupId)) return;
-      if (!meIn || m.dissolved || !this.contact(from) || this.state.groups.length >= MAX_GROUPS) return;
+      if (this.state.leftGroups.some((x) => x.id === m.groupId)) {
+        // I left it myself. An owner who adds me back (or never heard that I left) learns it
+        // again, so their list does not keep showing someone who gets nothing.
+        if (meIn && !m.dissolved && !this.replaying) return this.sendTo(from, { type: 'group.leave', groupId: m.groupId }, TTL.chat).then(() => undefined);
+        return;
+      }
+      if (!meIn || m.dissolved || !this.contact(from) || this.liveGroups().length >= MAX_GROUPS) return;
+      this.joinGroup(from, m, undefined);
+      return;
     }
-    if (!meIn || m.dissolved) {
+    if (m.dissolved) {
       this.update({
         groups: this.state.groups.filter((x) => x.id !== m.groupId),
         leftGroups: [...this.state.leftGroups.filter((x) => x.id !== m.groupId), { id: m.groupId, at: this.now() }].slice(-200),
       });
       this.markSync();
-      this.alert({
-        category: 'group',
-        title: m.name,
-        body: m.dissolved ? 'Die Gruppe wurde aufgelöst.' : 'Du bist nicht mehr in dieser Gruppe.',
-        from,
-        ref: { groupId: m.groupId },
-      });
+      if (!g.dissolved) this.alert({ category: 'group', title: m.name, body: 'Die Gruppe wurde aufgelöst.', from, ref: { groupId: m.groupId } });
       return;
     }
-    const next: Group = { id: m.groupId, name: m.name, owner: m.owner, members: m.members, version: m.version, updatedAt: this.now() };
-    this.update({ groups: g ? this.state.groups.map((x) => (x.id === m.groupId ? next : x)) : [...this.state.groups, next] });
-    this.markSync();
-    if (!g) {
-      this.alert({
-        category: 'group',
-        title: m.name,
-        body: `${this.name(from)} hat dich zur Gruppe hinzugefügt.`,
-        from,
-        thread: `g:${m.groupId}`,
-        ref: { groupId: m.groupId },
-      });
+    if (!meIn) {
+      // Taken off by the owner: kept hidden with its version (see `Group.dissolved`), so an older
+      // roster cannot bring me back, but the owner adding me again later can.
+      const out: Group = {
+        id: m.groupId,
+        name: m.name,
+        owner: from,
+        members: m.members.filter((x) => x.key === from),
+        version: m.version,
+        updatedAt: this.now(),
+        dissolved: true,
+      };
+      this.update({ groups: this.state.groups.map((x) => (x.id === m.groupId ? out : x)) });
+      this.markSync();
+      if (!g.dissolved) this.alert({ category: 'group', title: m.name, body: 'Du bist nicht mehr in dieser Gruppe.', from, ref: { groupId: m.groupId } });
+      return;
     }
+    // Back in after being taken off: like joining, only a contact can add me.
+    if (g.dissolved && !this.contact(from)) return;
+    this.joinGroup(from, m, g);
+  }
+
+  /** Takes a roster that lists me; `g` is my copy, if I had one (also a hidden one, see `Group.dissolved`). */
+  private joinGroup(from: ContactKey, m: MessageOf<'group.update'>, g: Group | undefined): void {
+    const next: Group = { id: m.groupId, name: m.name, owner: m.owner, members: m.members, version: m.version, updatedAt: this.now() };
+    this.update({ groups: g ? this.state.groups.map((x) => (x.id === m.groupId ? next : x)) : capGroups([...this.state.groups, next], MAX_GROUPS) });
+    this.markSync();
+    if (g && !g.dissolved) return;
+    this.alert({
+      category: 'group',
+      title: m.name,
+      body: `${this.name(from)} hat dich zur Gruppe hinzugefügt.`,
+      from,
+      thread: `g:${m.groupId}`,
+      ref: { groupId: m.groupId },
+    });
   }
 
   private onGroupText(from: ContactKey, m: MessageOf<'group.text'>, at: number): void {
@@ -2142,8 +2268,13 @@ export class SocialNode {
             await this.sendChat(intent.to, intent.text);
             break;
           case 'send_checkin':
-            // Never adds the place I'm at by itself: the trigger may be a contact without a grant for it.
-            await this.checkin({ to: intent.to, kind: intent.checkinKind, text: intent.text }, false);
+            // Never adds the place I'm at by itself: nobody looks at the message before it goes.
+            // It ends my watches only when I arrived at one of my places, and only those whose
+            // people all get it: a rule a contact can set off must not tell them I'm fine.
+            await this.checkin(
+              { to: intent.to, kind: intent.checkinKind, text: intent.text },
+              { addPlace: false, ends: event.type === 'me.arrive' ? 'covered' : 'none' },
+            );
             break;
           case 'set_dnd':
             await this.setDnd(intent.minutes);
@@ -2350,7 +2481,8 @@ export class SocialNode {
   }
 
   private isMember(groupId: string, key: ContactKey): boolean {
-    return this.group(groupId)?.members.some((m) => m.key === key) ?? false;
+    const g = this.group(groupId);
+    return !!g && !g.dissolved && g.members.some((m) => m.key === key);
   }
 
   private dndActive(): boolean {
@@ -2398,6 +2530,8 @@ export class SocialNode {
     if (openInvites.length !== this.state.openInvites.length) patch.openInvites = openInvites;
     const leftGroups = this.state.leftGroups.filter((g) => now - g.at < 180 * DAY);
     if (leftGroups.length !== this.state.leftGroups.length) patch.leftGroups = leftGroups;
+    const groups = this.state.groups.filter((g) => !g.dissolved || now - g.updatedAt < 180 * DAY);
+    if (groups.length !== this.state.groups.length) patch.groups = groups;
     if (Object.keys(patch).length) this.update(patch);
   }
 

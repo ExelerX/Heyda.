@@ -3,14 +3,16 @@ import { Rule } from '../automation/schema';
 import type { Place } from '../geo/geofence';
 import { normalizePrefs, type NotificationPrefs } from '../notify/prefs';
 import type { PlaceGrant } from '../privacy/policy';
-import type { Contact, Group, MyStatus, NodeState, SyncField } from '../state';
+import { capGroups, type Contact, type Group, type MyStatus, type NodeState, type SyncField } from '../state';
 
 /**
  * What my own devices keep in sync: contacts, groups, places, rules and settings.
- * Trips, live shares and SOS stay on the device that runs them.
+ * Trips, live shares and SOS stay on the device that runs them; my watches go to the other
+ * devices as messages of their own (`sync.watch`).
  *
  * Merging: contacts per contact (newest `updatedAt` wins, removals are remembered as
- * tombstones), groups per group (higher roster version wins, groups I left stay left),
+ * tombstones), groups per group (higher roster version wins, also over the hidden copy of a
+ * group I was taken off, so being added back sticks; groups I left stay left),
  * everything else per field (newest change wins). Ties are broken the same way on every
  * device, so all of them end up with the same data.
  */
@@ -158,7 +160,8 @@ export function mergeSyncDoc(s: NodeState, doc: SyncDoc, now: number): Partial<N
       groups.set(g.id, g);
     }
   }
-  const mergedGroups = [...groups.values()].filter((g) => !left.has(g.id));
+  // Within what the other side takes (`groups` max 100): hidden copies of groups I was taken off give way first.
+  const mergedGroups = capGroups([...groups.values()].filter((g) => !left.has(g.id)), 100);
   if (canonicalJson(mergedGroups) !== canonicalJson(s.groups)) patch.groups = mergedGroups;
 
   // Plain fields: newest change wins.

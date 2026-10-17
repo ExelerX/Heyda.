@@ -142,9 +142,14 @@ export default function ContactDetails() {
   }
 
   async function remove() {
+    // The core leaves the groups they made (see `endEverythingWith`).
+    const theirGroups = state.groups.filter((g) => g.owner === c.key && !g.dissolved).map((g) => `„${g.name}“`);
+    const groupsNote = theirGroups.length
+      ? ` Aus ${theirGroups.length === 1 ? 'der Gruppe' : 'den Gruppen'} ${theirGroups.join(', ')}, die ${name} erstellt hat, trittst du aus.`
+      : '';
     const ok = await confirm({
       title: `${name} entfernen?`,
-      message: `${name} bekommt dann nichts mehr von dir – keine Nachrichten, keine Ankunftszeiten, keinen Standort. Euer Chat wird auf diesem Gerät gelöscht. Um wieder verbunden zu sein, scannt ihr erneut eure Codes.`,
+      message: `${name} bekommt dann nichts mehr von dir – keine Nachrichten, keine Ankunftszeiten, keinen Standort. Euer Chat wird auf diesem Gerät gelöscht.${groupsNote} Um wieder verbunden zu sein, scannt ihr erneut eure Codes.`,
       ok: 'Entfernen',
       destructive: true,
     });

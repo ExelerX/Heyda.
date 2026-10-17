@@ -108,7 +108,7 @@ export default function Chats() {
             })}
           </ListCard>
         )}
-        {rows.length > 0 && state.groups.length === 0 ? (
+        {rows.length > 0 && !state.groups.some((g) => !g.dissolved) ? (
           <T variant="small" style={{ textAlign: 'center', marginTop: spacing.sm }}>
             Tipp: Mit „Neue Gruppe“ schreibt ihr zu mehreren, z. B. als Familie.
           </T>

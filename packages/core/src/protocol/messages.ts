@@ -240,6 +240,21 @@ export const SyncSentMessage = msg('sync.sent', {
   at: time,
 });
 
+/**
+ * One of my "Pass auf mich auf", for my other devices: any of them can end it with a check-in
+ * (also when the device that started it is off), and each reminds me. `ended` once it is over.
+ * Older versions do not know this type and drop it.
+ */
+export const SyncWatchMessage = msg('sync.watch', {
+  deviceId: DeviceId,
+  watchId: id,
+  recipients: z.array(key).min(1).max(100),
+  label: shortText(60),
+  dueAt: time,
+  startedAt: time,
+  ended: z.literal(true).optional(),
+});
+
 /** A newly linked device confirms it imported the account. */
 export const LinkDoneMessage = msg('link.done', {
   deviceId: DeviceId,
@@ -306,6 +321,7 @@ export const AppMessage = z.discriminatedUnion('type', [
   GroupTextMessage,
   GroupLeaveMessage,
   SyncSentMessage,
+  SyncWatchMessage,
   LinkDoneMessage,
   LinkHelloMessage,
   LinkRevealMessage,

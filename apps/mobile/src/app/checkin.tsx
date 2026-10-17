@@ -5,7 +5,7 @@ import { Pressable, Text, View } from 'react-native';
 import { BigButton } from '../components/safety/BigButton';
 import { ContactPicker, defaultRecipients, namesOf, NoContacts, stillContacts } from '../components/safety/ContactPicker';
 import { Field } from '../components/safety/Field';
-import { Card, Hint, Row, Screen, Section, T } from '../components/ui';
+import { Card, Hint, Row, Screen, Section, T, Toggle } from '../components/ui';
 import { notice } from '../lib/confirm';
 import { useRuntime, useSnapshot } from '../lib/store';
 import { radius, spacing, TOUCH, useTheme } from '../lib/theme';
@@ -37,6 +37,7 @@ export default function CheckinScreen() {
   const [recipients, setRecipients] = useState<string[]>(() => defaultRecipients(state.contacts));
   const [text, setText] = useState('');
   const [place, setPlace] = useState('');
+  const [placeOn, setPlaceOn] = useState(true);
   const [busy, setBusy] = useState(false);
   const [sentTo, setSentTo] = useState<string>();
 
@@ -56,7 +57,10 @@ export default function CheckinScreen() {
   const finalText = preset.vacation
     ? cleanText || (cleanPlace ? `Gut in ${cleanPlace} angekommen 🏖️` : 'Gut im Urlaub angekommen 🏖️')
     : cleanText || undefined;
-  const finalPlace = preset.vacation ? (cleanText && cleanPlace ? cleanPlace : undefined) : cleanPlace || undefined;
+  const typedPlace = preset.vacation ? (cleanText && cleanPlace ? cleanPlace : undefined) : cleanPlace || undefined;
+  // The place I'm at, only if everyone it goes to may see it (and nothing was typed).
+  const herePlace = cleanPlace ? undefined : runtime.node.checkinPlace(to);
+  const finalPlace = typedPlace ?? (herePlace && placeOn ? herePlace : undefined);
   const preview = checkinText(preset.kind, finalText, finalPlace);
   const ready = to.length > 0 && !busy && (preset.kind !== 'custom' || cleanText.length > 0);
 
@@ -64,7 +68,8 @@ export default function CheckinScreen() {
     if (!ready) return;
     setBusy(true);
     try {
-      await runtime.node.sendCheckin({ to, kind: preset.kind, text: finalText, placeName: finalPlace });
+      // Exactly what the preview shows: no place is added behind its back.
+      await runtime.node.sendCheckin({ to, kind: preset.kind, text: finalText, placeName: finalPlace, autoPlace: false });
       setSentTo(namesOf(to, state.contacts));
     } catch (e) {
       notice('Nicht gesendet', e instanceof Error ? e.message : String(e));
@@ -149,9 +154,17 @@ export default function CheckinScreen() {
             hint={
               preset.vacation
                 ? undefined
-                : 'Leer lassen: Wenn du gerade an einem deiner gespeicherten Orte bist, wird dessen Name mitgeschickt.'
+                : 'Leer lassen: Bist du gerade an einem deiner Orte, kannst du ihn mitschicken – wenn alle, an die es geht, ihn sehen dürfen.'
             }
           />
+          {herePlace ? (
+            <Toggle
+              label="Ort mitschicken"
+              detail={`Du bist gerade hier: „${herePlace}“. Alle, an die es geht, dürfen diesen Ort sehen.`}
+              value={placeOn}
+              onChange={setPlaceOn}
+            />
+          ) : null}
           <Field
             label={preset.kind === 'custom' ? 'Deine Nachricht' : 'Nachricht (optional)'}
             value={text}

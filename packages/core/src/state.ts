@@ -43,7 +43,29 @@ export interface Group {
   members: GroupMember[];
   version: number;
   updatedAt: number;
+  /**
+   * Over for me: the owner took me off, or I left when I removed the owner as a contact. Kept
+   * (hidden, with the owner alone as roster) for its version, so an older roster relays hand over
+   * late cannot bring me back, while the owner adding me again can. Groups that were dissolved or
+   * that I left myself go to `leftGroups` instead.
+   */
   dissolved?: boolean;
+}
+
+/**
+ * At most `max` groups, as many as my other devices take in a sync: hidden copies of groups I
+ * was taken off (`Group.dissolved`) give way first, oldest first.
+ */
+export function capGroups(groups: Group[], max: number): Group[] {
+  const over = groups.length - max;
+  if (over <= 0) return groups;
+  const drop = new Set(
+    groups
+      .filter((g) => g.dissolved)
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(0, over),
+  );
+  return groups.filter((g) => !drop.has(g));
 }
 
 /** A standing "see my location" share with one contact. */
@@ -74,7 +96,12 @@ export interface MyWatch {
   label: string;
   dueAt: number;
   startedAt: number;
-  /** Ended automatically when this trip arrives. */
+  /**
+   * When it last started or moved, on this device or the one that told me (sender's clock), so
+   * an older copy from another of my devices does not bring back an earlier deadline.
+   */
+  changedAt?: number;
+  /** Ended automatically when this trip arrives (only on the device running the trip). */
   tripId?: string;
 }
 
