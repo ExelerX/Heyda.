@@ -101,12 +101,29 @@ const NOTIFICATION_TEXT: Record<string, { title: string; body: string }> = {
 };
 
 /**
+ * Runs one call at a time with the latest input. Each call waits for the OS several times; two
+ * calls side by side could both start tracking (one watch never removed), or a call for "low"
+ * could start tracking after a later "off" had already stopped it.
+ */
+function latestOnly<I, O>(apply: (input: I) => Promise<O>, fallback: O): (input: I) => Promise<O> {
+  let latest: I;
+  let queue: Promise<O> = Promise.resolve(fallback);
+  return (input) => {
+    latest = input;
+    queue = queue.catch(() => fallback).then(() => apply(latest));
+    return queue;
+  };
+}
+
+/**
  * Runs the location tracking the core asks for: precise and frequent during a trip,
  * an SOS or a precise live share; rare and coarse for an area-only live share; otherwise none.
  * With "always" access it keeps running in the background with a visible notification
  * (Android) or the blue pill (iOS); otherwise only while the app is open.
  */
-export async function applyLocationNeeds(needs: LocationNeeds): Promise<LocationAccess> {
+export const applyLocationNeeds = latestOnly(applyNeedsNow, 'denied' as LocationAccess);
+
+async function applyNeedsNow(needs: LocationNeeds): Promise<LocationAccess> {
   if (!locationSupported) return 'denied';
   const access = await currentLocationAccess();
   if (needs.mode === currentMode && (needs.mode === 'off' || foregroundWatch || (await isTracking()))) return access;
@@ -155,7 +172,9 @@ export async function freshFix(): Promise<void> {
 }
 
 /** Hands my places to the OS, which watches them even while the app is closed. */
-export async function registerGeofences(places: Place[]): Promise<void> {
+export const registerGeofences = latestOnly(registerGeofencesNow, undefined);
+
+async function registerGeofencesNow(places: Place[]): Promise<void> {
   if (!locationSupported) return;
   const running = await Location.hasStartedGeofencingAsync(GEOFENCE_TASK);
   if (!places.length || (await currentLocationAccess()) !== 'always') {

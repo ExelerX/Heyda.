@@ -44,9 +44,18 @@ if (isNative) {
     },
   });
   Notifications.addNotificationResponseReceivedListener((response) => {
-    const data = (response.notification.request.content.data ?? {}) as Record<string, unknown>;
-    const id = typeof data.alertId === 'string' ? data.alertId : response.notification.request.identifier;
-    openListeners.forEach((l) => l(id, data));
+    // No screen to open yet (cold start, or the app restarting): takeLaunchNotification() hands it on.
+    if (!openListeners.size) return;
+    const tap = takeTap(response);
+    if (!tap) return;
+    // Expo keeps every tap as the "last response"; left there, the next takeLaunchNotification()
+    // (after a restore, a link or the demo) would open this old screen again.
+    try {
+      Notifications.clearLastNotificationResponse();
+    } catch {
+      // Not available: takeTap() still never opens the same tap twice.
+    }
+    openListeners.forEach((l) => l(tap.alertId, tap.data));
   });
 }
 desktop?.onNotificationClick((id) => openListeners.forEach((l) => l(id, {})));
@@ -67,15 +76,26 @@ export function onNotificationOpen(listener: (alertId: string, data: Record<stri
   return () => openListeners.delete(listener);
 }
 
-/** The notification that launched the app from a cold start, once. */
+/** The tap opened last. Expo can report one tap twice: as the launch response and as an event. */
+let lastTap: string | undefined;
+
+function takeTap(response: Notifications.NotificationResponse): { alertId: string; data: Record<string, unknown> } | undefined {
+  const { request, date } = response.notification;
+  const key = `${request.identifier}|${date}|${response.actionIdentifier}`;
+  if (key === lastTap) return undefined;
+  lastTap = key;
+  const data = (request.content.data ?? {}) as Record<string, unknown>;
+  const alertId = typeof data.alertId === 'string' ? data.alertId : request.identifier;
+  return { alertId, data };
+}
+
+/** A tap not opened yet: the one that launched the app, or one made while the app was restarting. */
 export function takeLaunchNotification(): { alertId: string; data: Record<string, unknown> } | undefined {
   if (!isNative) return undefined;
   const response = Notifications.getLastNotificationResponse();
   if (!response) return undefined;
   Notifications.clearLastNotificationResponse();
-  const data = (response.notification.request.content.data ?? {}) as Record<string, unknown>;
-  const alertId = typeof data.alertId === 'string' ? data.alertId : response.notification.request.identifier;
-  return { alertId, data };
+  return takeTap(response);
 }
 
 export function setOpenThread(thread: string | undefined): void {
@@ -190,6 +210,24 @@ function nid(id: string): string {
 }
 
 /**
+ * The native calls for one alarm, one after another. Each call waits for the OS several times
+ * (permission, channel), so without this a cancel that follows a schedule closely (a watch and
+ * its end arriving together after the phone was offline) would reach the OS first, and the
+ * alarm would ring later for a watch that had already ended.
+ */
+const alarmCalls = new Map<string, Promise<void>>();
+
+function inOrder(identifier: string, call: () => Promise<void>): Promise<void> {
+  const run = (alarmCalls.get(identifier) ?? Promise.resolve()).then(call);
+  const done = run.catch(() => {});
+  alarmCalls.set(identifier, done);
+  void done.then(() => {
+    if (alarmCalls.get(identifier) === done) alarmCalls.delete(identifier);
+  });
+  return run;
+}
+
+/**
  * Shows an alert by its level. In the open app a banner (and for alarms the alarm screen);
  * in the background a system notification. `feed` alerts only go to the activity list.
  */
@@ -235,13 +273,16 @@ export async function scheduleAlarm(alarm: Alarm, onDesktopFire?: (alarm: Alarm)
     );
     return;
   }
-  if (!(await notificationsAllowed())) return;
-  await Notifications.cancelScheduledNotificationAsync(nid(alarm.id)).catch(() => {});
-  if (alarm.at <= Date.now()) return;
-  await Notifications.scheduleNotificationAsync({
-    identifier: nid(alarm.id),
-    content: content(alarm.title, alarm.body, alarm.level, { alertId: alarm.id }),
-    trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: alarm.at, channelId: await channelFor(alarm.level) },
+  const identifier = nid(alarm.id);
+  return inOrder(identifier, async () => {
+    if (!(await notificationsAllowed())) return;
+    await Notifications.cancelScheduledNotificationAsync(identifier).catch(() => {});
+    if (alarm.at <= Date.now()) return;
+    await Notifications.scheduleNotificationAsync({
+      identifier,
+      content: content(alarm.title, alarm.body, alarm.level, { alertId: alarm.id }),
+      trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: alarm.at, channelId: await channelFor(alarm.level) },
+    });
   });
 }
 
@@ -250,8 +291,35 @@ export async function cancelAlarm(id: string): Promise<void> {
   if (t) clearTimeout(t);
   desktopTimers.delete(id);
   if (!isNative) return;
-  await Notifications.cancelScheduledNotificationAsync(nid(id)).catch(() => {});
-  await Notifications.dismissNotificationAsync(nid(id)).catch(() => {});
+  const identifier = nid(id);
+  return inOrder(identifier, async () => {
+    await Notifications.cancelScheduledNotificationAsync(identifier).catch(() => {});
+    await Notifications.dismissNotificationAsync(identifier).catch(() => {});
+  });
+}
+
+/** Alarm ids as the OS knows them: only these are ever pruned. */
+const ALARM_PREFIXES = [nid('watch:'), nid('mywatch:')];
+
+/**
+ * Cancels alarms the OS still holds but the app no longer knows, e.g. from before a restore, a
+ * link or the demo, or because the app was closed between the two. `known` returns undefined
+ * when its list may be incomplete; then nothing is touched.
+ */
+export async function pruneAlarms(known: () => readonly Alarm[] | undefined): Promise<void> {
+  if (!isNative || desktop) return;
+  const pending = await Notifications.getAllScheduledNotificationsAsync().catch(() => []);
+  const stale = pending.map((n) => n.identifier).filter((id) => ALARM_PREFIXES.some((p) => id.startsWith(p)));
+  await Promise.all(
+    stale.map((identifier) =>
+      inOrder(identifier, async () => {
+        // Checked only now: the alarm may have been scheduled again while the list was read.
+        const list = known();
+        if (!list || list.some((a) => nid(a.id) === identifier)) return;
+        await Notifications.cancelScheduledNotificationAsync(identifier).catch(() => {});
+      }),
+    ),
+  );
 }
 
 export async function setBadge(count: number): Promise<void> {

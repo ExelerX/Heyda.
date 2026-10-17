@@ -32,7 +32,7 @@ import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport, type SeenSnapshot } fr
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
 import { DEMO_KEYS, startDemoFriends } from './demo';
-import { cancelAlarm, deliverAlert, scheduleAlarm, setBadge, setOpenThread as setNotificationThread, showToast } from './notifications';
+import { cancelAlarm, deliverAlert, pruneAlarms, scheduleAlarm, setBadge, setOpenThread as setNotificationThread, showToast } from './notifications';
 import { desktop, deviceLabel, isBrowserPreview, isDesktop } from './platform';
 import type { Appearance } from './theme';
 import { DesktopVault, EncryptedFileVault, MemoryVault, type Vault } from './vault';
@@ -121,6 +121,7 @@ const MAX_CHAT_PER_THREAD = 500;
 const MAX_CHAT_CHARS_PER_THREAD = 400_000;
 const MAX_CHAT_CHARS_TOTAL = 3_000_000;
 const MAX_ACTIVITY = 300;
+const MAX_ALARMS = 100;
 const MAX_ACTIVITY_TITLE = 200;
 const MAX_ACTIVITY_BODY = 600;
 const DATA_FILE = 'app-data';
@@ -255,7 +256,7 @@ export class AppRuntime {
           break;
         }
         case 'alarm.schedule':
-          this.data.alarms = [...this.data.alarms.filter((a) => a.id !== e.alarm.id), e.alarm].slice(-100);
+          this.data.alarms = [...this.data.alarms.filter((a) => a.id !== e.alarm.id), e.alarm].slice(-MAX_ALARMS);
           void scheduleAlarm(e.alarm, (a) => this.fireDesktopAlarm(a)).catch(() => {});
           this.changed();
           break;
@@ -331,17 +332,26 @@ export class AppRuntime {
     if (this.startDemo) this.stopDemo = this.startDemo(this.node);
     // Alarms of the Windows app only live while it runs: re-arm them.
     if (isDesktop) for (const a of this.data.alarms) void scheduleAlarm(a, (x) => this.fireDesktopAlarm(x));
+    // Phone alarms the OS kept from before (a restore, a link, the demo) that this data no longer
+    // knows would ring for nothing. A full list may have lost old entries: then none are touched.
+    else void pruneAlarms(() => (this.disposed || this.data.alarms.length >= MAX_ALARMS ? undefined : this.data.alarms)).catch(() => {});
+    this.tickTimer = setInterval(() => void this.tick(), TICK_MS);
+    // Not awaited: sending what waited in the outbox can take a while on a slow network, and the
+    // screens (the SOS button too) and background tasks such as an iOS geofence wake must not wait.
+    void this.firstRound();
+    if (!this.isDemo) {
+      this.hooks.onLocationNeeds(this.node.locationNeeds());
+      this.hooks.onPlacesChange(this.data.state.places);
+    }
+  }
+
+  private async firstRound(): Promise<void> {
     if (this.data.announceLinked) {
       this.data.announceLinked = false;
       await this.node.announceLinked().catch(() => {});
       this.changed();
     }
-    this.tickTimer = setInterval(() => void this.tick(), TICK_MS);
-    await this.tick();
-    if (!this.isDemo) {
-      this.hooks.onLocationNeeds(this.node.locationNeeds());
-      this.hooks.onPlacesChange(this.data.state.places);
-    }
+    if (!this.disposed) await this.tick();
   }
 
   /** Housekeeping: expiring shares, overdue alarms, outbox retries. Also called when the app wakes up. */
@@ -635,27 +645,46 @@ export class AppRuntime {
     this.changed();
   }
 
+  /**
+   * Leaving the demo: removes Lisa, Max and Oma Ilse and what belongs to them (also groups,
+   * watches and an SOS made with them in the demo), nothing else. Statuses need nothing here:
+   * the next start keeps only those of contacts.
+   */
   private removeDemoData(): void {
-    const isDemo = (k: string) => DEMO_KEYS.includes(k);
+    const demo = new Set(DEMO_KEYS);
     const mentionsDemo = (r: Rule) => DEMO_KEYS.some((k) => JSON.stringify(r).includes(k));
     const s = this.data.state;
+    const groups = s.groups.flatMap((g) => {
+      if (demo.has(g.owner)) return [];
+      if (!g.members.some((m) => demo.has(m.key))) return [g];
+      const members = g.members.filter((m) => !demo.has(m.key));
+      return members.some((m) => m.key !== s.self.key) ? [{ ...g, members }] : [];
+    });
+    const goneThreads = new Set([...DEMO_KEYS, ...s.groups.filter((g) => !groups.some((x) => x.id === g.id)).map((g) => `g:${g.id}`)]);
+    const watches = s.watches.filter((w) => !w.recipients.some((k) => demo.has(k)));
+    const goneWatches = s.watches.filter((w) => !watches.includes(w)).map((w) => w.watchId);
     this.data.state = {
       ...s,
-      contacts: s.contacts.filter((c) => !isDemo(c.key)),
-      grants: s.grants.filter((g) => !isDemo(g.contactKey)),
+      contacts: s.contacts.filter((c) => !demo.has(c.key)),
+      grants: s.grants.filter((g) => !demo.has(g.contactKey)),
       rules: s.rules.filter((r) => !mentionsDemo(r)),
-      groups: [],
-      liveShares: [],
-      watches: [],
-      sos: undefined,
-      outbox: [],
+      groups,
+      liveShares: s.liveShares.filter((l) => !demo.has(l.contactKey)),
+      watches,
+      sos: s.sos?.recipients.some((k) => demo.has(k)) ? undefined : s.sos,
+      outbox: s.outbox.filter((e) => !demo.has(e.to)),
+      whereInbox: s.whereInbox.filter((w) => !demo.has(w.from)),
+      whereAsked: s.whereAsked.filter((w) => !demo.has(w.from)),
       places: s.places.filter((p) => !p.id.startsWith('demo-')),
     };
-    this.data.chats = {};
-    this.data.unread = {};
-    this.data.statuses = {};
-    this.data.activity = [];
-    this.data.alarms = [];
+    this.data.chats = Object.fromEntries(Object.entries(this.data.chats).filter(([t]) => !goneThreads.has(t)));
+    this.data.unread = Object.fromEntries(Object.entries(this.data.unread).filter(([t]) => !goneThreads.has(t)));
+    this.data.activity = this.data.activity.filter(
+      (a) => !(a.from && demo.has(a.from)) && !(a.thread && goneThreads.has(a.thread)) && !(a.ref?.sosOwner && demo.has(a.ref.sosOwner)),
+    );
+    const goneAlarm = (id: string) => DEMO_KEYS.some((k) => id.startsWith(`watch:${k}:`)) || goneWatches.some((w) => id.startsWith(`mywatch:${w}:`));
+    for (const a of this.data.alarms) if (goneAlarm(a.id)) void cancelAlarm(a.id).catch(() => {});
+    this.data.alarms = this.data.alarms.filter((a) => !goneAlarm(a.id));
     this.data.trip = undefined;
   }
 

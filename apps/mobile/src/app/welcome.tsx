@@ -1,14 +1,15 @@
 import type { LinkPayload } from '@heyda/core';
 import * as Clipboard from 'expo-clipboard';
-import { router } from 'expo-router';
+import { Redirect, router } from 'expo-router';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { BackHandler, Platform, Pressable, Text, View } from 'react-native';
 import { QrCode } from '../components/QrCode';
 import { Banner, Bullet, Digits, errorText, Field, MONO, Narrow, Step } from '../components/setup/kit';
 import { RestoreFlow } from '../components/setup/RestoreFlow';
 import { Button, Card, Pill, Row, Screen, T, Toggle } from '../components/ui';
-import { notice } from '../lib/confirm';
+import { confirm, notice } from '../lib/confirm';
 import { isIgnoringBatteryOptimizations, keepAliveSupported, openBatteryOptimizationSettings } from '../lib/keepalive';
+import { DEMO_KEYS } from '../lib/demo';
 import { beginLinkReceive, completeLink, type LinkSession } from '../lib/link';
 import { locationSupported, requestLocationAccess, type LocationAccess } from '../lib/location';
 import { notificationsAllowed, setupNotifications } from '../lib/notifications';
@@ -31,7 +32,7 @@ const NAME_MAX = 40;
 /** Onboarding: a short intro, then start fresh, link to another device, restore a backup or try the demo. */
 export default function Welcome() {
   const runtime = useRuntime();
-  const { state } = useSnapshot();
+  const { state, settings, isDemo } = useSnapshot();
   const [step, setStep] = useState<StepName>('intro');
   const [name, setName] = useState(() => (state.self.name && state.self.name !== 'Ich' ? state.self.name : ''));
 
@@ -46,6 +47,10 @@ export default function Welcome() {
     });
     return () => sub.remove();
   }, [step]);
+
+  // A set-up account never comes back here (a link could open this screen): restoring a backup
+  // lives under Sicherung, and the demo is not something to switch a real account to by accident.
+  if (settings.onboarded && !isDemo) return <Redirect href="/" />;
 
   const back = BACK[step];
   return (
@@ -194,6 +199,20 @@ function Choose({ onPick }: { onPick: (s: StepName) => void }) {
   const [busy, setBusy] = useState(false);
 
   async function startDemo() {
+    const s = runtime.getSnapshot().state;
+    // Left over after ending the demo, or an account restored or linked but not finished here.
+    const real = s.contacts.some((c) => !DEMO_KEYS.includes(c.key)) || s.devices.some((d) => d.deviceId !== s.self.deviceId);
+    if (
+      real &&
+      !runtime.isDemo &&
+      !(await confirm({
+        title: 'Demo starten?',
+        message: 'Solange die Demo läuft, ist dein Konto offline: Nachrichten, Notrufe und „Pass auf mich auf“ kommen weder bei dir noch bei deinen Kontakten an.',
+        ok: 'Demo starten',
+      }))
+    ) {
+      return;
+    }
     setBusy(true);
     try {
       runtime.finishOnboarding();
