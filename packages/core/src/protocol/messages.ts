@@ -162,7 +162,11 @@ export const SosUpdateMessage = msg('sos.update', {
 
 export const SosEndMessage = msg('sos.end', {
   sosId: id,
-  reason: z.enum(['safe', 'cancelled']),
+  /**
+   * `removed`: the sender removed me as a contact while the alert ran. It says nothing about the
+   * emergency itself, only that no more updates come. Older versions drop such an end.
+   */
+  reason: z.enum(['safe', 'cancelled', 'removed']),
 });
 
 /** "I'm taking care of it." Sent to the person in need and to the other helpers. */

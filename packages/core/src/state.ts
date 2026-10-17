@@ -170,14 +170,20 @@ export interface NodeState {
   /** Groups I left, so a late roster update does not add me back. */
   leftGroups: { id: string; at: number }[];
   /**
+   * Synced: the device that sends what automations send to others ("Automationen senden von").
+   * Absent, or naming a device not in my list: the usual rule (see `SocialNode.runsAutomationActions`).
+   */
+  automationDevice?: string;
+  /**
    * When this device got the account (linked or restored from a backup). Relays still hold the
-   * days before: those messages fill in chats and statuses but ring and trigger nothing, since my
-   * other device (or the old phone) already handled them. Absent on a device that created the account.
+   * days before: what the first catch-up hands over from before fills in chats and statuses but
+   * rings and triggers nothing, since my other device (or the old phone) already handled it.
+   * Cleared once that catch-up is in. Absent on a device that created the account.
    */
   historyBefore?: number;
 }
 
-export type SyncField = 'profile' | 'places' | 'grants' | 'rules' | 'prefs' | 'sosMessage' | 'status';
+export type SyncField = 'profile' | 'places' | 'grants' | 'rules' | 'prefs' | 'sosMessage' | 'status' | 'automationDevice';
 
 /** What a contact currently shares with me. */
 export interface ContactStatus {
@@ -219,7 +225,8 @@ export interface ContactStatus {
     others: { key: ContactKey; name: string }[];
     acks: { key: ContactKey; name: string; at: number; text?: string }[];
     endedAt?: number;
-    endReason?: 'safe' | 'cancelled';
+    /** `removed`: they removed me as a contact, so no more updates come; the emergency may go on. */
+    endReason?: 'safe' | 'cancelled' | 'removed';
     /** The sender's clock of the newest message of this alert, and of the newest start (sent again when pressed again). */
     lastSentAt?: number;
     startSentAt?: number;
@@ -305,6 +312,8 @@ export function createInitialState(self: {
   return normalizeState({ self } as Partial<NodeState> & Pick<NodeState, 'self'>);
 }
 
+const DEVICE_ID = /^[A-Za-z0-9_-]{8,32}$/;
+
 /** Fills in fields that older saved data may lack, so loading never crashes. */
 export function normalizeState(s: Partial<NodeState> & Pick<NodeState, 'self'>): NodeState {
   const arr = <T>(v: T[] | undefined): T[] => (Array.isArray(v) ? v : []);
@@ -330,6 +339,7 @@ export function normalizeState(s: Partial<NodeState> & Pick<NodeState, 'self'>):
     syncRev: s.syncRev ?? {},
     removedContacts: arr(s.removedContacts),
     leftGroups: arr(s.leftGroups),
+    ...(typeof s.automationDevice === 'string' && DEVICE_ID.test(s.automationDevice) ? { automationDevice: s.automationDevice } : {}),
     ...(typeof s.historyBefore === 'number' && Number.isFinite(s.historyBefore) ? { historyBefore: s.historyBefore } : {}),
   };
 }

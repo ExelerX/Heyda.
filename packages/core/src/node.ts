@@ -1,6 +1,6 @@
 import { AutomationEngine, systemLocalTime, type ActionIntent, type AutomationEvent, type LocalTime } from './automation/engine';
 import type { Rule } from './automation/schema';
-import { checkinText, pingText } from './features/labels';
+import { checkinText, pingText, sosEndText } from './features/labels';
 import { isLiveShareActive, isSosLocationActive, LIVE_CADENCE, LiveTracker, SOS_CADENCE, SOS_LOCATION_MS } from './features/live';
 import { CLOCK_TOLERANCE_MS, normalizeFix, normalizeFixes } from './geo/fix';
 import { GeofenceTracker, type Place } from './geo/geofence';
@@ -155,7 +155,10 @@ const OFFLINE_AFTER_FAILURES = 3;
 
 /** Messages sent this long before this device got the account still count as new: senders' clocks differ a little. */
 const HISTORY_MARGIN_MS = 5 * 60_000;
-/** An open SOS sent before this device got the account rings this long after it came, unless its end follows. */
+/**
+ * An open SOS sent before this device got the account rings once the first catch-up is in, unless
+ * its end came with it. If the transport never reports that, it rings this long after it came.
+ */
 const HISTORY_SOS_WAIT_MS = 2 * 60_000;
 /** How long a contact's SOS that was never ended is kept. */
 const SOS_KEEP_MS = 3 * DAY;
@@ -259,6 +262,13 @@ export class SocialNode {
    * must raise alerts and start automations before their first `await` (they all do).
    */
   private replaying = false;
+  /**
+   * True from `start()` on a device that just got the account until the transport reports its
+   * first catch-up done (see `endHistory`): only what arrives meanwhile can be history. What comes
+   * later is news, also when it was sent before (the sender was offline, or their clock lags).
+   * A transport that cannot tell keeps it open; then only the send time decides.
+   */
+  private historyOpen = false;
 
   constructor(private readonly options: SocialNodeOptions) {
     this.state = JSON.parse(JSON.stringify(options.initialState)) as NodeState;
@@ -291,6 +301,7 @@ export class SocialNode {
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    this.historyOpen = this.state.historyBefore !== undefined;
     this.unsubscribe = this.transport.onMessage((m) => {
       this.handleIncoming(m).catch(() => {
         // One bad message must never stop the others.
@@ -340,6 +351,25 @@ export class SocialNode {
       if (!this.running) return;
       this.ringMissed(this.now());
     });
+    // Only the transport saying so ends the history, also when it says so after the wait.
+    caughtUp.then(
+      () => {
+        if (run === this.runs && this.running) this.endHistory();
+      },
+      () => {},
+    );
+  }
+
+  /**
+   * The first catch-up after this device got the account is in: from now on everything is news,
+   * also on later starts. An SOS from before that is still open (its end would have come with the
+   * catch-up) rings now, once; overdue watches from before ring as usual (`checkOverdueWatches`).
+   */
+  private endHistory(): void {
+    if (!this.historyOpen) return;
+    this.historyOpen = false;
+    if (this.state.historyBefore !== undefined) this.update({ historyBefore: undefined });
+    this.ringHeldSos(this.now(), true);
   }
 
   /** Watches overdue and held SOS alerts whose wait is over: they ring now. */
@@ -611,8 +641,8 @@ export class SocialNode {
 
     let sos = this.state.sos;
     if (sos?.recipients.includes(key)) {
-      // The protocol knows no "removed": "cancelled" is the end that claims the least.
-      ends.push({ body: { type: 'sos.end', sosId: sos.sosId, reason: 'cancelled' }, ttl: TTL.sos });
+      // Not "cancelled": they must not take it as the emergency being over, only as no more updates.
+      ends.push({ body: { type: 'sos.end', sosId: sos.sosId, reason: 'removed' }, ttl: TTL.sos });
       const recipients = sos.recipients.filter((k) => k !== key);
       sos = recipients.length ? { ...sos, recipients, acks: sos.acks.filter((a) => a.key !== key) } : undefined;
     }
@@ -1290,12 +1320,15 @@ export class SocialNode {
   /**
    * Whether automations set off by contacts may act here beyond notifications: send messages,
    * pings and check-ins, start a trip, set my status or a shared quiet mode. Every device of my
-   * account gets the same messages and has the same rules, so only one kind of device does this,
-   * or contacts would get everything once per device. A phone always does; a computer only when
-   * none of my other devices is a phone or might be one (not told yet, e.g. an older version).
+   * account gets the same messages and has the same rules, so only one device should do this, or
+   * contacts would get everything once per device. The device I chose (`automationDevice`) does,
+   * and only it. Without a choice the usual rule: a phone always does; a computer only when none
+   * of my other devices is a phone or might be one (not told yet, e.g. an older version).
    * Notifications show on every device; rules on my own arrival run where my location is.
    */
   get runsAutomationActions(): boolean {
+    const chosen = this.automationDevice;
+    if (chosen !== undefined) return chosen === this.state.self.deviceId;
     if (this.deviceKind === 'phone') return true;
     const self = this.state.self.deviceId;
     return this.state.devices.every((d) => d.deviceId === self || d.kind === 'computer');
@@ -1446,6 +1479,26 @@ export class SocialNode {
   /** Forgets a device in the list. Its copy of the account keeps working until it is reset there. */
   removeDevice(deviceId: string): void {
     this.update({ devices: this.state.devices.filter((d) => d.deviceId !== deviceId) });
+    // It sent what automations send: my other devices go back to the usual rule, not to nobody.
+    if (this.state.automationDevice === deviceId) this.update({ automationDevice: undefined }, ['automationDevice']);
+  }
+
+  /**
+   * The device chosen to send what automations send to others ("Automationen senden von"), if it
+   * is this one or one in my list. Undefined: the usual rule decides (see `runsAutomationActions`).
+   */
+  get automationDevice(): string | undefined {
+    const id = this.state.automationDevice;
+    return id !== undefined && (id === this.state.self.deviceId || this.state.devices.some((d) => d.deviceId === id)) ? id : undefined;
+  }
+
+  /** Chooses the device that sends what automations send (synced to my other devices); `undefined`: the usual rule. */
+  setAutomationDevice(deviceId: string | undefined): void {
+    if (deviceId !== undefined && deviceId !== this.state.self.deviceId && !this.state.devices.some((d) => d.deviceId === deviceId)) {
+      throw new RangeError('Dieses Gerät gibt es nicht mehr.');
+    }
+    if (deviceId === this.state.automationDevice) return;
+    this.update({ automationDevice: deviceId }, ['automationDevice']);
   }
 
   /** Sends my settings to my other devices now, if something changed. */
@@ -1567,11 +1620,14 @@ export class SocialNode {
    * Whether this device acts on a message from `from` at all. Only contacts can reach it;
    * group members who are not my contacts may write in a group whose owner is me or still a
    * contact of mine (the owner vouches for them), and leave a group I own. An owner I removed
-   * as a contact can only let me go. A stranger may answer a QR code I showed.
-   * A transport can call this to keep strangers' messages out of its list of processed ones.
+   * as a contact can only let me go. A stranger may answer a QR code I showed. A contact's message
+   * that needs something not here yet is turned down for now (see `waitsForState`).
+   * A transport can call this to keep strangers' messages out of its list of processed ones, and
+   * hands on again what it turned down once contacts, groups or SOS alerts change (`redeliverRefused`).
    */
   acceptsMessage(from: ContactKey, message: AppMessage): boolean {
-    if (from === this.state.self.key || this.contact(from)) return true;
+    if (from === this.state.self.key) return true;
+    if (this.contact(from)) return !this.waitsForState(from, message);
     switch (message.type) {
       case 'hello':
         return message.inviteNonce !== undefined && this.state.openInvites.some((i) => i.nonce === message.inviteNonce);
@@ -1594,6 +1650,48 @@ export class SocialNode {
       default:
         return false;
     }
+  }
+
+  /**
+   * Whether a contact's message depends on something that may still be on its way: relays hand
+   * stored messages over in any order. Taken now, it would be dropped and count as handled, so it
+   * would never come back. Turned down, the transport holds it and offers it again later:
+   * - a group message before the roster that makes its sender a member (owner me or a contact);
+   * - someone leaving a group this device does not know yet (my other device's sync may bring it);
+   * - an SOS update or a helper's "Ich kümmere mich" before the SOS itself.
+   * What can never become valid (a group I left, an SOS that ended or was replaced) is taken and dropped.
+   */
+  private waitsForState(from: ContactKey, m: AppMessage): boolean {
+    const me = this.state.self.key;
+    switch (m.type) {
+      case 'group.text': {
+        if (this.leftForGood(m.groupId)) return false;
+        const owner = this.group(m.groupId)?.owner;
+        return !(this.isMember(m.groupId, from) && owner !== undefined && (owner === me || !!this.contact(owner)));
+      }
+      case 'group.leave':
+        return !this.group(m.groupId) && !this.leftForGood(m.groupId);
+      case 'sos.update':
+        return this.sosNotHereYet(from, m.sosId, m.sentAt);
+      case 'sos.ack':
+        return m.owner !== me && this.sosNotHereYet(m.owner, m.sosId, m.sentAt);
+      default:
+        return false;
+    }
+  }
+
+  /** A group I left myself: nothing for it is ever shown again (see `onGroupUpdate`). */
+  private leftForGood(groupId: string): boolean {
+    return !this.group(groupId) && this.state.leftGroups.some((g) => g.id === groupId);
+  }
+
+  /** Whether `owner`'s SOS `sosId` may still arrive: not here, not ended, and not older than the one I have. */
+  private sosNotHereYet(owner: ContactKey, sosId: string, sentAt: number): boolean {
+    if (this.ended.has(`sos|${owner}|${sosId}`)) return false;
+    const sos = this.statuses.get(owner)?.sos;
+    if (sos?.sosId === sosId) return false;
+    const now = this.now();
+    return !(sos && isOlder(senderTime(sentAt, now), sos.lastSentAt, now));
   }
 
   private async handleIncoming({ from, message }: IncomingMessage): Promise<void> {
@@ -1620,13 +1718,14 @@ export class SocialNode {
   }
 
   /**
-   * Whether a message was sent before this device got the account (see `NodeState.historyBefore`).
+   * Whether a message is history (see `NodeState.historyBefore`): it arrives during the first
+   * catch-up after this device got the account (`historyOpen`) and was sent before that moment.
    * Never while my clock reads earlier than that moment: it was set back since, and every message
    * would look old.
    */
   private isHistory(sentAt: number, at: number): boolean {
     const before = this.state.historyBefore;
-    return before !== undefined && before <= at + CLOCK_TOLERANCE_MS && senderTime(sentAt, at) < before - HISTORY_MARGIN_MS;
+    return this.historyOpen && before !== undefined && before <= at + CLOCK_TOLERANCE_MS && senderTime(sentAt, at) < before - HISTORY_MARGIN_MS;
   }
 
   private dispatch(from: ContactKey, message: AppMessage, at: number): Promise<void> | void {
@@ -1793,6 +1892,7 @@ export class SocialNode {
       prefs: doc.prefs,
       sosMessage: doc.sosMessage,
       status: doc.status,
+      automationDevice: doc.automationDevice,
       syncRev: doc.rev,
     };
     if (Object.keys(mergeSyncDoc(theirs, buildSyncDoc(this.state), now)).length) this.markSync();
@@ -1884,6 +1984,9 @@ export class SocialNode {
     const current = this.statuses.get(from)?.trip;
     const mine = current?.sessionId === m.sessionId;
     if (mine) this.setStatus(from, { trip: undefined });
+    // The end of an older trip, caught up late while a newer one runs: that one is not over, so
+    // no "angekommen" and no automation. (Its late start or updates stay ended all the same.)
+    else if (current && isOlder(senderTime(m.sentAt, at), current.lastSentAt, at)) return;
     if (m.reason === 'arrived') {
       this.alert({
         category: 'arrival',
@@ -2117,6 +2220,8 @@ export class SocialNode {
           ...(ringAt !== undefined ? { ringAt } : {}),
         },
       });
+      // Its updates and helpers' answers that came first were held back (see `waitsForState`).
+      if (!same) this.redeliverSoon();
       if (history || (same && prev.ringAt === undefined)) return;
       this.sosAlarm(from, m.sosId, m.text, m.point !== undefined, at);
       if (!same) await this.runAutomations({ type: 'contact.sos', contact: from, at });
@@ -2147,15 +2252,7 @@ export class SocialNode {
     this.setStatus(from, { sos: { ...ended, endedAt: at, endReason: m.reason } });
     // Its alarm never rang here (it came from before this device got the account): nothing to call off.
     if (ringAt !== undefined) return;
-    this.alert({
-      category: 'sos',
-      followUp: true,
-      title: m.reason === 'safe' ? `✅ ${this.name(from)} ist in Sicherheit` : `${this.name(from)} hat den Notruf abgebrochen`,
-      body: m.reason === 'safe' ? 'Der Notruf ist beendet.' : 'Es war wohl ein Versehen.',
-      from,
-      thread: from,
-      ref: { sosId: m.sosId, sosOwner: from },
-    });
+    this.alert({ category: 'sos', followUp: true, ...sosEndText(this.name(from), m.reason), from, thread: from, ref: { sosId: m.sosId, sosOwner: from } });
   }
 
   /** An SOS always rings. Only a flood of them from one person is turned down to a normal notification, which still nothing can switch off. */
@@ -2173,11 +2270,11 @@ export class SocialNode {
     });
   }
 
-  /** Rings an SOS sent before this device got the account once its wait is over and no end came. */
-  private ringHeldSos(now: number): void {
+  /** Rings an SOS sent before this device got the account once its wait is over (`all`: now) and no end came. */
+  private ringHeldSos(now: number, all = false): void {
     for (const [key, status] of [...this.statuses]) {
       const sos = status.sos;
-      if (sos?.ringAt === undefined || now < sos.ringAt || sos.endedAt !== undefined) continue;
+      if (sos?.ringAt === undefined || (!all && now < sos.ringAt) || sos.endedAt !== undefined) continue;
       const { ringAt: _rung, ...rest } = sos;
       this.setStatus(key, { sos: rest });
       this.sosAlarm(key, sos.sosId, sos.text, sos.point !== undefined, now);
@@ -2266,7 +2363,17 @@ export class SocialNode {
         if (meIn && !m.dissolved && !this.replaying) return this.sendTo(from, { type: 'group.leave', groupId: m.groupId }, TTL.chat).then(() => undefined);
         return;
       }
-      if (!meIn || m.dissolved || !this.contact(from) || this.liveGroups().length >= MAX_GROUPS) return;
+      if (!this.contact(from)) return;
+      if (!meIn || m.dissolved) {
+        // Taken off, or dissolved, before the roster that added me came (relays hand them over in
+        // any order): kept hidden with its version (see `Group.dissolved`), so that older roster
+        // cannot add me afterwards, while the owner adding me again still can.
+        const out: Group = { id: m.groupId, name: m.name, owner: from, members: m.members.filter((x) => x.key === from), version: m.version, updatedAt: this.now(), dissolved: true };
+        this.update({ groups: capGroups([...this.state.groups, out], MAX_GROUPS) });
+        this.markSync();
+        return;
+      }
+      if (this.liveGroups().length >= MAX_GROUPS) return;
       this.joinGroup(from, m, undefined);
       return;
     }
@@ -2657,7 +2764,8 @@ export class SocialNode {
 
   /**
    * Someone new may be accepted now (a contact from my other device's sync, a member from a group
-   * update): the transport hands on again what it turned away from them a moment ago. Deferred,
+   * update), or what waited for a group or an SOS alert (see `waitsForState`): the transport hands
+   * on again what it turned away a moment ago. Deferred,
    * so it never runs in the middle of handling the message that caused it.
    */
   private redeliverSoon(): void {

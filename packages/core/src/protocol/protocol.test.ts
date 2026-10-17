@@ -25,6 +25,13 @@ describe('protocol', () => {
     }
   });
 
+  it('ends an SOS for someone who was removed, and still reads the ends older versions send', () => {
+    for (const reason of ['safe', 'cancelled', 'removed'] as const) {
+      const m = composeMessage({ type: 'sos.end', sosId: 'sos-abcdefgh', reason }, 1);
+      expect(parseAppMessage(serializeAppMessage(m))).toEqual({ ok: true, message: m });
+    }
+  });
+
   it('rejects unknown types and extra fields', () => {
     const m = composeMessage({ type: 'chat.text', text: 'hi' });
     expect(parseAppMessage(JSON.stringify({ ...m, type: 'exec' })).ok).toBe(false);

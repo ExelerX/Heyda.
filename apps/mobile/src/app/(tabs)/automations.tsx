@@ -4,9 +4,9 @@ import { useMemo, useState } from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
 import { LIMITS_TEXT } from '../../components/automation/catalog';
 import { RuleCard, SmallAction, TemplateCard } from '../../components/automation/cards';
-import { Banner, Field, Narrow } from '../../components/setup/kit';
-import { Button, Card, Chip, Empty, Hint, Row, Screen, Section, T } from '../../components/ui';
-import { confirm } from '../../lib/confirm';
+import { Banner, errorText, Field, Narrow } from '../../components/setup/kit';
+import { Button, Card, Chip, Empty, Hint, Row, Screen, Section, T, Wrap } from '../../components/ui';
+import { confirm, notice } from '../../lib/confirm';
 import { useRuntime, useSnapshot } from '../../lib/store';
 import { CATEGORY_ICON, CATEGORY_TEXT, groupTemplates, TIPS } from '../../lib/templates-ui';
 import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
@@ -14,7 +14,7 @@ import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
 export default function Automations() {
   const t = useTheme();
   const runtime = useRuntime();
-  const { state, templates, plugins, automationsActHere } = useSnapshot();
+  const { state, templates, plugins, automationsActHere, automationDevice } = useSnapshot();
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<RuleTemplate['category']>();
   const [tipIndex, setTipIndex] = useState(() => new Date().getDate() % TIPS.length);
@@ -26,6 +26,20 @@ export default function Automations() {
   );
   const pluginOf = (tpl: RuleTemplate) => plugins.find((p) => p.templates.some((x) => x.id === tpl.id))?.name;
   const rules = [...state.rules].sort((a, b) => Number(b.enabled) - Number(a.enabled));
+  // Only one device sends what automations send to others; with more than one, I choose which.
+  const devices = [
+    { deviceId: state.self.deviceId, name: state.self.deviceName, here: true },
+    ...state.devices.filter((d) => d.deviceId !== state.self.deviceId).map((d) => ({ deviceId: d.deviceId, name: d.name, here: false })),
+  ];
+  const sender = devices.find((d) => d.deviceId === automationDevice);
+
+  function chooseSender(deviceId: string | undefined) {
+    try {
+      runtime.node.setAutomationDevice(deviceId);
+    } catch (e) {
+      notice('Das hat nicht geklappt', errorText(e));
+    }
+  }
 
   async function deleteRule(rule: Rule) {
     const ok = await confirm({ title: `„${rule.name}“ löschen?`, message: 'Die Automation ist dann weg. Du kannst sie jederzeit neu einrichten.', ok: 'Löschen', destructive: true });
@@ -48,11 +62,25 @@ export default function Automations() {
         <T variant="muted">Kleine Helfer, die von selbst etwas tun. Sie laufen nur auf deinem Gerät und tun nur, was der Satz sagt.</T>
 
         {!automationsActHere && (
-          <Banner tone="info" icon="💻" title="Dein Handy übernimmt">
+          <Banner tone="info" icon={sender ? '📤' : '💻'} title={sender ? `„${sender.name}“ übernimmt` : 'Dein Handy übernimmt'}>
             <T variant="small" color={t.text}>
-              Hier zeigen Automationen nur Hinweise an. Was an andere geht, schickt dein Handy, damit nichts doppelt ankommt.
+              {`Hier zeigen Automationen nur Hinweise an. Was an andere geht, schickt ${sender ? `„${sender.name}“` : 'dein Handy'}, damit nichts doppelt ankommt.`}
             </T>
           </Banner>
+        )}
+
+        {devices.length > 1 && (
+          <Section title="Von welchem Gerät?">
+            <T>{`Automationen senden von: ${sender ? (sender.here ? `${sender.name} (dieses Gerät)` : sender.name) : 'automatisch'}`}</T>
+            <T variant="small">Was an andere geht, schickt nur ein Gerät, damit nichts doppelt ankommt. Hinweise siehst du überall.</T>
+            <Wrap>
+              <Chip label="Automatisch" selected={!sender} onPress={() => chooseSender(undefined)} />
+              {devices.map((d) => (
+                <Chip key={d.deviceId} label={d.here ? `${d.name} (hier)` : d.name} selected={sender?.deviceId === d.deviceId} onPress={() => chooseSender(d.deviceId)} />
+              ))}
+            </Wrap>
+            {!sender && <T variant="small">Automatisch heißt: Jedes Handy schickt. Ein PC nur, wenn es kein Handy gibt.</T>}
+          </Section>
         )}
 
         {!state.contacts.length && (

@@ -84,7 +84,8 @@ Zeit oder wenn du ihn ausschaltest; was gerade läuft, steht immer oben auf dem 
   (siehe unten); danach einmal neu installieren (vorher Sicherung machen).
 - **Windows ohne Zertifikat:** SmartScreen warnt beim ersten Start, bis ein Code-Signing-Zertifikat genutzt wird.
 - **iPhone-Verteilung** ohne Apple Developer Program (99 USD/Jahr) nur per Sideloading mit 7-Tage-Limit.
-- **Zwei Handys mit demselben Konto:** Automationen, die auf Kontakte reagieren, senden dann von beiden Handys.
+- **Zwei Handys mit demselben Konto:** Automationen, die auf Kontakte reagieren, senden dann von beiden Handys, bis du
+  unter *Automationen* bei „Von welchem Gerät?“ eines auswählst.
 - **Verlorenes Gerät:** Alle deine Geräte teilen eine Identität. „Gerät entfernen“ stoppt das Synchronisieren, kann
   ein gestohlenes Gerät aber nicht aussperren. Sag dann deinen Kontakten Bescheid und richte Heyda. neu ein.
 - **Keine Forward Secrecy** in v1: Wer einen Geräteschlüssel stiehlt, könnte alte, noch auf Relays liegende

@@ -248,6 +248,112 @@ describe('a device that just got the account (linked or restored)', () => {
   });
 });
 
+/** Like the relay transport: delivers at once, and says when its first catch-up is done (`finishCatchUp`). */
+function catchUpTransport(net: MemoryNetwork, key: string, now: () => number) {
+  const t = net.createTransport(key, now);
+  let finish!: () => void;
+  const done = new Promise<void>((resolve) => (finish = resolve));
+  return Object.assign(t, { caughtUp: () => done, finishCatchUp: () => finish() });
+}
+
+describe('a device that just got the account: its first catch-up', () => {
+  async function linkedPc() {
+    const w = world();
+    const relay = catchUpTransport(w.net, LISA, w.now);
+    const pc = w.make(LISA, 'Lisa', {
+      transport: relay,
+      initial: { ...state(LISA, 'Lisa', 'dev-pc-0001'), contacts: [contact(MAX, 'Max')], historyBefore: w.now() },
+    });
+    const got = alerts(pc);
+    await pc.start();
+    const caughtUp = async () => {
+      relay.finishCatchUp();
+      await flush();
+    };
+    return { ...w, pc, got, caughtUp, fromMax: w.forge(MAX) };
+  }
+
+  it('only what comes during it is history: a message written before the link that arrives later notifies', async () => {
+    const { pc, got, now, caughtUp, fromMax } = await linkedPc();
+    await fromMax(LISA, { type: 'chat.text', text: 'von gestern' }, now() - DAY);
+    expect(got).toEqual([]);
+    await caughtUp();
+    // Max wrote this before the link while he was offline; it reaches the relays only now.
+    await fromMax(LISA, { type: 'chat.text', text: 'aus dem Funkloch' }, now() - 2 * HOUR);
+    expect(got.map((a) => a.body)).toEqual(['aus dem Funkloch']);
+    expect(pc.getState().historyBefore).toBeUndefined();
+  });
+
+  it('a contact whose clock runs behind gets their first messages after the link through', async () => {
+    const { got, now, tick, caughtUp, fromMax } = await linkedPc();
+    await caughtUp();
+    tick(MIN);
+    await fromMax(LISA, { type: 'chat.text', text: 'Hallo' }, now() - 12 * MIN);
+    expect(got.map((a) => a.body)).toEqual(['Hallo']);
+  });
+
+  it('a catch-up cut short (the app was closed) still counts as the first one on the next start', async () => {
+    const w = world();
+    const first = catchUpTransport(w.net, LISA, w.now);
+    const pc = w.make(LISA, 'Lisa', { transport: first, initial: { ...state(LISA, 'Lisa', 'dev-pc-0001'), contacts: [contact(MAX, 'Max')], historyBefore: w.now() } });
+    await pc.start();
+    await pc.stop();
+    expect(pc.getState().historyBefore).toBe(w.now());
+    const second = catchUpTransport(w.net, LISA, w.now);
+    const again = w.make(LISA, 'Lisa', { transport: second, initial: pc.getState() });
+    const got = alerts(again);
+    await again.start();
+    await w.forge(MAX)(LISA, { type: 'chat.text', text: 'von gestern' }, w.now() - DAY);
+    expect(got).toEqual([]);
+    second.finishCatchUp();
+    await flush();
+    expect(again.getState().historyBefore).toBeUndefined();
+  });
+
+  it('an SOS from before that is still open rings right after it, once, as an alarm even in quiet mode', async () => {
+    const { pc, got, now, tick, caughtUp, fromMax } = await linkedPc();
+    await pc.setDnd(undefined);
+    await fromMax(LISA, { type: 'sos.start', sosId: 'sos-max-000010', text: 'Hilfe', others: [] }, now() - HOUR);
+    expect(got).toEqual([]);
+    await caughtUp();
+    expect(got.map((a) => [a.level, a.id, a.title])).toEqual([['alarm', `sos:${MAX}:sos-max-000010`, '🆘 Max braucht Hilfe!']]);
+    tick(5 * MIN);
+    await pc.tick();
+    await pc.tick();
+    expect(got).toHaveLength(1);
+    // Not again after a restart either.
+    const again = new SocialNode({ transport: w2(pc), initialState: pc.getState(), initialStatuses: pc.exportStatuses(), now, localTime, syncDelayMs: 0 });
+    const more = alerts(again);
+    await again.start();
+    await again.tick();
+    expect(more).toEqual([]);
+  });
+
+  it('an SOS from before that ended during it rings nothing', async () => {
+    const { got, now, caughtUp, fromMax } = await linkedPc();
+    await fromMax(LISA, { type: 'sos.end', sosId: 'sos-max-000011', reason: 'safe' }, now() - HOUR + 5 * MIN);
+    await fromMax(LISA, { type: 'sos.start', sosId: 'sos-max-000011', text: 'Hilfe', others: [] }, now() - HOUR);
+    await caughtUp();
+    expect(got).toEqual([]);
+  });
+
+  it('an overdue watch from before with no end rings once after it, at its proper level', async () => {
+    const { pc, got, now, tick, caughtUp, fromMax } = await linkedPc();
+    await pc.setDnd(undefined);
+    await fromMax(LISA, { type: 'watch.start', watchId: 'watch-max-0010', label: 'Heimweg', dueAt: now() - 30 * MIN }, now() - 2 * HOUR);
+    await caughtUp();
+    tick(3 * MIN);
+    await pc.tick();
+    await pc.tick();
+    expect(got.map((a) => [a.category, a.level, a.ref?.watchId])).toEqual([['watch', 'alarm', 'watch-max-0010']]);
+  });
+});
+
+/** A plain transport for the same account, for a restart in a test. */
+function w2(node: SocialNode): MemoryTransport {
+  return new MemoryNetwork().createTransport(node.getState().self.key);
+}
+
 describe('restoring a backup', () => {
   it('a backup keeps no running live share, SOS or anything waiting to go out', async () => {
     const w = world();
@@ -331,6 +437,35 @@ describe('removing a contact', () => {
     w.tick(HOUR + MIN);
     await max.tick();
     expect(maxAlerts.filter((a) => a.category === 'watch')).toEqual([]);
+  });
+
+  it('during my SOS, tells someone I remove that they get no more updates, not that the emergency is over', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    const max = w.make(MAX, 'Max');
+    const mia = w.make(MIA, 'Mia');
+    for (const n of [lisa, max, mia]) await n.start();
+    await w.pair(lisa, max);
+    await w.pair(lisa, mia);
+    lisa.updateContact(MAX, { emergency: true });
+    lisa.updateContact(MIA, { emergency: true });
+    await lisa.startSos({ text: 'Hilfe' });
+    await flush();
+    const maxAlerts = alerts(max);
+    const miaAlerts = alerts(mia);
+
+    await lisa.removeContact(MAX);
+    await flush();
+    expect(max.getStatus(LISA).sos?.endReason).toBe('removed');
+    expect(maxAlerts.map((a) => [a.category, a.level, a.title, a.body])).toEqual([
+      ['sos', 'normal', 'Lisa: keine Notruf-Updates mehr', 'Du bekommst von Lisa keine Notruf-Updates mehr. Ob der Notruf vorbei ist, weißt du damit nicht.'],
+    ]);
+    expect(maxAlerts.some((a) => /abgebrochen|beendet|Sicherheit/.test(`${a.title} ${a.body}`))).toBe(false);
+    // Still running for Mia; an end as before still reads as before.
+    expect(mia.getStatus(LISA).sos?.endedAt).toBeUndefined();
+    await lisa.endSos('cancelled');
+    await flush();
+    expect(miaAlerts.map((a) => a.title)).toEqual(['Lisa hat den Notruf abgebrochen']);
   });
 
   it('keeps my watch, SOS and trip running for the others', async () => {

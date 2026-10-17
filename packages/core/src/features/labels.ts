@@ -29,3 +29,18 @@ export function checkinText(kind: CheckinKind, text?: string, placeName?: string
   const main = text?.trim() || l.text;
   return placeName ? `${l.emoji} ${main} (${placeName})` : `${l.emoji} ${main}`;
 }
+
+/**
+ * How the end of a contact's SOS reads. `removed`: they removed me as a contact, so no more
+ * updates come. It must not sound like the emergency is over, since it may not be.
+ */
+export function sosEndText(name: string, reason: 'safe' | 'cancelled' | 'removed' | undefined): { title: string; body: string } {
+  switch (reason) {
+    case 'safe':
+      return { title: `✅ ${name} ist in Sicherheit`, body: 'Der Notruf ist beendet.' };
+    case 'removed':
+      return { title: `${name}: keine Notruf-Updates mehr`, body: `Du bekommst von ${name} keine Notruf-Updates mehr. Ob der Notruf vorbei ist, weißt du damit nicht.` };
+    default:
+      return { title: `${name} hat den Notruf abgebrochen`, body: 'Es war wohl ein Versehen.' };
+  }
+}

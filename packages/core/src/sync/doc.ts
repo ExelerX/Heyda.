@@ -29,6 +29,11 @@ export interface SyncDoc {
   prefs: NotificationPrefs;
   sosMessage?: string;
   status?: MyStatus;
+  /**
+   * The device that sends what automations send to others. Only present when one was chosen:
+   * older versions read the doc strictly and would drop all of it for a field they do not know.
+   */
+  automationDevice?: string;
   rev: Partial<Record<SyncField, number>>;
 }
 
@@ -80,6 +85,7 @@ const SyncDocSchema = z.strictObject({
   prefs: z.unknown(),
   sosMessage: text(200).optional(),
   status: z.strictObject({ text: text(80).optional(), emoji: text(16).optional(), expiresAt: time }).optional(),
+  automationDevice: z.string().regex(/^[A-Za-z0-9_-]{8,32}$/).optional(),
   rev: z.record(z.string(), time),
 });
 
@@ -96,6 +102,7 @@ export function buildSyncDoc(s: NodeState): SyncDoc {
     prefs: s.prefs,
     sosMessage: s.sosMessage,
     status: s.status,
+    ...(s.automationDevice !== undefined ? { automationDevice: s.automationDevice } : {}),
     rev: s.syncRev,
   };
 }
@@ -179,6 +186,7 @@ export function mergeSyncDoc(s: NodeState, doc: SyncDoc, now: number): Partial<N
   take('prefs', () => (patch.prefs = doc.prefs));
   take('sosMessage', () => (patch.sosMessage = doc.sosMessage));
   take('status', () => (patch.status = doc.status));
+  take('automationDevice', () => (patch.automationDevice = doc.automationDevice));
   if (canonicalJson(rev) !== canonicalJson(s.syncRev)) patch.syncRev = rev;
   return patch;
 }

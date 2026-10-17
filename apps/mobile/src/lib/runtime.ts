@@ -95,8 +95,10 @@ export interface Snapshot {
   locationNeeds: LocationNeeds;
   /** Linking a new device from here: waiting for it, or the 6 digits to compare. */
   linkStatus: LinkStatus | undefined;
-  /** False on a computer while my phone sends what automations send (they only notify here). */
+  /** False while another of my devices sends what automations send (they only notify here). */
   automationsActHere: boolean;
+  /** The device chosen in "Automationen senden von", if it is still in the list; else the usual rule. */
+  automationDevice: string | undefined;
 }
 
 /** Hooks the platform layer (location, geofences) sets when a runtime is created. */
@@ -417,6 +419,7 @@ export class AppRuntime {
         locationNeeds: this.node.locationNeeds(),
         linkStatus: this.node.linkStatus,
         automationsActHere: this.node.runsAutomationActions,
+        automationDevice: this.node.automationDevice,
       };
     }
     return this.snapshotCache;

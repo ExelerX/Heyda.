@@ -46,12 +46,20 @@ export function AlarmOverlay() {
   const who = alert?.from ? nameOf(alert.from) : owner ? nameOf(owner) : undefined;
   const ownWatchId = current ? myWatchDue(current.id) : undefined;
 
-  // The emergency may be over by the time someone looks: say so and stop buzzing.
+  // The emergency may be over by the time someone looks, or no more updates come: say so and stop buzzing.
   let resolved: string | undefined;
+  // They removed me as a contact: no more updates, which does not mean the emergency is over.
+  let noMoreUpdates = false;
   if (owner && owner !== state.self.key) {
     const s = statuses[owner]?.sos;
     if (s && s.sosId === alert?.ref?.sosId && s.endedAt) {
-      resolved = s.endReason === 'safe' ? `${who} ist inzwischen in Sicherheit.` : `${who} hat den Notruf abgebrochen.`;
+      noMoreUpdates = s.endReason === 'removed';
+      resolved =
+        s.endReason === 'safe'
+          ? `${who} ist inzwischen in Sicherheit.`
+          : noMoreUpdates
+            ? `Du bekommst von ${who} keine Notruf-Updates mehr. Ob der Notruf vorbei ist, weißt du damit nicht.`
+            : `${who} hat den Notruf abgebrochen.`;
     }
   } else if (alert?.from && alert.ref?.watchId) {
     const watchId = alert.ref.watchId;
@@ -116,7 +124,7 @@ export function AlarmOverlay() {
         <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: spacing.xl }}>
           <View style={{ width: '100%', maxWidth: 560, alignSelf: 'center', gap: spacing.lg, alignItems: 'center' }}>
             <Text accessible={false} style={{ fontSize: 76 }}>
-              {resolved ? '✅' : sos ? '🆘' : '⏰'}
+              {resolved ? (noMoreUpdates ? 'ℹ️' : '✅') : sos ? '🆘' : '⏰'}
             </Text>
             <Text accessibilityRole="header" style={{ color: text, fontSize: 30, fontWeight: '900', textAlign: 'center' }}>
               {title}
@@ -130,7 +138,7 @@ export function AlarmOverlay() {
               </Text>
             ) : null}
             {resolved ? (
-              <Text style={{ color: t.success, fontSize: 19, fontWeight: '800', textAlign: 'center' }} accessibilityLiveRegion="polite">
+              <Text style={{ color: noMoreUpdates ? t.text : t.success, fontSize: 19, fontWeight: '800', textAlign: 'center' }} accessibilityLiveRegion="polite">
                 {resolved}
               </Text>
             ) : null}

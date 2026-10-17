@@ -1,4 +1,4 @@
-import { contactLabel, type ContactStatus } from '@heyda/core';
+import { contactLabel, sosEndText, type ContactStatus } from '@heyda/core';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useState } from 'react';
 import { Text, View } from 'react-native';
@@ -79,6 +79,9 @@ function SosDetails({ ownerKey, sos }: { ownerKey: string; sos: Sos }) {
   const name = contact ? contactLabel(contact) : 'Unbekannt';
   const selfKey = state.self.key;
   const ended = sos.endedAt !== undefined;
+  // Removed as their contact: no more updates, but the emergency may go on.
+  const removed = sos.endReason === 'removed';
+  const endText = sosEndText(name, sos.endReason);
   const mine = sos.acks.find((a) => a.key === selfKey);
   const fg = onFilled(t);
 
@@ -107,16 +110,15 @@ function SosDetails({ ownerKey, sos }: { ownerKey: string; sos: Sos }) {
 
   return (
     <Screen edges={['bottom']}>
-      <Stack.Screen options={{ title: ended ? 'Notruf beendet' : `Notruf von ${name}` }} />
+      <Stack.Screen options={{ title: ended && !removed ? 'Notruf beendet' : `Notruf von ${name}` }} />
       <View style={{ width: '100%', maxWidth: 720, alignSelf: 'center', gap: spacing.lg }}>
         {ended ? (
           <Card style={{ borderColor: sos.endReason === 'safe' ? t.success : t.border, borderWidth: 2, gap: spacing.sm }}>
             <T variant="big" color={sos.endReason === 'safe' ? t.success : t.text}>
-              {sos.endReason === 'safe' ? `✅ ${name} ist in Sicherheit` : `${name} hat den Notruf abgebrochen`}
+              {endText.title}
             </T>
             <T variant="muted">
-              {sos.endReason === 'safe' ? 'Der Notruf ist beendet.' : 'Es war wohl ein Versehen.'} Beendet um {hhmm(sos.endedAt!)} Uhr (
-              {ago(sos.endedAt!, now)}).
+              {endText.body} {removed ? 'Seit' : 'Beendet um'} {hhmm(sos.endedAt!)} Uhr ({ago(sos.endedAt!, now)}).
             </T>
             <T variant="small">
               Notruf von {hhmm(sos.startedAt)} Uhr{sos.text ? `: „${sos.text}“` : ''}
