@@ -25,21 +25,18 @@ export const APP_RUMOR_KIND = 21_420;
  */
 export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net'];
 
-/** NIP-59 backdates wraps by up to two days to hide timing, so look back that far. */
-const WRAP_BACKDATE_S = 2 * 24 * 3600;
 /**
- * How long relays keep a wrap (NIP-40), counted from its randomized created_at on top of the
- * backdating. The same for every message: an expiration derived from the message's TTL told
- * relays and anyone fetching wraps which kind of message it was (an SOS, a live location, a
- * device link), when it was really sent, and the deadline of a "Pass auf mich auf". Covers the
- * longest TTL in use (chats and sync, 7 days).
+ * NIP-59 backdates wraps at random, so someone reading a relay's database later cannot tell when
+ * they were sent. Relays and anyone subscribed see the arrival time anyway, so an hour is enough;
+ * a catch-up then has to look back only that far, not days.
  */
-const RELAY_RETENTION_S = 7 * 24 * 3600;
+const WRAP_BACKDATE_S = 3600;
 /**
- * Extra look-back before the last full sync of a relay. The backdating counts from the sender's
- * clock, which can run hours behind (set by hand, wrong time zone); their wraps must still match.
+ * Extra look-back before the last full sync of a relay, for senders whose clock runs behind. A
+ * clock more than about this far behind loses its messages in catch-ups: accepted, so that every
+ * reconnect fetches the last few hours instead of days.
  */
-const SYNC_MARGIN_S = 24 * 3600;
+const SYNC_MARGIN_S = 3600;
 const MAX_WRAP_BYTES = 64 * 1024;
 /**
  * How far a sender's clock may run ahead of mine. Generous on purpose: ten minutes silently
@@ -56,6 +53,14 @@ const MAX_REFUSED = 200;
 const MAX_REFUSED_PER_SENDER = 50;
 const MAX_REFUSED_CHARS = 2_000_000;
 
+/**
+ * Wraps turned away for now (a sender not known yet, a message this version cannot read, one from
+ * the future) are not opened again until contacts or groups change, or the app restarts.
+ */
+const MAX_LATER = 5000;
+/** How often the seen store forgets what no longer matters. */
+const PRUNE_EVERY_S = 3600;
+
 /** Remembers what was already processed, across app restarts. */
 export interface SeenStore {
   /** Per relay: everything it held up to this time (epoch seconds) has arrived. 0 if unknown. */
@@ -63,34 +68,89 @@ export interface SeenStore {
   setSyncedUntil(relay: string, seconds: number): void;
   /** Inner messages (rumor ids) already handed to the app. */
   has(rumorId: string): boolean;
-  add(rumorId: string): void;
-  /** Gift wraps already dealt with, so copies from other relays or a later catch-up cost no decryption. */
+  /** `keepUntil` (epoch seconds): from then on the transport drops the message for its age anyway. */
+  add(rumorId: string, keepUntil: number): void;
+  /** Gift wraps already dealt with (junk included), so copies from other relays or a later catch-up cost nothing. */
   hasWrap(wrapId: string): boolean;
-  addWrap(wrapId: string): void;
+  addWrap(wrapId: string, keepUntil: number): void;
+  /** A wrap that can never be read. Kept apart, so junk cannot push out the wraps that matter. */
+  addJunk(wrapId: string, keepUntil: number): void;
+  /** Forgets what no longer matters at `nowS`. */
+  prune(nowS: number): void;
 }
 
 export interface SeenSnapshot {
   /** Written by older versions: one time for all relays. Only a fallback now. */
   sync: number;
+  /** Written by older versions: rumor ids, without times. */
   ids: string[];
   relays?: Record<string, number>;
+  /** Written by older versions: wrap ids, without times. */
   wraps?: string[];
+  /** Short ids, each with the time (epoch seconds) until which it matters. */
+  messageIds?: [string, number][];
+  wrapIds?: [string, number][];
+  junkIds?: [string, number][];
 }
 
 const MAX_RELAY_ENTRIES = 32;
-/** Wrap ids are hashes chosen by nobody: 64 bits are plenty to recognize them and keep the saved file small. */
-const wrapKey = (id: string) => id.slice(0, 16);
+const MAX_JUNK = 5000;
+/**
+ * Ids are hashes nobody can aim at a message not yet received: 64 bits are plenty to recognize
+ * them and keep the saved file small.
+ */
+const shortId = (id: string) => id.slice(0, 16);
 
-/** Bounded in-memory store; the app persists it via its own storage. */
+/** Ids with the time (epoch seconds) until which each matters. */
+class TimedIds {
+  private readonly ids = new Map<string, number>();
+  constructor(
+    /** The newest this many stay whatever their time: a clock that ran days ahead for a while must not wipe them. */
+    private readonly keep: number,
+    /** Only against running out of memory: past it, the oldest go. */
+    private readonly cap: number,
+  ) {}
+  has(id: string): boolean {
+    return this.ids.has(shortId(id));
+  }
+  add(id: string, keepUntil: number): void {
+    const key = shortId(id);
+    const until = Number.isFinite(keepUntil) ? Math.floor(keepUntil) : 0;
+    if ((this.ids.get(key) ?? -Infinity) >= until) return;
+    this.ids.set(key, until);
+    if (this.ids.size > this.cap) this.drop(this.ids.size - Math.floor(this.cap * 0.9), Infinity);
+  }
+  prune(nowS: number): void {
+    if (this.ids.size > this.keep) this.drop(this.ids.size - this.keep, nowS);
+  }
+  entries(): [string, number][] {
+    return [...this.ids];
+  }
+  /** Drops up to `count` ids whose time is before `before`, oldest first. */
+  private drop(count: number, before: number): void {
+    for (const [id, until] of [...this.ids].sort((a, b) => a[1] - b[1])) {
+      if (count-- <= 0 || until >= before) return;
+      this.ids.delete(id);
+    }
+  }
+}
+
+/** In memory; the app persists it via its own storage. */
 export class MemorySeenStore implements SeenStore {
   private sync = 0;
   private readonly relays = new Map<string, number>();
-  private readonly ids = new Set<string>();
-  private readonly wraps = new Set<string>();
-  constructor(
-    private readonly max = 5000,
-    private readonly maxWraps = 8000,
-  ) {}
+  private readonly ids: TimedIds;
+  private readonly wraps: TimedIds;
+  private readonly junk = new TimedIds(0, MAX_JUNK);
+  /**
+   * Keeps every id until a catch-up would drop its message for age anyway: one handed over again
+   * would ring, notify or trigger automations a second time. `keep` and `keepWraps` of the newest
+   * stay even then; `cap` per list only protects memory.
+   */
+  constructor(keep = 5000, keepWraps = 8000, cap = 50_000) {
+    this.ids = new TimedIds(keep, Math.max(cap, keep));
+    this.wraps = new TimedIds(keepWraps, Math.max(cap, keepWraps));
+  }
   syncedUntil(relay: string): number {
     return this.relays.get(relay) ?? this.sync;
   }
@@ -104,28 +164,47 @@ export class MemorySeenStore implements SeenStore {
   has(id: string): boolean {
     return this.ids.has(id);
   }
-  add(id: string): void {
-    this.ids.add(id);
-    if (this.ids.size > this.max) this.ids.delete(this.ids.values().next().value!);
+  add(id: string, keepUntil: number): void {
+    this.ids.add(id, keepUntil);
   }
   hasWrap(id: string): boolean {
-    return this.wraps.has(wrapKey(id));
+    return this.wraps.has(id) || this.junk.has(id);
   }
-  addWrap(id: string): void {
-    this.wraps.add(wrapKey(id));
-    if (this.wraps.size > this.maxWraps) this.wraps.delete(this.wraps.values().next().value!);
+  addWrap(id: string, keepUntil: number): void {
+    this.wraps.add(id, keepUntil);
+  }
+  addJunk(id: string, keepUntil: number): void {
+    this.junk.add(id, keepUntil);
+  }
+  prune(nowS: number): void {
+    this.ids.prune(nowS);
+    this.wraps.prune(nowS);
+    this.junk.prune(nowS);
   }
   snapshot(): SeenSnapshot {
-    return { sync: this.sync, ids: [...this.ids], relays: Object.fromEntries(this.relays), wraps: [...this.wraps] };
+    return {
+      sync: this.sync,
+      ids: [],
+      relays: Object.fromEntries(this.relays),
+      messageIds: this.ids.entries(),
+      wrapIds: this.wraps.entries(),
+      junkIds: this.junk.entries(),
+    };
   }
   /** Tolerates data from older versions and anything malformed. */
-  static restore(data: Partial<SeenSnapshot> | undefined, max?: number): MemorySeenStore {
-    const s = new MemorySeenStore(max);
+  static restore(data: Partial<SeenSnapshot> | undefined, keep?: number, keepWraps?: number): MemorySeenStore {
+    const s = new MemorySeenStore(keep, keepWraps);
     if (!data || typeof data !== 'object') return s;
     if (Number.isSafeInteger(data.sync)) s.sync = data.sync!;
     const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
-    for (const id of strings(data.ids)) s.add(id);
-    for (const id of strings(data.wraps)) s.addWrap(id);
+    const timed = (v: unknown) =>
+      Array.isArray(v) ? v.filter((x): x is [string, number] => Array.isArray(x) && typeof x[0] === 'string' && typeof x[1] === 'number') : [];
+    // Saved without a time: they count as expired, the first to go once more than `keep` are stored.
+    for (const id of strings(data.ids)) s.ids.add(id, 0);
+    for (const id of strings(data.wraps)) s.wraps.add(id, 0);
+    for (const [id, until] of timed(data.messageIds)) s.ids.add(id, until);
+    for (const [id, until] of timed(data.wrapIds)) s.wraps.add(id, until);
+    for (const [id, until] of timed(data.junkIds)) s.junk.add(id, until);
     if (data.relays && typeof data.relays === 'object') {
       for (const [relay, seconds] of Object.entries(data.relays)) s.setSyncedUntil(relay, seconds);
     }
@@ -159,6 +238,9 @@ export interface NostrTransportOptions {
 
 interface Refused {
   wrapId: string;
+  /** For the seen store, once handed over. */
+  wrapUntil: number;
+  keepUntil: number;
   from: ContactKey;
   message: AppMessage;
   until: number;
@@ -189,6 +271,9 @@ export class NostrTransport implements Transport {
   private readonly handlers = new Set<(m: IncomingMessage) => void>();
   /** Messages `accept` turned down, by rumor id, oldest first. */
   private readonly refused = new Map<string, Refused>();
+  /** Short ids of wraps turned away for now (see `MAX_LATER`), oldest first. */
+  private readonly later = new Set<string>();
+  private prunedAt: number | undefined;
   private sub: { close(): void } | undefined;
   /** Resolves once every own relay caught up after the last `start()`. */
   private backlog: Promise<void> | undefined;
@@ -213,11 +298,14 @@ export class NostrTransport implements Transport {
     let backlogIn!: () => void;
     this.backlog = new Promise<void>((resolve) => (backlogIn = resolve));
     if (pending.size === 0) backlogIn();
+    this.pruneSeen();
     this.sub = this.pool.subscribe(this.opts.ownRelays, {
       filter: (relay) => ({ kinds: [GIFT_WRAP_KIND], '#p': [this.selfKey], since: this.sinceFor(relay) }),
       onEvent: (event) => this.handleWrap(event),
+      handled: (id) => this.handled(id),
       onSynced: (relay) => {
         this.seen.setSyncedUntil(relay, this.nowS() - 60);
+        this.pruneSeen();
         if (pending.delete(relay) && pending.size === 0) backlogIn();
       },
     });
@@ -240,6 +328,7 @@ export class NostrTransport implements Transport {
     this.disposed = true;
     this.secretKey.fill(0);
     this.refused.clear();
+    this.later.clear();
     if (this.ownsPool) this.pool.close();
   }
 
@@ -266,7 +355,9 @@ export class NostrTransport implements Transport {
    * node calls this after it learned contacts or group members.
    */
   redeliverRefused(): void {
-    if (this.disposed || this.refused.size === 0) return;
+    if (this.disposed) return;
+    // The next catch-up opens again what was turned away, also what no longer fitted in memory.
+    this.later.clear();
     const now = this.now();
     for (const [rumorId, r] of [...this.refused]) {
       if (!this.refused.has(rumorId)) continue;
@@ -274,15 +365,40 @@ export class NostrTransport implements Transport {
         this.refused.delete(rumorId);
         continue;
       }
-      if (this.opts.accept && !this.opts.accept(r.from, r.message)) continue;
+      if (this.opts.accept && !this.opts.accept(r.from, r.message)) {
+        this.markLater(r.wrapId);
+        continue;
+      }
       this.refused.delete(rumorId);
-      this.seen.addWrap(r.wrapId);
-      this.deliver(rumorId, r.from, r.message);
+      this.seen.addWrap(r.wrapId, r.wrapUntil);
+      this.deliver(rumorId, r.keepUntil, r.from, r.message);
     }
   }
 
   private nowS(): number {
     return Math.floor(this.now() / 1000);
+  }
+
+  /** Dealt with, or turned away for now: a copy needs neither its signature checked nor opening. */
+  private handled(wrapId: string): boolean {
+    return this.seen.hasWrap(wrapId) || this.later.has(shortId(wrapId));
+  }
+
+  private markLater(wrapId: string): void {
+    this.later.add(shortId(wrapId));
+    if (this.later.size > MAX_LATER) this.later.delete(this.later.values().next().value!);
+  }
+
+  private pruneSeen(): void {
+    const nowS = this.nowS();
+    if (this.prunedAt !== undefined && Math.abs(nowS - this.prunedAt) < PRUNE_EVERY_S) return;
+    this.prunedAt = nowS;
+    this.seen.prune(nowS);
+  }
+
+  /** Until then a wrap may hold a message young enough to take: its contents are at most WRAP_BACKDATE_S newer. */
+  private wrapUntil(wrap: NostrEvent): number {
+    return wrap.created_at + WRAP_BACKDATE_S + this.maxAge;
   }
 
   /** Where a catch-up from this relay starts. */
@@ -296,7 +412,12 @@ export class NostrTransport implements Transport {
     return Math.max(0, oldestUseful, synced - WRAP_BACKDATE_S - SYNC_MARGIN_S);
   }
 
-  /** Like nostr-tools' createWrap, plus a NIP-40 expiration so relays can delete it. */
+  /**
+   * Like nostr-tools' createWrap, plus a NIP-40 expiration so relays can delete it once no
+   * recipient takes its message any more. The same for every message, counted from the randomized
+   * created_at: one derived from the message's TTL told relays which kind of message it was (an
+   * SOS, a live location, a device link) and when it was really sent. Relays may ignore it.
+   */
   private createWrap(seal: NostrEvent, recipient: string): NostrEvent {
     const oneTimeKey = generateSecretKey();
     const createdAt = this.nowS() - Math.floor(secureRandom() * WRAP_BACKDATE_S);
@@ -307,7 +428,7 @@ export class NostrTransport implements Transport {
         created_at: createdAt,
         tags: [
           ['p', recipient],
-          ['expiration', String(createdAt + WRAP_BACKDATE_S + RELAY_RETENTION_S)],
+          ['expiration', String(createdAt + WRAP_BACKDATE_S + this.maxAge)],
         ],
       },
       oneTimeKey,
@@ -321,48 +442,62 @@ export class NostrTransport implements Transport {
     try {
       if (event.kind !== GIFT_WRAP_KIND || event.content.length > MAX_WRAP_BYTES) return;
       // Seen before: on another relay, in the overlap after a reconnect, or before a restart.
-      if (this.seen.hasWrap(event.id)) return;
-      for (const r of this.refused.values()) if (r.wrapId === event.id) return;
+      if (this.handled(event.id)) return;
       const nowS = this.nowS();
-      // The message inside is at most WRAP_BACKDATE_S newer than its wrap: this one can only hold an expired one.
-      if (event.created_at + WRAP_BACKDATE_S < nowS - this.maxAge) return;
+      const wrapUntil = this.wrapUntil(event);
+      if (wrapUntil < nowS) return;
       if (!event.tags.some((t) => t[0] === 'p' && t[1] === this.selfKey)) return;
       if (!verifyEvent(event)) return;
       // From here the id is the wrap's own hash, so recording it cannot hide a different wrap.
       verified = true;
-      if (this.open(event, nowS)) this.seen.addWrap(event.id);
+      const outcome = this.open(event, nowS);
+      if (outcome === 'done') this.seen.addWrap(event.id, wrapUntil);
+      else if (outcome === 'junk') this.seen.addJunk(event.id, wrapUntil);
+      else this.markLater(event.id);
     } catch (error) {
       // Undecryptable or malformed wraps are expected noise on public relays, and stay so.
-      if (verified) this.seen.addWrap(event.id);
+      if (verified) this.seen.addJunk(event.id, this.wrapUntil(event));
       this.opts.onError?.(error);
     }
   }
 
-  /** Unwraps and hands the message on. False if the wrap may be worth another look later. */
-  private open(event: NostrEvent, nowS: number): boolean {
+  /**
+   * Unwraps and hands the message on: `done`. `junk` if it can never be taken, `later` if it may be
+   * worth another look (a sender who may become known, a newer version's message after an update).
+   */
+  private open(event: NostrEvent, nowS: number): 'done' | 'junk' | 'later' {
     // Checks the seal signature and that the inner author matches the seal signer.
     const rumor = unwrapEvent(event, this.secretKey);
-    if (rumor.kind !== APP_RUMOR_KIND || typeof rumor.content !== 'string' || !Number.isSafeInteger(rumor.created_at)) return true;
+    if (rumor.kind !== APP_RUMOR_KIND || typeof rumor.content !== 'string' || !Number.isSafeInteger(rumor.created_at)) return 'junk';
     // The rumor is unsigned: its id is a fair key for "already processed" only if it is its hash.
-    if (getEventHash(rumor) !== rumor.id) return true;
-    if (rumor.created_at < nowS - this.maxAge) return true;
-    if (rumor.created_at > nowS + MAX_CLOCK_SKEW_S) return false;
-    if (this.seen.has(rumor.id)) return true;
+    if (getEventHash(rumor) !== rumor.id) return 'junk';
+    if (rumor.created_at < nowS - this.maxAge) return 'junk';
+    if (rumor.created_at > nowS + MAX_CLOCK_SKEW_S) return 'later';
+    if (this.seen.has(rumor.id)) return 'done';
 
-    // Only messages the app would act on take room in the bounded seen store.
+    // Only messages the app would act on take room in the seen store.
     const parsed = parseAppMessage(rumor.content);
     // Perhaps a kind of message from a newer version: worth another look after an update.
-    if (!parsed.ok) return false;
+    if (!parsed.ok) return 'later';
+    const keepUntil = rumor.created_at + this.maxAge;
     if (this.opts.accept && !this.opts.accept(rumor.pubkey, parsed.message)) {
-      this.holdRefused(rumor.id, { wrapId: event.id, from: rumor.pubkey, message: parsed.message, until: this.now() + REFUSED_TTL_MS, chars: rumor.content.length });
-      return false;
+      this.holdRefused(rumor.id, {
+        wrapId: event.id,
+        wrapUntil: this.wrapUntil(event),
+        keepUntil,
+        from: rumor.pubkey,
+        message: parsed.message,
+        until: this.now() + REFUSED_TTL_MS,
+        chars: rumor.content.length,
+      });
+      return 'later';
     }
-    this.deliver(rumor.id, rumor.pubkey, parsed.message);
-    return true;
+    this.deliver(rumor.id, keepUntil, rumor.pubkey, parsed.message);
+    return 'done';
   }
 
-  private deliver(rumorId: string, from: ContactKey, message: AppMessage): void {
-    this.seen.add(rumorId);
+  private deliver(rumorId: string, keepUntil: number, from: ContactKey, message: AppMessage): void {
+    this.seen.add(rumorId, keepUntil);
     const incoming: IncomingMessage = { from, message, receivedAt: this.now() };
     for (const h of [...this.handlers]) {
       try {

@@ -124,9 +124,9 @@ describe('SimpleRelayPool', () => {
     await second.start();
     await until(() => sinceOf(relayA.reqs, second.selfKey).length >= 2, 2000, 'second REQ');
     const since = sinceOf(relayA.reqs, second.selfKey).at(-1)!.since!;
-    // Wraps are backdated by up to 2 days, so it looks back that far before the last sync, plus a
-    // day for senders whose clock runs behind.
-    expect(since).toBe(seen.syncedUntil(A) - 3 * 86_400);
+    // Wraps are backdated by up to an hour, so it looks back that far before the last sync, plus an
+    // hour for senders whose clock runs behind.
+    expect(since).toBe(seen.syncedUntil(A) - 2 * 3600);
   }, 10_000);
 
   it('keeps trying a relay that was unreachable at start', async () => {

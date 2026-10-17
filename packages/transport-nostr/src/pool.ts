@@ -2,7 +2,7 @@ import type { AbstractRelay, Subscription } from 'nostr-tools/abstract-relay';
 import type { Filter } from 'nostr-tools/filter';
 import { matchFilter } from 'nostr-tools/filter';
 import { SimplePool } from 'nostr-tools/pool';
-import type { NostrEvent } from 'nostr-tools/pure';
+import { verifyEvent, type NostrEvent } from 'nostr-tools/pure';
 
 /** What a subscription asks of each relay and reports back. */
 export interface FeedHandlers {
@@ -10,9 +10,14 @@ export interface FeedHandlers {
   filter(relay: string): Filter;
   onEvent(event: NostrEvent): void;
   /**
+   * Whether this event id was dealt with already. Its copies are dropped without checking their
+   * signature (dropping needs no proof), but still count while paging through stored events.
+   */
+  handled?(eventId: string): boolean;
+  /**
    * `relay` has sent everything it stores for the filter, and its live stream had no gap since:
    * whatever it held up to now has arrived. Called after each full catch-up and then regularly
-   * while the connection is known to be alive.
+   * while the connection is known to be alive; never after one cut off at `maxPages`.
    */
   onSynced?(relay: string): void;
 }
@@ -62,10 +67,9 @@ const PROBE: Filter = { ids: ['0'.repeat(64)], limit: 1 };
  *
  * nostr-tools' own reconnect stays off: when reconnecting it asks only for events newer than the
  * newest one it saw (and changes the filter shared by all relays to that). NIP-59 wraps are
- * backdated by up to two days, so nearly everything sent during the gap was skipped, and kept
- * being filtered out afterwards. Here each relay is handled on its own: after any gap it
- * subscribes again with a fresh filter, whose `since` the transport derives from what that
- * relay last delivered in full.
+ * backdated, so nearly everything sent during the gap was skipped, and kept being filtered out
+ * afterwards. Here each relay is handled on its own: after any gap it subscribes again with a
+ * fresh filter, whose `since` the transport derives from what that relay last delivered in full.
  */
 export class SimpleRelayPool implements RelayPool {
   private readonly pool = new SimplePool({ enablePing: false, enableReconnect: false });
@@ -74,6 +78,15 @@ export class SimpleRelayPool implements RelayPool {
 
   constructor(options: SimpleRelayPoolOptions = {}) {
     this.cfg = { ...DEFAULTS, ...options };
+    // Every catch-up downloads again what arrived in its window. A copy of something already
+    // handled is dropped at once; everything else gets the full check, with the same function (and
+    // its per-event cache) the transport uses afterwards.
+    this.pool.verifyEvent = (event) => !this.handledByAny(event.id) && verifyEvent(event);
+  }
+
+  private handledByAny(id: unknown): boolean {
+    for (const f of this.feeds) if (f.handled(id)) return true;
+    return false;
   }
 
   async publish(relays: string[], event: NostrEvent): Promise<void> {
@@ -131,6 +144,10 @@ class RelayFeed {
     this.reset();
   }
 
+  handled(id: unknown): boolean {
+    return typeof id === 'string' && (this.handlers.handled?.(id) ?? false);
+  }
+
   private async connect(): Promise<void> {
     if (this.closed) return;
     const attempt = ++this.attempt;
@@ -149,7 +166,14 @@ class RelayFeed {
     let page = await this.request(relay, attempt, { ...base, limit }, true);
     // Then older pages. A relay's cap is unknown, so a short page does not prove the end; only a
     // page with nothing older in it does.
-    for (let n = 0; page?.oldest !== undefined && n < this.cfg.maxPages; n++) {
+    let complete = false;
+    for (let n = 0; page; n++) {
+      if (page.oldest === undefined) {
+        complete = true;
+        break;
+      }
+      // Cut off: older events were never asked for, so this relay has not handed over everything.
+      if (n >= this.cfg.maxPages) break;
       const { oldest, atOldest } = page;
       const next = await this.request(relay, attempt, { ...base, until: oldest, limit }, false);
       if (!next) return;
@@ -157,23 +181,25 @@ class RelayFeed {
       const fresh = next.events.filter((e) => !(e.created_at === oldest && atOldest.has(e.id)));
       if (fresh.length === 0) {
         // Only repeats: the end, unless a full page shares that one second (then step past it).
-        if (next.events.length < limit || oldest - 1 < (base.since ?? 0)) break;
+        complete = next.events.length < limit || oldest - 1 < (base.since ?? 0);
+        if (complete) break;
         page = { events: [], oldest: oldest - 1, atOldest: new Set() };
         continue;
       }
       const older = summarize(fresh);
       // A relay that ignores `until` would send the newest page again and again.
-      if (older.oldest === undefined || older.oldest > oldest) break;
+      complete = older.oldest === undefined || older.oldest > oldest;
+      if (complete) break;
       page = older;
     }
     if (!page || attempt !== this.attempt) return;
     this.failures = 0;
-    this.handlers.onSynced?.(this.url);
-    this.scheduleProbe(relay, attempt);
+    if (complete) this.handlers.onSynced?.(this.url);
+    this.scheduleProbe(relay, attempt, complete);
   }
 
   /** Checks the connection now and then; an answer proves the live stream had no gap. */
-  private scheduleProbe(relay: AbstractRelay, attempt: number): void {
+  private scheduleProbe(relay: AbstractRelay, attempt: number, complete: boolean): void {
     const due = Date.now() + this.cfg.probeEveryMs;
     this.probeTimer = setTimeout(async () => {
       if (attempt !== this.attempt) return;
@@ -185,8 +211,8 @@ class RelayFeed {
       }
       const ok = await this.request(relay, attempt, PROBE, false);
       if (!ok || attempt !== this.attempt) return;
-      this.handlers.onSynced?.(this.url);
-      this.scheduleProbe(relay, attempt);
+      if (complete) this.handlers.onSynced?.(this.url);
+      this.scheduleProbe(relay, attempt, complete);
     }, this.cfg.probeEveryMs);
   }
 
@@ -204,6 +230,11 @@ class RelayFeed {
       }
       const events: NostrEvent[] = [];
       let eosed = false;
+      const take = (event: NostrEvent) => {
+        if (eosed) return;
+        events.push(event);
+        arm();
+      };
       let timer: ReturnType<typeof setTimeout> | undefined;
       // Silence counts as failure. nostr-tools reports an EOSE of its own after its timeout; that
       // one is set longer, so an EOSE arriving while this timer still runs came from the relay.
@@ -219,11 +250,19 @@ class RelayFeed {
         eoseTimeout: this.cfg.timeoutMs * 2 + 1000,
         onevent: (event) => {
           if (attempt !== this.attempt) return;
-          if (!eosed) {
-            events.push(event);
-            arm();
-          }
+          take(event);
           this.handlers.onEvent(event);
+        },
+        // Failed the pool's check. A copy of something handled was not even checked, and still counts
+        // for paging; one handled only by another subscription of this pool is checked here.
+        oninvalidevent: (raw) => {
+          const event = raw as NostrEvent;
+          if (attempt !== this.attempt || !matchFilter(filter, event)) return;
+          if (this.handled(event.id)) take(event);
+          else if (verifyEvent(event)) {
+            take(event);
+            this.handlers.onEvent(event);
+          }
         },
         oneose: () => {
           if (eosed || attempt !== this.attempt) return;

@@ -185,11 +185,12 @@ describe('NostrTransport', () => {
       const exp = event.tags.find((t) => t[0] === 'expiration');
       return exp ? Number(exp[1]) - event.created_at : undefined;
     });
-    // Measured from the randomized created_at, so it reveals neither the kind of message nor when it was sent.
-    expect(new Set(lifetimes)).toEqual(new Set([9 * 86_400]));
+    // Measured from the randomized created_at, so it reveals neither the kind of message nor when it
+    // was sent: the 8 days a recipient takes a message, plus the hour of backdating.
+    expect(new Set(lifetimes)).toEqual(new Set([8 * 86_400 + 3600]));
   });
 
-  it('after a restart still finds wraps from a sender whose clock runs hours behind', async () => {
+  it('after a restart still finds wraps from a sender whose clock runs behind', async () => {
     const { pool, aliceKey, bobKey, now, tick } = setup();
     const seen = new MemorySeenStore();
     const make = () => new NostrTransport({ secretKey: bobKey, ownRelays: [RELAY_B], relaysFor: () => [], pool, now, seen });
@@ -198,10 +199,10 @@ describe('NostrTransport', () => {
     expect(seen.syncedUntil(RELAY_B)).toBe(Math.floor(now() / 1000) - 60);
     await first.stop();
 
-    // Ten minutes later Alice writes. Her phone's clock is 5 hours behind, and the wrap got the
-    // full two days of backdating.
+    // Ten minutes later Alice writes. Her phone's clock is 45 minutes behind, and the wrap got the
+    // full hour of backdating.
     tick(10 * 60_000);
-    const aliceNow = Math.floor(now() / 1000) - 5 * 3600;
+    const aliceNow = Math.floor(now() / 1000) - 45 * 60;
     const content = JSON.stringify(composeMessage({ type: 'sos.start', sosId: 'sos-id-0001', others: [] }, aliceNow * 1000));
     const rumor = createRumor({ kind: APP_RUMOR_KIND, content, created_at: aliceNow }, aliceKey);
     const seal = createSeal(rumor, aliceKey, getPublicKey(bobKey));
@@ -210,7 +211,7 @@ describe('NostrTransport', () => {
       {
         kind: GIFT_WRAP_KIND,
         content: nip44Encrypt(JSON.stringify(seal), getConversationKey(oneTime, getPublicKey(bobKey))),
-        created_at: aliceNow - 2 * 86_400 + 1,
+        created_at: aliceNow - 3600 + 1,
         tags: [['p', getPublicKey(bobKey)]],
       },
       oneTime,

@@ -38,7 +38,7 @@ Heyda. auf dem Handy hat, verbindet den PC unter *Ich → Meine Geräte*.
 | --- | --- | --- |
 | Deine Kontakte | Was du freigibst: Ankunftszeit (gerundet), Ankunft/Abfahrt an freigegebenen Orten, Status, Ruhemodus; nur wenn du es wählst: ein ~2-km-Raster oder den genauen Punkt (mit Ablaufzeit oder bis du es beendest) | Koordinaten deiner Orte, deinen Standort, wenn du nichts teilst |
 | Deine Notfallkontakte, wenn **du** einen Notruf auslöst | Deinen genauen Standort (auch im Geistmodus) | |
-| Nostr-Relays | Für welchen (anonymen) Schlüssel eine Nachricht bestimmt ist, ungefähre Zeit (bis zu 2 Tage zufällig verschoben), Größe, deine IP-Adresse | Inhalt, Absender, Art der Nachricht |
+| Nostr-Relays | Für welchen (anonymen) Schlüssel eine Nachricht bestimmt ist, wann sie ankommt (gespeichert wird eine bis zu 1 Std. zufällig verschobene Zeit), Größe, deine IP-Adresse | Inhalt, Absender, Art der Nachricht |
 | openstreetmap.org (nur wenn du die Karte einschaltest) | Deine IP-Adresse und welche Kartenausschnitte du ansiehst, also auch ungefähr, wo ein Freund ist, den du dir auf der Karte anschaust (von selbst zoomt die Karte dabei nur auf ein paar Kilometer heran) | Wer deine Freunde sind und was sie dir schicken |
 | Wir (die Entwickler) | Nichts. Es gibt keinen Server und keine Telemetrie. | |
 
@@ -88,8 +88,9 @@ Zeit oder wenn du ihn ausschaltest; was gerade läuft, steht immer oben auf dem 
 - **Verlorenes Gerät:** Alle deine Geräte teilen eine Identität. „Gerät entfernen“ stoppt das Synchronisieren, kann
   ein gestohlenes Gerät aber nicht aussperren. Sag dann deinen Kontakten Bescheid und richte Heyda. neu ein.
 - **Keine Forward Secrecy** in v1: Wer einen Geräteschlüssel stiehlt, könnte alte, noch auf Relays liegende
-  Nachrichten lesen. Deshalb sollen die Relays jede Nachricht nach höchstens 9 Tagen löschen. Die Frist ist für alle
-  Nachrichten gleich, damit niemand an ihr erkennt, ob es ein Chat, ein Standort oder ein Notruf ist.
+  Nachrichten lesen. Deshalb bittet Heyda. die Relays, jede Nachricht nach gut 8 Tagen zu löschen. Daran halten müssen
+  sie sich nicht; ein Relay kann Nachrichten auch länger aufbewahren. Die Frist ist für alle Nachrichten gleich, damit
+  niemand an ihr erkennt, ob es ein Chat, ein Standort oder ein Notruf ist.
 - **Öffentliche Relays** können ausfallen oder Nachrichten verwerfen; Heyda. versendet über mehrere Relays und
   wiederholt automatisch.
 
