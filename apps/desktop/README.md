@@ -77,7 +77,13 @@ after that it shows a notification, and opening the window tries again. The rela
 timers live in that process, so without this a crash in the tray would silently stop all alerts.
 
 Closing the window hides it to the tray; only the tray's "Beenden" quits. Autostart registers a login item that
-starts the app with `--hidden`.
+starts the app with `--hidden`. It is off until the person turns it on: in onboarding (suggested), under Ruhe
+(which warns while it is off) or in the tray menu. Launching it again while it is still starting shows the
+window that startup creates rather than opening a second one.
+
+Watch alarms are timers in the UI process. Those whose time passed while the PC was off ring only once the relays
+have handed over what waited meanwhile (at most 15 s after start), so a check-in among it calls them off, and not
+at all when more than 12 hours old.
 
 ## Security notes
 

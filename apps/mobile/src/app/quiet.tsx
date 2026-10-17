@@ -13,7 +13,7 @@ import {
   openBatteryOptimizationSettings,
 } from '../lib/keepalive';
 import { notificationsAllowed, setupNotifications } from '../lib/notifications';
-import { isBrowserPreview, isDesktop, isNative } from '../lib/platform';
+import { autostartSupported, desktop, isBrowserPreview, isDesktop, isNative } from '../lib/platform';
 import { useRuntime, useSnapshot, useTick } from '../lib/store';
 import { spacing, useTheme } from '../lib/theme';
 
@@ -296,11 +296,19 @@ function Reliability() {
   const [allowed, setAllowed] = useState<boolean>();
   const [dndAccess, setDndAccess] = useState<boolean>();
   const [battery, setBattery] = useState<boolean>();
+  const [autostart, setAutostart] = useState<boolean>();
 
   const refresh = useCallback(() => {
     void notificationsAllowed()
       .then(setAllowed)
       .catch(() => setAllowed(false));
+    // Also switchable in the tray menu, so read again whenever the window comes back.
+    if (autostartSupported) {
+      void desktop!
+        .getAutostart()
+        .then(setAutostart)
+        .catch(() => setAutostart(undefined));
+    }
     if (Platform.OS === 'android' && keepAliveSupported) {
       void isDndAccessGranted()
         .then(setDndAccess)
@@ -325,6 +333,17 @@ function Reliability() {
     if (!ok && isNative) await Linking.openSettings().catch(() => {});
   }
 
+  async function changeAutostart(on: boolean) {
+    setAutostart(on);
+    try {
+      await desktop!.setAutostart(on);
+    } catch {
+      notice('Hat nicht geklappt', 'Du kannst es auch über das Heyda.-Symbol im Infobereich einstellen.');
+    }
+    // What Windows really has now.
+    setAutostart(await desktop!.getAutostart().catch(() => undefined));
+  }
+
   async function openDndAccess() {
     try {
       await Linking.sendIntent('android.settings.NOTIFICATION_POLICY_ACCESS_SETTINGS');
@@ -338,6 +357,21 @@ function Reliability() {
       <Card style={{ gap: spacing.md }}>
         {isBrowserPreview ? (
           <StatusLine ok={false} title="Browser-Vorschau" detail="Hier gibt es keine echten Benachrichtigungen. Auf dem Handy und am PC schon." />
+        ) : isDesktop && autostartSupported ? (
+          <>
+            <StatusLine
+              ok={autostart}
+              title={autostart === undefined ? 'Start mit Windows …' : autostart ? 'Heyda. startet mit Windows' : 'Heyda. startet nicht mit Windows'}
+              detail={
+                autostart === false
+                  ? 'Nach einem Neustart des PCs kommen Notrufe und Alarme hier erst an, wenn du Heyda. wieder öffnest.'
+                  : 'Die Windows-App läuft im Infobereich weiter und meldet sich sofort, solange der PC an ist.'
+              }
+            />
+            {autostart !== undefined && (
+              <Toggle label="Beim Windows-Start öffnen" value={autostart} onChange={(v) => void changeAutostart(v)} />
+            )}
+          </>
         ) : isDesktop ? (
           <StatusLine ok title="Benachrichtigungen am PC" detail="Die Windows-App läuft im Infobereich weiter und meldet sich sofort, solange der PC an ist." />
         ) : (

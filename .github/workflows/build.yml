@@ -187,8 +187,30 @@ jobs:
       - run: npm run prepare-web -w desktop
       - run: npm run build -w desktop
       - run: npm run dist:win -w desktop
-      - name: Start the installed app and check it
-        run: npm run smoke -w desktop -- --exe dist/win-unpacked/Heyda.exe --out ../../windows-smoke/smoke.png
+      # The setup.exe that is published, not just the files it contains: install it silently for the
+      # current user, check the installed app and its Start menu shortcut, then uninstall it again.
+      - name: Install the setup, start the installed app and check it, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path "apps/desktop/dist/Heyda-Setup-${{ steps.version.outputs.version }}.exe").Path
+          $p = Start-Process -FilePath $setup -ArgumentList '/S', '/currentuser' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Setup failed with exit code $($p.ExitCode)" }
+          $exe = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Filter 'Heyda.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "The setup did not install Heyda.exe for the current user" }
+          $dir = Split-Path -Parent $exe
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Heyda.lnk'
+          if (-not (Test-Path $shortcut)) { throw "The setup did not create the Start menu shortcut" }
+          npm run smoke -w desktop -- --exe "$exe" --out ../../windows-smoke/smoke.png
+          if ($LASTEXITCODE -ne 0) { throw "The installed app failed its smoke test" }
+          Get-Process -Name Heyda -ErrorAction SilentlyContinue | Stop-Process -Force
+          # _?= runs the uninstaller in place, so -Wait waits for the real work (NSIS otherwise copies it to %TEMP% and returns at once).
+          $uninstaller = Get-ChildItem -Path $dir -Filter 'Uninstall*.exe' | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $uninstaller) { throw "The setup installed no uninstaller" }
+          $u = Start-Process -FilePath $uninstaller -ArgumentList '/S', '/currentuser', "_?=$dir" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "Uninstall failed with exit code $($u.ExitCode)" }
+          if (Test-Path $exe) { throw "The uninstaller left $exe behind" }
+          if (Test-Path $shortcut) { throw "The uninstaller left the Start menu shortcut behind" }
       - name: Collect
         shell: bash
         run: |

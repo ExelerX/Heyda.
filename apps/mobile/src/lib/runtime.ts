@@ -125,6 +125,8 @@ const MAX_CHAT_CHARS_PER_THREAD = 400_000;
 const MAX_CHAT_CHARS_TOTAL = 3_000_000;
 const MAX_ACTIVITY = 300;
 const MAX_ALARMS = 100;
+/** A Windows alarm whose time passed while the PC was off still rings this long after it: as long as the core keeps a watch. */
+const MISSED_ALARM_KEEP_MS = 12 * 3600_000;
 const MAX_ACTIVITY_TITLE = 200;
 const MAX_ACTIVITY_BODY = 600;
 const DATA_FILE = 'app-data';
@@ -261,8 +263,8 @@ export class AppRuntime {
         case 'alert': {
           const id = e.alert.id;
           const watch = id.startsWith('watch:');
-          // On Windows the alarm timer already rang for this watch; the core's overdue check reports it again.
-          const rang = isDesktop && watch && this.data.activity.some((a) => a.id === id);
+          // On Windows the alarm timer may have rung for this deadline already; the core's overdue check reports it again.
+          const rang = isDesktop && watch && this.rangSince(id, this.watchRingAt(e.alert));
           this.addActivity(e.alert);
           // On a phone the OS has an alarm with the same id, which may have rung already.
           if (!rang) deliverAlert(e.alert, watch ? () => this.data.alarms.find((a) => a.id === id && a.os)?.at : undefined);
@@ -352,7 +354,7 @@ export class AppRuntime {
     if (this.data.trip && !this.node.resumeTrip(this.data.trip)) this.data.trip = undefined;
     if (this.startDemo) this.stopDemo = this.startDemo(this.node);
     // Alarms of the Windows app only live while it runs: re-arm them.
-    if (isDesktop) for (const a of this.data.alarms) void scheduleAlarm(a, (x) => this.fireDesktopAlarm(x));
+    if (isDesktop) this.rearmDesktopAlarms();
     // Phone alarms the OS kept from before (a restore, a link, the demo) that this data no longer
     // knows would ring for nothing. A full list may have lost old entries: then none are touched.
     else void pruneAlarms(() => (this.disposed || this.data.alarms.length >= MAX_ALARMS ? undefined : this.data.alarms)).catch(() => {});
@@ -646,19 +648,58 @@ export class AppRuntime {
 
   // ---- internals ---------------------------------------------------------------------------
 
+  /**
+   * Those still to come ring on time. Those whose time passed while the PC was off wait until what
+   * the relays kept meanwhile has arrived, since the end of a watch or a check-in may be among it,
+   * and do not ring at all once older than the core keeps a watch.
+   */
+  private rearmDesktopAlarms(): void {
+    const fire = (a: Alarm) => this.fireDesktopAlarm(a);
+    const now = Date.now();
+    const missed = this.data.alarms.filter((a) => a.at <= now);
+    for (const a of this.data.alarms) if (a.at > now) void scheduleAlarm(a, fire);
+    // "Denk dran, dich zu melden" is pointless once the deadline itself has passed too.
+    const pastDue = new Set(missed.filter((a) => a.id.endsWith(':due')).map((a) => a.id.slice(0, -':due'.length)));
+    const late = missed.filter((a) => !(a.id.endsWith(':remind') && pastDue.has(a.id.slice(0, -':remind'.length))));
+    if (!late.length) return;
+    void this.node.whenCaughtUp().then(() => {
+      const oldest = Date.now() - MISSED_ALARM_KEEP_MS;
+      // Not one cancelled or moved meanwhile: that entry is gone from the list.
+      for (const a of late) if (!this.disposed && this.data.alarms.includes(a) && a.at >= oldest) void scheduleAlarm(a, fire);
+    });
+  }
+
   private fireDesktopAlarm(alarm: Alarm): void {
     if (this.disposed || !this.data.alarms.some((a) => a.id === alarm.id && a.at === alarm.at)) return;
     // Rung once: without this, every restart within 24 h re-arms it with delay 0 and it rings again.
     this.data.alarms = this.data.alarms.filter((a) => a.id !== alarm.id);
-    // The core's overdue check may have reported this watch a moment earlier; ring only once.
-    const already = this.data.activity.some((a) => a.id === alarm.id);
-    if (already) {
+    // The core's overdue check may have reported this deadline a moment earlier; ring only once.
+    if (this.rangSince(alarm.id, alarm.at)) {
       this.changed();
       return;
     }
-    const alert: Alert = { id: alarm.id, at: Date.now(), category: alarm.level === 'alarm' ? 'watch' : 'automation', level: alarm.level, title: alarm.title, body: alarm.body };
+    // Never stamped before its time (a timer may fire a moment early by the clock), so the check
+    // above and the one for the core's alert recognize this ring.
+    const at = Math.max(Date.now(), alarm.at);
+    const alert: Alert = { id: alarm.id, at, category: alarm.level === 'alarm' ? 'watch' : 'automation', level: alarm.level, title: alarm.title, body: alarm.body };
     this.addActivity(alert);
     deliverAlert(alert);
+  }
+
+  /**
+   * Whether the alarm with this id already rang for the time `at` it is due now. A ring for an
+   * earlier time does not count: a watch whose deadline moved after it rang rings again, and so
+   * do my own watch's reminders after I gave myself more time.
+   */
+  private rangSince(id: string, at: number | undefined): boolean {
+    return at !== undefined && this.data.activity.some((a) => a.id === id && a.at >= at);
+  }
+
+  /** When the core's overdue alert for a contact's watch was due: its deadline, or later for one that came late. */
+  private watchRingAt(alert: Alert): number | undefined {
+    const watchId = alert.ref?.watchId;
+    const w = alert.from && watchId ? this.data.statuses[alert.from]?.watches?.find((x) => x.watchId === watchId) : undefined;
+    return w ? Math.max(w.dueAt, w.ringAt ?? 0) : undefined;
   }
 
   private addActivity(alert: Alert): void {

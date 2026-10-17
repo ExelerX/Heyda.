@@ -110,6 +110,8 @@ export interface SocialNodeOptions {
   syncDelayMs?: number;
   /** What this device is (see `runsAutomationActions`). Default: phone. */
   deviceKind?: DeviceKind;
+  /** How long `start()` waits at most for what waited on the relays (see `whenCaughtUp`). For tests. */
+  backlogWaitMs?: number;
 }
 
 /** How long relays should keep a message for an offline phone, in seconds. */
@@ -157,6 +159,11 @@ const HISTORY_MARGIN_MS = 5 * 60_000;
 const HISTORY_SOS_WAIT_MS = 2 * 60_000;
 /** How long a contact's SOS that was never ended is kept. */
 const SOS_KEEP_MS = 3 * DAY;
+/**
+ * How long a start waits at most for what relays kept while the device was off, before deadlines
+ * that passed meanwhile ring anyway. Shorter than a background wake listens (20 s).
+ */
+const BACKLOG_WAIT_MS = 15_000;
 
 /** Message types whose newer copy replaces an older one still waiting in the outbox. */
 const REPLACEABLE = new Set(['presence', 'session.update', 'live.update', 'sos.update']);
@@ -237,6 +244,16 @@ export class SocialNode {
   private redeliverQueued = false;
   private pendingLink: PendingLink | undefined;
   /**
+   * False from `start()` until what waited on the relays while this device was off has arrived
+   * (or BACKLOG_WAIT_MS passed). Until then watches and SOS alerts whose time passed meanwhile do
+   * not ring: the check-in or end that calls them off may still be on its way.
+   */
+  private backlogIn = true;
+  private backlogDone: Promise<void> = Promise.resolve();
+  private backlogTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Counts starts, so a wait from an earlier run changes nothing. */
+  private runs = 0;
+  /**
    * Set while the synchronous part of handling a message sent before this device got the account
    * runs (see `NodeState.historyBefore`): `alert` and `runAutomations` then do nothing. Handlers
    * must raise alerts and start automations before their first `await` (they all do).
@@ -280,6 +297,7 @@ export class SocialNode {
       });
     });
     await this.transport.start();
+    this.awaitBacklog();
     this.lastDndActive = this.dndActive();
     this.emitLocationNeeds();
     // A computer waits for a phone it does not know about: let my other devices know what this one
@@ -292,8 +310,45 @@ export class SocialNode {
     this.running = false;
     if (this.syncTimer) clearTimeout(this.syncTimer);
     this.syncTimer = undefined;
+    clearTimeout(this.backlogTimer);
     this.unsubscribe?.();
     await this.transport.stop();
+  }
+
+  /**
+   * Resolves once what relays kept while this device was off has arrived, or the node stopped
+   * waiting for it. Alarms whose time passed meanwhile are judged only then (an end or check-in
+   * may be among it): the platform holds back its own copies of them until this resolves.
+   */
+  whenCaughtUp(): Promise<void> {
+    return this.backlogDone;
+  }
+
+  private awaitBacklog(): void {
+    const caughtUp = this.transport.caughtUp?.();
+    if (!caughtUp) return;
+    const run = ++this.runs;
+    this.backlogIn = false;
+    this.backlogDone = new Promise<void>((resolve) => {
+      clearTimeout(this.backlogTimer);
+      this.backlogTimer = setTimeout(resolve, this.options.backlogWaitMs ?? BACKLOG_WAIT_MS);
+      caughtUp.then(resolve, resolve);
+    }).then(() => {
+      if (run !== this.runs) return;
+      clearTimeout(this.backlogTimer);
+      this.backlogIn = true;
+      if (!this.running) return;
+      this.ringMissed(this.now());
+    });
+  }
+
+  /** Watches overdue and held SOS alerts whose wait is over: they ring now. */
+  private ringMissed(now: number): void {
+    // First what is too old to ring at all.
+    this.pruneStatuses(now);
+    if (!this.backlogIn) return;
+    this.checkOverdueWatches(now);
+    this.ringHeldSos(now);
   }
 
   on(listener: (e: NodeEvent) => void): () => void {
@@ -1442,9 +1497,7 @@ export class SocialNode {
     await this.broadcastPresence();
     const watches = this.state.watches.filter((w) => now < w.dueAt + 12 * HOUR);
     if (watches.length !== this.state.watches.length) this.update({ watches });
-    this.checkOverdueWatches(now);
-    this.pruneStatuses(now);
-    this.ringHeldSos(now);
+    this.ringMissed(now);
     this.pruneLists(now);
     if (this.pendingLink && this.pendingLink.expiresAt <= now) this.clearLink();
     this.emitLocationNeeds();

@@ -13,7 +13,7 @@ import { DEMO_KEYS } from '../lib/demo';
 import { beginLinkReceive, completeLink, type LinkSession } from '../lib/link';
 import { locationSupported, requestLocationAccess, type LocationAccess } from '../lib/location';
 import { notificationsAllowed, setupNotifications } from '../lib/notifications';
-import { isBrowserPreview, isDesktop } from '../lib/platform';
+import { autostartSupported, desktop, isBrowserPreview, isDesktop } from '../lib/platform';
 import { useRestart, useRuntime, useSnapshot, useTick } from '../lib/store';
 import { radius, spacing, TOUCH, useTheme } from '../lib/theme';
 
@@ -316,6 +316,7 @@ function Permissions({ name }: { name: string }) {
   const [notif, setNotif] = useState<'unknown' | 'granted' | 'denied'>('unknown');
   const [location, setLocation] = useState<LocationAccess>();
   const [keepAlive, setKeepAlive] = useState(true);
+  const [autostart, setAutostart] = useState(true);
   const [batteryOk, setBatteryOk] = useState(true);
   const [busy, setBusy] = useState<'notif' | 'location' | 'finish'>();
   const canNotify = !isBrowserPreview;
@@ -349,6 +350,8 @@ function Permissions({ name }: { name: string }) {
     setBusy('finish');
     try {
       if (keepAliveSupported) runtime.updateSettings({ keepAlive });
+      // Can be changed later under Ruhe or in the tray menu.
+      if (autostartSupported) await desktop!.setAutostart(autostart).catch(() => {});
       await runtime.setDisplayName(name);
       runtime.finishOnboarding();
       // Someone who tried the demo first and now starts for real.
@@ -419,6 +422,17 @@ function Permissions({ name }: { name: string }) {
               />
             </>
           )}
+        </PermissionCard>
+      )}
+
+      {autostartSupported && (
+        <PermissionCard icon="🖥️" title="Mit Windows starten">
+          <Toggle
+            label="Empfohlen"
+            detail="Dann läuft Heyda. nach jedem Neustart still im Infobereich, und Notrufe und Alarme kommen auch hier an."
+            value={autostart}
+            onChange={setAutostart}
+          />
         </PermissionCard>
       )}
 

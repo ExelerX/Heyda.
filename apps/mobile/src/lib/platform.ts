@@ -32,6 +32,8 @@ export const desktop: HeydaDesktopBridge | undefined =
 
 /** Running inside the Windows app. */
 export const isDesktop = desktop !== undefined;
+/** The Windows app can start by itself when the person logs in (off until they turn it on). */
+export const autostartSupported = desktop?.platform === 'win32';
 /** Android or iOS. */
 export const isNative = Platform.OS === 'android' || Platform.OS === 'ios';
 /** A plain browser (preview only): demo mode, nothing stored. */

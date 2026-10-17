@@ -52,8 +52,17 @@ if grep -nE "^E/ReactNativeJS" "$OUT/logcat.txt" | grep -viE "websocket|relay|ne
   echo "::error::JavaScript errors in the log (see above)."
   fail=1
 fi
-if ! grep -qiE "heyda|ankommst" "$OUT/start.xml" 2>/dev/null; then
+# Visible text only: every node of the dump carries package="io.github.exelerx.heyda", so matching
+# anywhere would pass on a blank screen or a stuck splash too.
+if [ ! -s "$OUT/start.xml" ]; then
+  echo "::error::No UI dump of the start screen."
+  fail=1
+elif ! grep -qE '(text|content-desc)="[^"]*(Heyda|ankommst)' "$OUT/start.xml"; then
   echo "::error::The start screen did not render the expected text."
+  fail=1
+fi
+if grep -qE '(text|content-desc)="[^"]*Kurz hängen geblieben' "$OUT"/*.xml 2>/dev/null; then
+  echo "::error::The app shows its error screen."
   fail=1
 fi
 [ "$fail" = 0 ] && echo "Android smoke test passed."

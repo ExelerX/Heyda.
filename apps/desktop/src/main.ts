@@ -91,8 +91,16 @@ function main(): void {
   ]);
   keepRunningInBackground();
 
+  // Electron hands over a launch made during startup right after 'ready', while onReady still runs.
+  // Showing a window then would create a second one that onReady replaces and whose bridge calls
+  // are refused, so wait for onReady to finish (it creates the window).
+  const started = app.whenReady().then(onReady);
+  started.catch(fatal);
+  const afterStart = (show: () => void): void => {
+    started.then(show, () => undefined);
+  };
   app.on('second-instance', (_event, argv) => {
-    if (app.isReady() && !argv.includes(HIDDEN_ARG)) showWindow();
+    if (!argv.includes(HIDDEN_ARG)) afterStart(() => showWindow());
   });
   app.on('web-contents-created', (_event, contents) => hardenWebContents(contents));
   app.on('before-quit', () => {
@@ -101,11 +109,7 @@ function main(): void {
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
   });
-  app.on('activate', () => {
-    if (app.isReady()) showWindow();
-  });
-
-  app.whenReady().then(onReady).catch(fatal);
+  app.on('activate', () => afterStart(() => showWindow()));
 }
 
 /**
@@ -593,7 +597,8 @@ async function saveFile(fileName: string, data: Buffer): Promise<boolean> {
     }),
   );
   if (result.canceled || result.filePath === undefined || result.filePath === '') return false;
-  await fs.writeFile(result.filePath, data);
+  // An existing file (an earlier backup of the same name) is replaced only once the new one is complete.
+  await writeFileAtomic(result.filePath, data);
   return true;
 }
 

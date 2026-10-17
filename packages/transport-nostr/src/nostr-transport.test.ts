@@ -4,7 +4,7 @@ import { createRumor, createSeal, createWrap } from 'nostr-tools/nip59';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { describe, expect, it } from 'vitest';
 import { APP_RUMOR_KIND, GIFT_WRAP_KIND, MemorySeenStore, NostrTransport } from './nostr-transport';
-import { MemoryRelayPool } from './pool';
+import { MemoryRelayPool, type FeedHandlers, type RelayPool } from './pool';
 
 const RELAY_A = 'wss://relay-a.example';
 const RELAY_B = 'wss://relay-b.example';
@@ -311,5 +311,29 @@ describe('NostrTransport', () => {
 
     await phone.send(getPublicKey(generateSecretKey()), composeMessage({ type: 'chat.text', text: 'x' }), { relays: [RELAY_B] });
     expect(pool.events.at(-1)?.relays).toEqual([RELAY_B]);
+  });
+
+  it('says when every own relay has handed over what it stored, so missed deadlines can be judged', async () => {
+    let feed: FeedHandlers | undefined;
+    const pool: RelayPool = {
+      publish: async () => {},
+      subscribe: (_relays, handlers) => {
+        feed = handlers;
+        return { close: () => {} };
+      },
+      close: () => {},
+    };
+    const t = new NostrTransport({ secretKey: generateSecretKey(), ownRelays: [RELAY_A, RELAY_B, RELAY_A], relaysFor: () => [], pool });
+    await t.start();
+    let done = false;
+    void t.caughtUp().then(() => (done = true));
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    feed!.onSynced!(RELAY_A);
+    feed!.onSynced!(RELAY_A);
+    await settle();
+    expect(done).toBe(false);
+    feed!.onSynced!(RELAY_B);
+    await settle();
+    expect(done).toBe(true);
   });
 });

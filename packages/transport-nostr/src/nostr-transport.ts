@@ -190,6 +190,8 @@ export class NostrTransport implements Transport {
   /** Messages `accept` turned down, by rumor id, oldest first. */
   private readonly refused = new Map<string, Refused>();
   private sub: { close(): void } | undefined;
+  /** Resolves once every own relay caught up after the last `start()`. */
+  private backlog: Promise<void> | undefined;
   private disposed = false;
 
   constructor(private readonly opts: NostrTransportOptions) {
@@ -206,11 +208,23 @@ export class NostrTransport implements Transport {
   async start(): Promise<void> {
     if (this.sub) return;
     if (this.disposed) throw new Error('transport disposed');
+    // Every own relay caught up once: then what waited while this device was off is in.
+    const pending = new Set(this.opts.ownRelays);
+    let backlogIn!: () => void;
+    this.backlog = new Promise<void>((resolve) => (backlogIn = resolve));
+    if (pending.size === 0) backlogIn();
     this.sub = this.pool.subscribe(this.opts.ownRelays, {
       filter: (relay) => ({ kinds: [GIFT_WRAP_KIND], '#p': [this.selfKey], since: this.sinceFor(relay) }),
       onEvent: (event) => this.handleWrap(event),
-      onSynced: (relay) => this.seen.setSyncedUntil(relay, this.nowS() - 60),
+      onSynced: (relay) => {
+        this.seen.setSyncedUntil(relay, this.nowS() - 60);
+        if (pending.delete(relay) && pending.size === 0) backlogIn();
+      },
     });
+  }
+
+  caughtUp(): Promise<void> {
+    return this.backlog ?? Promise.resolve();
   }
 
   async stop(): Promise<void> {

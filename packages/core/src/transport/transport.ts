@@ -40,4 +40,9 @@ export interface Transport {
    * known yet. The node calls it after it learned new contacts or group members.
    */
   redeliverRefused?(): void;
+  /**
+   * Optional, after `start()`: resolves once what relays kept for this device while it was off has
+   * been handed over. It may never resolve (offline, a relay down), so callers wait only a while.
+   */
+  caughtUp?(): Promise<void>;
 }
