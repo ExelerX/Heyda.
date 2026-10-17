@@ -135,6 +135,16 @@ const ORDER_TRUST_AHEAD_MS = 60_000;
 const FRESH_FIX_MS = 2 * 60_000;
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
+/** How long after its deadline a contact's watch is still taken, and its status kept. */
+const WATCH_KEEP_MS = 12 * HOUR;
+/** A watch that arrives after its deadline rings this long after it came, so a check-in caught up with it can still cancel it. */
+const LATE_WATCH_GRACE_MS = 2 * 60_000;
+/** Loud watch alarms (they ring through quiet mode) one contact may have ringing within an hour of each other. */
+const LOUD_WATCHES_PER_HOUR = 4;
+/** Queued messages tried first after being offline: someone may be waiting for them in an emergency. */
+const PRIORITY_TYPES = new Set(['sos.start', 'sos.update', 'sos.end', 'sos.ack', 'watch.start', 'watch.end', 'where.reply']);
+/** Failed sends to this many different people in a row, with no success in between, mean I am offline. */
+const OFFLINE_AFTER_FAILURES = 3;
 
 /** Message types whose newer copy replaces an older one still waiting in the outbox. */
 const REPLACEABLE = new Set(['presence', 'session.update', 'live.update', 'sos.update']);
@@ -189,8 +199,13 @@ export class SocialNode {
   private readonly sosAlarmLimiter = new RateLimiter(6, HOUR);
   private readonly whereLimiter = new RateLimiter(5, HOUR);
   private readonly askLimiter = new RateLimiter(5, HOUR);
-  /** Per contact: loud watch alarms (they ring through quiet mode). More ring as normal notifications. */
-  private readonly watchAlarmLimiter = new RateLimiter(4, HOUR);
+  /**
+   * Per contact: when their loud watch alarms ring (see `chargeLoudWatch`). A watch ended before
+   * it rang keeps its place, so starting and ending watches over and over gains nothing.
+   */
+  private readonly loudWatchRings = new Map<ContactKey, { watchId: string; at: number }[]>();
+  /** People the last try to send to failed while others could be reached. The outbox tries them last. */
+  private readonly unreachable = new Set<ContactKey>();
   /** Per contact: name and relay changes, each of which is saved and synced to my other devices. */
   private readonly helloLimiter = new RateLimiter(10, HOUR);
   private trip: TripSharer | undefined;
@@ -222,6 +237,11 @@ export class SocialNode {
     });
     for (const [key, status] of Object.entries(options.initialStatuses ?? {})) {
       if (this.contact(key) && status && typeof status === 'object') this.statuses.set(key, status);
+    }
+    // Loud alarms still to ring (or just rung) keep counting after a restart.
+    for (const [key, status] of this.statuses) {
+      const rings = (status.watches ?? []).filter((w) => !w.quiet).map((w) => ({ watchId: w.watchId, at: watchRingTime(w) }));
+      if (rings.length) this.loudWatchRings.set(key, rings);
     }
   }
 
@@ -462,6 +482,7 @@ export class SocialNode {
     if (this.state.liveShares.some((s) => s.contactKey === key)) await this.stopLive(key);
     for (const w of this.statuses.get(key)?.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
     this.statuses.delete(key);
+    this.loudWatchRings.delete(key);
     this.dropQueued((e) => e.to === key && (LOCATION_TYPES.has(e.message.type) || e.message.type === 'where.reply'));
     const grants = this.state.grants.filter((g) => g.contactKey !== key);
     this.update(
@@ -1230,42 +1251,55 @@ export class SocialNode {
     await this.flushSync();
   }
 
-  /** Tries to send everything that failed earlier (e.g. while offline). */
+  /**
+   * Tries to send everything that failed earlier (e.g. while offline). SOS, watch and where-answers
+   * go first. A failure holds back only the rest for that person (their relay may be gone for good),
+   * and only failures to several people in a row mean I am offline, which ends the round.
+   */
   async flushOutbox(force = false): Promise<void> {
     if (this.flushingOutbox || !this.state.outbox.length) return;
     this.flushingOutbox = true;
     try {
       const before = new Set(this.state.outbox);
       const now = this.now();
-      const keep: [OutboxEntry, OutboxEntry][] = [];
-      let offline = false;
+      const next = new Map<OutboxEntry, OutboxEntry>();
+      const failed = new Set<ContactKey>();
+      let failuresInARow = 0;
       const maxWaitMs = 10 * 60_000;
-      for (const e of before) {
+      // Stable, so messages to one person keep their order within each rank.
+      const rank = (e: OutboxEntry) => (PRIORITY_TYPES.has(e.message.type) ? 0 : 2) + (this.unreachable.has(e.to) ? 1 : 0);
+      for (const e of [...before].sort((a, b) => rank(a) - rank(b))) {
         // Only the time that is left, so a late retry does not keep the message on relays for longer
         // (and never more than it was given, also after the clock was set back).
         const ttlSeconds = Math.min(e.ttlSeconds, Math.ceil((e.firstAt + e.ttlSeconds * 1000 - now) / 1000));
         if (ttlSeconds <= 0) continue;
         // A retry further ahead than the longest wait means the clock was set back: it is due now.
         const waiting = e.nextAt !== undefined && e.nextAt > now && e.nextAt - now <= maxWaitMs;
-        if (offline || (!force && waiting)) {
-          keep.push([e, e]);
+        if (failuresInARow >= OFFLINE_AFTER_FAILURES || failed.has(e.to) || (!force && waiting)) {
+          next.set(e, e);
           continue;
         }
         try {
           await this.transport.send(e.to, e.message, { ttlSeconds });
+          failuresInARow = 0;
+          this.unreachable.delete(e.to);
         } catch {
           // A message the wire format rejects fails forever; keeping it would hold up everything behind it.
           if (!isSendable(e.message)) continue;
-          offline = true;
+          failed.add(e.to);
+          this.unreachable.add(e.to);
+          failuresInARow++;
           const attempts = e.attempts + 1;
-          keep.push([e, { ...e, attempts, nextAt: now + Math.min(maxWaitMs, 15_000 * 2 ** Math.min(attempts, 6)) }]);
+          next.set(e, { ...e, attempts, nextAt: now + Math.min(maxWaitMs, 15_000 * 2 ** Math.min(attempts, 6)) });
         }
       }
       // Entries queued while this loop was sending stay too; entries dropped meanwhile stay dropped.
       const current = new Set(this.state.outbox);
       const added = this.state.outbox.filter((e) => !before.has(e));
-      const kept = keep.filter(([orig]) => current.has(orig)).map(([, next]) => next);
-      this.update({ outbox: [...kept, ...added].slice(-MAX_OUTBOX) });
+      const kept = [...before].flatMap((e) => (current.has(e) && next.has(e) ? [next.get(e)!] : []));
+      const outbox = [...kept, ...added].slice(-MAX_OUTBOX);
+      for (const k of [...this.unreachable]) if (!outbox.some((e) => e.to === k)) this.unreachable.delete(k);
+      this.update({ outbox });
     } finally {
       this.flushingOutbox = false;
     }
@@ -1446,6 +1480,7 @@ export class SocialNode {
         if (kept.has(key)) continue;
         for (const w of status.watches ?? []) this.emit({ type: 'alarm.cancel', id: `watch:${key}:${w.watchId}` });
         this.statuses.delete(key);
+        this.loudWatchRings.delete(key);
       }
       // A live share with someone removed on another device would keep the GPS running for nobody.
       const liveShares = this.state.liveShares.filter((l) => kept.has(l.contactKey));
@@ -1499,6 +1534,8 @@ export class SocialNode {
     if (this.ended.has(`trip|${from}|${m.sessionId}`)) return;
     const prev = this.statuses.get(from)?.trip;
     const same = prev?.sessionId === m.sessionId;
+    // Relays may reorder: an older trip caught up late must not replace the one running now.
+    if (prev && !same && isOlder(senderTime(m.sentAt, at), prev.lastSentAt, at)) return;
     this.setStatus(from, {
       trip: {
         ...(same ? prev : {}),
@@ -1566,7 +1603,10 @@ export class SocialNode {
   }
 
   private async onPlaceEvent(from: ContactKey, m: MessageOf<'place.event'>, at: number): Promise<void> {
-    this.setStatus(from, { lastPlace: { kind: m.kind, placeName: m.placeName, at } });
+    const sentAt = senderTime(m.sentAt, at);
+    // An older arrive or leave caught up late is out of date: no new state, alert or automation.
+    if (isOlder(sentAt, this.statuses.get(from)?.lastPlace?.sentAt, at)) return;
+    this.setStatus(from, { lastPlace: { kind: m.kind, placeName: m.placeName, at, sentAt } });
     const arrive = m.kind === 'arrive';
     this.alert({
       category: 'arrival',
@@ -1632,32 +1672,34 @@ export class SocialNode {
 
   private onWatchStart(from: ContactKey, m: MessageOf<'watch.start'>, at: number): void {
     if (this.ended.has(`watch|${from}|${m.watchId}`)) return;
-    if (m.dueAt <= at - HOUR || m.dueAt > at + MAX_WATCH_MS + HOUR) return;
+    // One that went overdue while I was offline still rings: it matters most then.
+    if (m.dueAt <= at - WATCH_KEEP_MS || m.dueAt > at + MAX_WATCH_MS + HOUR) return;
     const watches = this.statuses.get(from)?.watches ?? [];
     const existing = watches.find((w) => w.watchId === m.watchId);
+    const sentAt = senderTime(m.sentAt, at);
+    // Relays may reorder: an older copy (from before the deadline moved) must not bring its time back.
+    if (existing && isOlder(sentAt, existing.lastSentAt, at)) return;
     if (existing && existing.dueAt === m.dueAt && existing.label === m.label) return;
     if (!existing && watches.length >= MAX_WATCHES_PER_CONTACT) return;
     // A watch that already rang rings again only when its deadline really moves into the future.
     if (existing?.firedAt !== undefined && m.dueAt <= at) return;
-    // Watch alarms ring through quiet mode, so each new ring takes one from a small hourly
-    // budget per contact; past it they ring as normal notifications. Moving the deadline of a
-    // watch that has not rung yet adds no ring and keeps its loudness.
-    const pending = existing !== undefined && existing.firedAt === undefined && existing.dueAt > at;
-    const quiet = pending ? existing.quiet === true : !this.watchAlarmLimiter.allow(from, at);
-    const next = { watchId: m.watchId, label: m.label, dueAt: m.dueAt, startedAt: existing?.startedAt ?? at, ...(quiet ? { quiet } : {}) };
+    // Arrived after its deadline: rings a moment later, so a check-in caught up with it can cancel it.
+    const ringAt = Math.max(m.dueAt, at + LATE_WATCH_GRACE_MS);
+    // A deadline that moves before its alarm rang takes its place in the budget along.
+    const rang = existing !== undefined && (existing.firedAt !== undefined || watchRingTime(existing) <= at);
+    const moved = existing !== undefined && !rang && !existing.quiet ? watchRingTime(existing) : undefined;
+    const loud = this.chargeLoudWatch(from, m.watchId, ringAt, at, moved);
+    const next = {
+      watchId: m.watchId,
+      label: m.label,
+      dueAt: m.dueAt,
+      startedAt: existing?.startedAt ?? at,
+      lastSentAt: sentAt,
+      ...(ringAt > m.dueAt ? { ringAt } : {}),
+      ...(loud ? {} : { quiet: true }),
+    };
     this.setStatus(from, { watches: [...watches.filter((w) => w.watchId !== m.watchId), next] });
-    const c = this.contact(from);
-    const dndThen = isDndActive(this.state.prefs.dnd, m.dueAt, this.localTime);
-    this.emit({
-      type: 'alarm.schedule',
-      alarm: {
-        id: `watch:${from}:${m.watchId}`,
-        at: m.dueAt,
-        title: `⏰ ${this.name(from)} hat sich nicht gemeldet`,
-        body: `„${m.label}“ war bis ${this.hhmm(m.dueAt)} geplant. Frag nach, ob alles okay ist.`,
-        level: alertLevel({ category: quiet ? 'trip' : 'watch', favorite: c?.favorite, muted: c?.muted }, this.state.prefs, dndThen),
-      },
-    });
+    this.emit({ type: 'alarm.schedule', alarm: this.watchAlarm(from, next) });
     this.alert({
       category: 'trip',
       title: existing ? `${this.name(from)} hat die Zeit geändert` : `${this.name(from)}: Pass auf mich auf`,
@@ -1666,6 +1708,49 @@ export class SocialNode {
       thread: from,
       ref: { watchId: m.watchId },
     });
+  }
+
+  /**
+   * Whether a contact's watch alarm ringing at `ringAt` may be loud (watch alarms ring through
+   * quiet mode): a few per contact within an hour of each other, counted by when they ring, so
+   * checkpoints of a long hike planned ahead all stay loud while a flood of watches does not.
+   * Past that they ring as a normal notification. `moved`: the earlier ring time of this watch,
+   * whose place is freed because its deadline moved before it rang.
+   */
+  private chargeLoudWatch(from: ContactKey, watchId: string, ringAt: number, now: number, moved?: number): boolean {
+    const rings = (this.loudWatchRings.get(from) ?? []).filter((r) => r.at > now - HOUR && !(r.watchId === watchId && r.at === moved));
+    const loud = rings.filter((r) => Math.abs(r.at - ringAt) < HOUR).length < LOUD_WATCHES_PER_HOUR;
+    if (loud) rings.push({ watchId, at: ringAt });
+    if (rings.length) this.loudWatchRings.set(from, rings.slice(-200));
+    else this.loudWatchRings.delete(from);
+    return loud;
+  }
+
+  /** The alarm scheduled for a contact's watch, as loud as my settings allow when it rings. */
+  private watchAlarm(key: ContactKey, w: NonNullable<ContactStatus['watches']>[number], prefs = this.state.prefs): Alarm {
+    const at = watchRingTime(w);
+    return {
+      id: `watch:${key}:${w.watchId}`,
+      at,
+      title: `⏰ ${this.name(key)} hat sich nicht gemeldet`,
+      body: `„${w.label}“ war bis ${this.hhmm(w.dueAt)} geplant. Frag nach, ob alles okay ist.`,
+      level: alertLevel({ category: 'watch', overBudget: w.quiet }, prefs, isDndActive(prefs.dnd, at, this.localTime)),
+    };
+  }
+
+  /**
+   * Quiet mode or its rules changed: alarms scheduled ahead with the OS (they ring even with the
+   * app closed) get the loudness they now should have.
+   */
+  private rescheduleWatchAlarms(before: NotificationPrefs): void {
+    const now = this.now();
+    for (const [key, status] of this.statuses) {
+      for (const w of status.watches ?? []) {
+        if (w.firedAt !== undefined || watchRingTime(w) <= now) continue;
+        const alarm = this.watchAlarm(key, w);
+        if (alarm.level !== this.watchAlarm(key, w, before).level) this.emit({ type: 'alarm.schedule', alarm });
+      }
+    }
   }
 
   private onWatchEnd(from: ContactKey, m: MessageOf<'watch.end'>): void {
@@ -1682,13 +1767,14 @@ export class SocialNode {
 
   private checkOverdueWatches(now: number): void {
     for (const [key, status] of [...this.statuses]) {
-      if (!status.watches?.some((w) => !w.firedAt && now >= w.dueAt)) continue;
+      if (!status.watches?.some((w) => !w.firedAt && now >= watchRingTime(w))) continue;
       const watches = status.watches.map((w) => {
-        if (w.firedAt || now < w.dueAt) return w;
+        if (w.firedAt || now < watchRingTime(w)) return w;
         // Same id as the scheduled alarm, so the platform shows one notification, not two.
         this.alert({
           id: `watch:${key}:${w.watchId}`,
-          category: w.quiet ? 'trip' : 'watch',
+          category: 'watch',
+          overBudget: w.quiet,
           title: `⏰ ${this.name(key)} hat sich nicht gemeldet`,
           body: `„${w.label}“ war bis ${this.hhmm(w.dueAt)} geplant. Frag nach, ob alles okay ist.`,
           from: key,
@@ -1707,24 +1793,36 @@ export class SocialNode {
     if (m.type === 'sos.start') {
       // `endedAt` survives a restart, the `ended` list does not: a late copy must not revive it.
       if (this.ended.has(`sos|${from}|${m.sosId}`) || (same && prev.endedAt !== undefined)) return;
+      const sentAt = senderTime(m.sentAt, at);
+      // Relays hand stored messages over in any order. An older alert (say one pressed by accident
+      // and cancelled) must not replace a newer one, and an older copy of this one (it is sent again
+      // when pressed again) must not bring back its text and helpers.
+      if (prev && !same && isOlder(sentAt, prev.lastSentAt, at)) return;
+      if (same && isOlder(sentAt, prev.startSentAt, at)) return;
+      // Nor its location, if a newer one came with an update in between.
+      const newest = !same || !isOlder(sentAt, prev.lastSentAt, at);
+      const point = newest && m.point ? m.point : same ? prev.point : undefined;
       this.setStatus(from, {
         sos: {
           sosId: m.sosId,
           startedAt: same ? prev.startedAt : at,
           text: m.text,
-          point: m.point ?? (same ? prev.point : undefined),
-          pointAt: m.point ? at : same ? prev.pointAt : undefined,
+          point,
+          pointAt: point && point === m.point ? at : same ? prev.pointAt : undefined,
           others: m.others.filter((o) => o.key !== this.state.self.key && o.key !== from),
           acks: same ? prev.acks : [],
-          lastSentAt: senderTime(m.sentAt, at),
+          lastSentAt: newest ? sentAt : prev.lastSentAt,
+          startSentAt: sentAt,
         },
       });
       if (same) return;
-      // An SOS always rings. Only a flood of them from one person is turned down to a normal notification.
+      // An SOS always rings. Only a flood of them from one person is turned down to a normal
+      // notification, which still nothing can switch off.
       const alarm = this.sosAlarmLimiter.allow(from, at);
       this.alert({
         id: `sos:${from}:${m.sosId}`,
-        category: alarm ? 'sos' : 'chat',
+        category: 'sos',
+        overBudget: !alarm,
         title: `🆘 ${this.name(from)} braucht Hilfe!`,
         body: m.text ?? (m.point ? 'Der Standort ist dabei. Tippe, um ihn zu sehen.' : 'Bitte melde dich sofort.'),
         from,
@@ -2010,6 +2108,7 @@ export class SocialNode {
   private async deliver(to: ContactKey, message: AppMessage, ttlSeconds: number): Promise<void> {
     try {
       await this.transport.send(to, message, { ttlSeconds });
+      this.unreachable.delete(to);
     } catch {
       // Not offline but unsendable (e.g. a relay address the wire rejects): retrying cannot help.
       if (!isSendable(message)) return;
@@ -2049,13 +2148,15 @@ export class SocialNode {
    * person is safe): it comes through quiet mode and can't be switched off like the SOS itself,
    * but as a normal notification, not a second alarm.
    */
-  private alert(input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean; followUp?: boolean }): void {
+  private alert(
+    input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean; followUp?: boolean; overBudget?: boolean },
+  ): void {
     const now = this.now();
-    const { urgent, id, followUp, ...rest } = input;
+    const { urgent, id, followUp, overBudget, ...rest } = input;
     const c = input.from ? this.contact(input.from) : undefined;
     let level: AlertLevel = followUp
       ? 'normal'
-      : alertLevel({ category: input.category, favorite: c?.favorite, muted: c?.muted, urgent }, this.state.prefs, this.dndActive());
+      : alertLevel({ category: input.category, favorite: c?.favorite, muted: c?.muted, urgent, overBudget }, this.state.prefs, this.dndActive());
     const critical = input.category === 'sos' || input.category === 'watch';
     if (!critical && input.from && level !== 'feed' && !this.alertLimiter.allow(input.from, now)) level = 'feed';
     this.emit({ type: 'alert', alert: { ...rest, id: id ?? randomId(), at: now, level } });
@@ -2136,7 +2237,9 @@ export class SocialNode {
         if (JSON.stringify(p) !== JSON.stringify(s.presence)) patch.presence = p;
       }
       if (s.sos && ((s.sos.endedAt !== undefined && now - s.sos.endedAt > DAY) || now - s.sos.startedAt > 3 * DAY)) patch.sos = undefined;
-      if (s.watches?.some((w) => now > w.dueAt + 12 * HOUR)) patch.watches = s.watches.filter((w) => now <= w.dueAt + 12 * HOUR);
+      if (s.watches?.some((w) => now > watchRingTime(w) + WATCH_KEEP_MS)) {
+        patch.watches = s.watches.filter((w) => now <= watchRingTime(w) + WATCH_KEEP_MS);
+      }
       if (Object.keys(patch).length) this.setStatus(key, patch);
     }
   }
@@ -2176,6 +2279,8 @@ export class SocialNode {
     }
     this.state = next;
     this.emit({ type: 'state', state: this.state });
+    // From any source: settings, quiet mode by hand or automation, its end, my other device.
+    if (next.prefs !== before.prefs) this.rescheduleWatchAlarms(before.prefs);
     if (syncFields.length) this.markSync();
     if (next.contacts !== before.contacts || next.groups !== before.groups) this.redeliverSoon();
   }
@@ -2280,6 +2385,11 @@ function checkWatchTime(dueAt: number, now: number): void {
   if (!Number.isFinite(dueAt) || dueAt < now + MIN_WATCH_MS || dueAt > now + MAX_WATCH_MS) {
     throw new RangeError('Die Zeit muss zwischen 5 Minuten und 48 Stunden in der Zukunft liegen.');
   }
+}
+
+/** When a contact's watch alarm rings: at its deadline, or a moment after it arrived if that was later. */
+function watchRingTime(w: { dueAt: number; ringAt?: number }): number {
+  return Math.max(w.dueAt, w.ringAt ?? 0);
 }
 
 function watchTtl(dueAt: number, now: number): number {

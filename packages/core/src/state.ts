@@ -152,7 +152,8 @@ export interface ContactStatus {
     updatedAt: number;
     lastSentAt: number;
   };
-  lastPlace?: { kind: 'arrive' | 'leave'; placeName: string; at: number };
+  /** `sentAt`: the sender's clock, so an older event caught up late does not overwrite a newer one. */
+  lastPlace?: { kind: 'arrive' | 'leave'; placeName: string; at: number; sentAt?: number };
   live?: {
     shareId: string;
     level: 'coarse' | 'precise';
@@ -179,10 +180,25 @@ export interface ContactStatus {
     acks: { key: ContactKey; name: string; at: number; text?: string }[];
     endedAt?: number;
     endReason?: 'safe' | 'cancelled';
+    /** The sender's clock of the newest message of this alert, and of the newest start (sent again when pressed again). */
     lastSentAt?: number;
+    startSentAt?: number;
   };
-  /** `quiet`: this contact used up its hourly budget of loud alarms, so it rings as a normal notification. */
-  watches?: { watchId: string; label: string; dueAt: number; startedAt: number; firedAt?: number; quiet?: boolean }[];
+  /**
+   * `quiet`: this contact used up its hourly budget of loud alarms, so it rings as a normal notification.
+   * `ringAt`: when the alarm rings, if later than `dueAt` (the watch arrived after its deadline).
+   * `lastSentAt`: the sender's clock of the start or change I took, so an older copy is ignored.
+   */
+  watches?: {
+    watchId: string;
+    label: string;
+    dueAt: number;
+    startedAt: number;
+    firedAt?: number;
+    quiet?: boolean;
+    ringAt?: number;
+    lastSentAt?: number;
+  }[];
   lastCheckin?: { kind: CheckinKind; text?: string; placeName?: string; at: number };
   lastWhere?: {
     requestId: string;

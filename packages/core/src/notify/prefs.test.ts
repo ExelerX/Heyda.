@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { alertLevel, DEFAULT_PREFS, dndEndsAt, isDndActive, normalizePrefs, scheduleActive } from './prefs';
+import { alertLevel, DEFAULT_PREFS, dndEndsAt, isDndActive, normalizePrefs, scheduleActive, type AlertCategory } from './prefs';
 
 const at = (weekday: number, hhmm: string) => {
   const [h, m] = hhmm.split(':').map(Number);
@@ -42,6 +42,15 @@ describe('alertLevel', () => {
   it('rings for overdue watches unless the user turned that off for quiet mode', () => {
     expect(alertLevel({ category: 'watch' }, prefs, true)).toBe('alarm');
     expect(alertLevel({ category: 'watch' }, { ...prefs, dnd: { ...prefs.dnd, allowWatch: false } }, true)).toBe('silent');
+  });
+
+  it('past the hourly budget, SOS and watch alarms are a normal notification nothing can switch off', () => {
+    const everythingOff = { ...prefs, off: ['chat', 'trip', 'checkin'] as AlertCategory[] };
+    expect(alertLevel({ category: 'sos', muted: true, overBudget: true }, everythingOff, true)).toBe('normal');
+    expect(alertLevel({ category: 'watch', muted: true, overBudget: true }, everythingOff, true)).toBe('normal');
+    expect(alertLevel({ category: 'watch', overBudget: true }, prefs, false)).toBe('normal');
+    // Only "Pass auf mich auf durchlassen" switched off keeps them quiet in quiet mode, as for any watch.
+    expect(alertLevel({ category: 'watch', overBudget: true }, { ...prefs, dnd: { ...prefs.dnd, allowWatch: false } }, true)).toBe('silent');
   });
 
   it('handles categories, mutes, favourites and urgent messages', () => {

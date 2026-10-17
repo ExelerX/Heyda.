@@ -117,12 +117,20 @@ export interface AlertSource {
   muted?: boolean;
   /** The sender asked to break through, and the rate limit allowed it. */
   urgent?: boolean;
+  /**
+   * An SOS or watch alarm from someone who used up their small hourly budget of alarms: still
+   * nothing can switch it off (not muting, not the "off" list), but it is a normal notification.
+   */
+  overBudget?: boolean;
 }
 
 export function alertLevel(source: AlertSource, prefs: NotificationPrefs, dndActive: boolean): AlertLevel {
   const { category } = source;
-  if (category === 'sos') return 'alarm';
-  if (category === 'watch') return dndActive && !prefs.dnd.allowWatch ? 'silent' : 'alarm';
+  if (category === 'sos') return source.overBudget ? 'normal' : 'alarm';
+  if (category === 'watch') {
+    if (dndActive && !prefs.dnd.allowWatch) return 'silent';
+    return source.overBudget ? 'normal' : 'alarm';
+  }
   if (prefs.off.includes(category)) return 'feed';
   if (source.muted) return 'feed';
   if (!dndActive) return 'normal';

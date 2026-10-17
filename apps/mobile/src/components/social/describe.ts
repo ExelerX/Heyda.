@@ -95,8 +95,9 @@ const CATEGORY_ICON: Record<Alert['category'], string> = {
   device: '💻',
 };
 
-export function alertIcon(a: Pick<Alert, 'category' | 'level'>): string {
-  // SOS follow-ups ("X kümmert sich", "X ist in Sicherheit") are calm news, not a new alarm.
-  if (a.category === 'sos' && a.level !== 'alarm') return '🤝';
+export function alertIcon(a: Pick<Alert, 'id' | 'category' | 'level'>): string {
+  // SOS follow-ups ("X kümmert sich", "X ist in Sicherheit") are calm news, not a new alarm. The
+  // SOS itself ("sos:…") keeps its icon, also when one of too many in an hour came as a normal notification.
+  if (a.category === 'sos' && a.level !== 'alarm' && !a.id.startsWith('sos:')) return '🤝';
   return CATEGORY_ICON[a.category] ?? '🔔';
 }
