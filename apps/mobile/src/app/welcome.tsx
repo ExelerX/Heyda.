@@ -14,6 +14,7 @@ import { beginLinkReceive, completeLink, type LinkSession } from '../lib/link';
 import { locationSupported, requestLocationAccess, type LocationAccess } from '../lib/location';
 import { notificationsAllowed, setupNotifications } from '../lib/notifications';
 import { autostartSupported, desktop, isBrowserPreview, isDesktop } from '../lib/platform';
+import { getRuntime } from '../lib/runtime';
 import { useRestart, useRuntime, useSnapshot, useTick } from '../lib/store';
 import { radius, spacing, TOUCH, useTheme } from '../lib/theme';
 
@@ -207,7 +208,7 @@ function Choose({ onPick }: { onPick: (s: StepName) => void }) {
       !runtime.isDemo &&
       !(await confirm({
         title: 'Demo starten?',
-        message: 'Solange die Demo läuft, ist dein Konto offline: Nachrichten, Notrufe und „Pass auf mich auf“ kommen weder bei dir noch bei deinen Kontakten an.',
+        message: 'Solange die Demo läuft, ist dein Konto offline: Nachrichten, Notrufe und „Pass auf mich auf“ kommen weder bei dir noch bei deinen Kontakten an. Was du in der Demo machst, ist danach wieder weg.',
         ok: 'Demo starten',
       }))
     ) {
@@ -309,6 +310,20 @@ function PermissionCard({ icon, title, children }: { icon: string; title: string
   );
 }
 
+/** Windows: start with Windows, for a new account and for one linked from another device alike. */
+function AutostartCard({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <PermissionCard icon="🖥️" title="Mit Windows starten">
+      <Toggle
+        label="Empfohlen"
+        detail="Dann läuft Heyda. nach jedem Neustart still im Infobereich, und Notrufe und Alarme kommen auch hier an."
+        value={value}
+        onChange={onChange}
+      />
+    </PermissionCard>
+  );
+}
+
 function Permissions({ name }: { name: string }) {
   const t = useTheme();
   const runtime = useRuntime();
@@ -352,12 +367,16 @@ function Permissions({ name }: { name: string }) {
       if (keepAliveSupported) runtime.updateSettings({ keepAlive });
       // Can be changed later under Ruhe or in the tray menu.
       if (autostartSupported) await desktop!.setAutostart(autostart).catch(() => {});
-      await runtime.setDisplayName(name);
-      runtime.finishOnboarding();
-      // Someone who tried the demo first and now starts for real.
       if (runtime.isDemo && !isBrowserPreview) {
+        // Someone who tried the demo first and now starts for real: the account comes back as it
+        // was before the demo (nothing from the demo goes along), and gets the name there.
+        runtime.finishOnboarding();
         await runtime.setDemo(false);
         await restart();
+        await (await getRuntime()).setDisplayName(name);
+      } else {
+        await runtime.setDisplayName(name);
+        runtime.finishOnboarding();
       }
       router.replace('/');
     } catch (e) {
@@ -425,16 +444,7 @@ function Permissions({ name }: { name: string }) {
         </PermissionCard>
       )}
 
-      {autostartSupported && (
-        <PermissionCard icon="🖥️" title="Mit Windows starten">
-          <Toggle
-            label="Empfohlen"
-            detail="Dann läuft Heyda. nach jedem Neustart still im Infobereich, und Notrufe und Alarme kommen auch hier an."
-            value={autostart}
-            onChange={setAutostart}
-          />
-        </PermissionCard>
-      )}
+      {autostartSupported && <AutostartCard value={autostart} onChange={setAutostart} />}
 
       <Button title="Fertig" icon="🚀" onPress={() => void finish()} busy={busy === 'finish'} disabled={!!busy} style={{ marginTop: spacing.sm }} />
     </View>
@@ -466,6 +476,8 @@ function LinkReceive() {
   const [pending, setPending] = useState<LinkPayload>();
   const [error, setError] = useState<string>();
   const [copied, setCopied] = useState(false);
+  // Offered with the account, as when starting a new one.
+  const [autostart, setAutostart] = useState(true);
   const copyTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   // Kept in refs so a re-render (restart handed out a new function) never cancels a running link.
   const restartRef = useRef(restart);
@@ -530,6 +542,8 @@ function LinkReceive() {
     setPhase('received');
     let stopped = false;
     try {
+      // Can be changed later under Ruhe or in the tray menu.
+      if (autostartSupported) await desktop!.setAutostart(autostart).catch(() => {});
       // Stop this device's empty account first so it cannot save over the received one.
       await runtimeRef.current.shutdown(false);
       stopped = true;
@@ -582,7 +596,11 @@ function LinkReceive() {
         </Card>
       )}
 
-      {phase === 'confirm' && pending && <ConfirmAccount payload={pending} onYes={() => void accept()} onNo={reject} />}
+      {phase === 'confirm' && pending && (
+        <ConfirmAccount payload={pending} onYes={() => void accept()} onNo={reject}>
+          {autostartSupported && <AutostartCard value={autostart} onChange={setAutostart} />}
+        </ConfirmAccount>
+      )}
 
       {phase === 'rejected' && (
         <>
@@ -692,8 +710,8 @@ function LinkReceive() {
   );
 }
 
-/** Shows what arrived and lets the person refuse an account that is not theirs. */
-function ConfirmAccount({ payload, onYes, onNo }: { payload: LinkPayload; onYes: () => void; onNo: () => void }) {
+/** Shows what arrived and lets the person refuse an account that is not theirs. `children` go above the answers. */
+function ConfirmAccount({ payload, onYes, onNo, children }: { payload: LinkPayload; onYes: () => void; onNo: () => void; children?: ReactNode }) {
   const t = useTheme();
   const contacts = Array.isArray(payload.doc.contacts) ? payload.doc.contacts : [];
   const name = payload.doc.profileName?.trim() || 'ohne Namen';
@@ -730,6 +748,7 @@ function ConfirmAccount({ payload, onYes, onNo }: { payload: LinkPayload; onYes:
       <Bullet icon="⚠️">
         Kennst du den Namen oder das Gerät nicht? Dann tippe auf „Nein, abbrechen“. Sonst landet ein fremdes Konto auf diesem Gerät.
       </Bullet>
+      {children}
       <Button title="Ja, das ist mein Konto" icon="✅" onPress={onYes} />
       <Button title="Nein, abbrechen" kind="secondary" onPress={onNo} />
     </View>

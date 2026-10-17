@@ -45,4 +45,9 @@ export interface Transport {
    * been handed over. It may never resolve (offline, a relay down), so callers wait only a while.
    */
   caughtUp?(): Promise<void>;
+  /**
+   * Optional, while started: resolves once every relay of this device has again handed over what
+   * it kept, after this call (e.g. after the device slept). May never resolve, like `caughtUp`.
+   */
+  caughtUpAgain?(): Promise<void>;
 }

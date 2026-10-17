@@ -20,6 +20,7 @@ export * from './automation/templates';
 export * from './automation/plugin';
 export * from './automation/describe';
 export * from './notify/prefs';
+export * from './notify/alarm';
 export * from './features/live';
 export * from './features/labels';
 export * from './sync/xfer';

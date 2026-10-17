@@ -39,6 +39,8 @@ function toFix(l: Location.LocationObject): LocationFix {
 
 async function feed(locations: Location.LocationObject[]): Promise<void> {
   const runtime = await getRuntime();
+  // The demo never gets the real location (tracking left over from before it is stopped).
+  if (runtime.isDemo) return;
   // As one batch: if the fixes are dated ahead of the phone's clock, they keep their order and spacing.
   await runtime.node.onLocationFixes(locations.map(toFix));
   await runtime.flushIfDirty();
@@ -59,6 +61,7 @@ if (locationSupported) {
     const placeId = data?.region?.identifier;
     if (error || !placeId) return;
     const runtime = await getRuntime();
+    if (runtime.isDemo) return;
     const inside = data.eventType === Location.GeofencingEventType.Enter;
     if (Date.now() - registeredAt < REGISTRATION_GRACE_MS) runtime.node.syncPlaceState(placeId, inside);
     else await runtime.node.onPlaceTransition(placeId, inside ? 'arrive' : 'leave');
@@ -123,10 +126,19 @@ function latestOnly<I, O>(apply: (input: I) => Promise<O>, fallback: O): (input:
  */
 export const applyLocationNeeds = latestOnly(applyNeedsNow, 'denied' as LocationAccess);
 
-async function applyNeedsNow(needs: LocationNeeds): Promise<LocationAccess> {
+/**
+ * Stops all tracking, also what an earlier run of the app left running with the OS, e.g. when the
+ * demo takes over from a real account. In line with `applyLocationNeeds`, so no earlier call starts it again.
+ */
+export function stopLocation(): Promise<LocationAccess> {
+  return applyLocationNeeds({ mode: 'off', reasons: [], force: true });
+}
+
+/** `force`: stop whatever runs, even when this run of the app thinks nothing does. */
+async function applyNeedsNow(needs: LocationNeeds & { force?: boolean }): Promise<LocationAccess> {
   if (!locationSupported) return 'denied';
   const access = await currentLocationAccess();
-  if (needs.mode === currentMode && (needs.mode === 'off' || foregroundWatch || (await isTracking()))) return access;
+  if (!needs.force && needs.mode === currentMode && (needs.mode === 'off' || foregroundWatch || (await isTracking()))) return access;
   await stopTracking();
   currentMode = needs.mode;
   if (needs.mode === 'off' || access === 'denied') return access;

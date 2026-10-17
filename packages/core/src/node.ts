@@ -167,6 +167,11 @@ const SOS_KEEP_MS = 3 * DAY;
  * that passed meanwhile ring anyway. Shorter than a background wake listens (20 s).
  */
 const BACKLOG_WAIT_MS = 15_000;
+/**
+ * A deadline seen this long after it passed, with no tick in between: the device slept or the app
+ * was frozen meanwhile (ticks come every 15–60 s), so what relays kept may hold its check-in.
+ */
+const LATE_RING_MS = 60_000;
 
 /** Message types whose newer copy replaces an older one still waiting in the outbox. */
 const REPLACEABLE = new Set(['presence', 'session.update', 'live.update', 'sos.update']);
@@ -254,8 +259,12 @@ export class SocialNode {
   private backlogIn = true;
   private backlogDone: Promise<void> = Promise.resolve();
   private backlogTimer: ReturnType<typeof setTimeout> | undefined;
-  /** Counts starts, so a wait from an earlier run changes nothing. */
+  /** Counts waits (starts and wake-ups), so an earlier wait changes nothing. */
   private runs = 0;
+  /** Counts starts, so the first catch-up of an earlier run does not end the history. */
+  private starts = 0;
+  /** When `tick()` last ran (or the node started), to notice a device that slept through a deadline. */
+  private lastTickAt: number | undefined;
   /**
    * Set while the synchronous part of handling a message sent before this device got the account
    * runs (see `NodeState.historyBefore`): `alert` and `runAutomations` then do nothing. Handlers
@@ -309,8 +318,10 @@ export class SocialNode {
     });
     await this.transport.start();
     this.awaitBacklog();
+    this.lastTickAt = this.now();
     this.lastDndActive = this.dndActive();
     this.emitLocationNeeds();
+    this.rearmAlarms(this.now());
     // A computer waits for a phone it does not know about: let my other devices know what this one
     // is, so another computer can tell it need not wait (they answer with what they are).
     if (this.deviceKind === 'computer' && this.state.devices.some((d) => d.kind === undefined)) this.markSync();
@@ -335,15 +346,42 @@ export class SocialNode {
     return this.backlogDone;
   }
 
+  /**
+   * The device slept or the app was frozen, e.g. a laptop closed over a deadline: what relays kept
+   * meanwhile may hold the check-in or end that calls a missed deadline off. Holds back missed
+   * deadlines until the transport has caught up again (at most BACKLOG_WAIT_MS), judges them, and
+   * resolves. `tick()` does this by itself; the platform awaits it before ringing an alarm timer of
+   * its own that fired late, and then rings only an alarm the node did not cancel meanwhile.
+   */
+  catchUpAgain(): Promise<void> {
+    // Already waiting (a start, or this wake-up noticed twice): the same wait.
+    if (!this.running || !this.backlogIn) return this.backlogDone;
+    const again = this.transport.caughtUpAgain?.();
+    return again ? this.holdMissed(again) : this.backlogDone;
+  }
+
   private awaitBacklog(): void {
     const caughtUp = this.transport.caughtUp?.();
     if (!caughtUp) return;
+    const start = ++this.starts;
+    this.holdMissed(caughtUp);
+    // Only the transport saying so ends the history, also when it says so after the wait.
+    caughtUp.then(
+      () => {
+        if (start === this.starts && this.running) this.endHistory();
+      },
+      () => {},
+    );
+  }
+
+  /** Missed deadlines wait until `signal` resolves (at most BACKLOG_WAIT_MS), then ring. */
+  private holdMissed(signal: Promise<void>): Promise<void> {
     const run = ++this.runs;
     this.backlogIn = false;
     this.backlogDone = new Promise<void>((resolve) => {
       clearTimeout(this.backlogTimer);
       this.backlogTimer = setTimeout(resolve, this.options.backlogWaitMs ?? BACKLOG_WAIT_MS);
-      caughtUp.then(resolve, resolve);
+      signal.then(resolve, resolve);
     }).then(() => {
       if (run !== this.runs) return;
       clearTimeout(this.backlogTimer);
@@ -351,13 +389,34 @@ export class SocialNode {
       if (!this.running) return;
       this.ringMissed(this.now());
     });
-    // Only the transport saying so ends the history, also when it says so after the wait.
-    caughtUp.then(
-      () => {
-        if (run === this.runs && this.running) this.endHistory();
-      },
-      () => {},
-    );
+    return this.backlogDone;
+  }
+
+  /** A deadline passed more than LATE_RING_MS ago without a tick since it passed: the device slept through it. */
+  private sleptThroughDeadline(now: number): boolean {
+    const last = this.lastTickAt;
+    if (last === undefined || now - last <= LATE_RING_MS) return false;
+    for (const status of this.statuses.values()) {
+      for (const w of status.watches ?? []) {
+        const at = watchRingTime(w);
+        if (w.firedAt === undefined && at > last && at < now - LATE_RING_MS) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Hands the platform the alarms of every deadline still ahead again, my own watches' reminders
+   * too. After a restore the app cleared what the OS held for the old data, and nothing else would
+   * schedule them again; the same id replaces an alarm the OS still has. Passed ones are left alone.
+   */
+  private rearmAlarms(now: number): void {
+    for (const w of this.state.watches) if (w.dueAt > now) this.scheduleOwnWatchAlarms(w.watchId, true);
+    for (const [key, status] of this.statuses) {
+      for (const w of status.watches ?? []) {
+        if (w.firedAt === undefined && watchRingTime(w) > now) this.emit({ type: 'alarm.schedule', alarm: this.watchAlarm(key, w) });
+      }
+    }
   }
 
   /**
@@ -1035,12 +1094,13 @@ export class SocialNode {
     }
   }
 
-  private scheduleOwnWatchAlarms(watchId: string): void {
+  /** `again`: handed over once more (see `rearmAlarms`): a reminder still ahead stays, none is cancelled. */
+  private scheduleOwnWatchAlarms(watchId: string, again = false): void {
     const w = this.state.watches.find((x) => x.watchId === watchId);
     if (!w) return;
     const names = w.recipients.map((k) => this.name(k)).join(', ');
     const remindAt = w.dueAt - 10 * 60_000;
-    if (remindAt > this.now() + 60_000) {
+    if (remindAt > this.now() + (again ? 0 : 60_000)) {
       this.emit({
         type: 'alarm.schedule',
         alarm: {
@@ -1051,7 +1111,7 @@ export class SocialNode {
           level: 'normal',
         },
       });
-    } else {
+    } else if (!again) {
       this.emit({ type: 'alarm.cancel', id: `mywatch:${watchId}:remind` });
     }
     this.emit({
@@ -1527,6 +1587,8 @@ export class SocialNode {
   async tick(): Promise<void> {
     const now = this.now();
     this.noteClock(now);
+    if (this.sleptThroughDeadline(now)) void this.catchUpAgain();
+    this.lastTickAt = now;
     if (this.trip && !this.trip.isEnded) {
       const end = this.trip.expire(now);
       if (end.length) {
@@ -1840,6 +1902,8 @@ export class SocialNode {
         if (!known) {
           this.alert({ category: 'device', title: 'Neues Gerät verbunden', body: `„${message.deviceName}“ nutzt jetzt dein Konto.` });
           this.markSync();
+          // My running watches, also those started before it existed: it can end them and reminds me too.
+          for (const w of this.state.watches) void this.syncWatch(w).catch(() => {});
         }
         return;
       }

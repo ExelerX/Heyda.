@@ -59,7 +59,7 @@ export default function Me() {
   async function endDemo() {
     const ok = await confirm({
       title: 'Demo beenden?',
-      message: 'Lisa, Max und Oma Ilse, ihre Chats und die Demo-Orte werden gelöscht. Danach richtest du dein echtes Konto ein.',
+      message: 'Alles aus der Demo wird gelöscht, auch Lisa, Max und Oma Ilse. Danach richtest du dein echtes Konto ein.',
       ok: 'Demo beenden',
       destructive: true,
     });

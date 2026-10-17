@@ -277,6 +277,8 @@ export class NostrTransport implements Transport {
   private sub: { close(): void } | undefined;
   /** Resolves once every own relay caught up after the last `start()`. */
   private backlog: Promise<void> | undefined;
+  /** Waits from `caughtUpAgain()`: the own relays each still has to report caught up. */
+  private readonly resyncs = new Set<{ pending: Set<string>; done: () => void }>();
   private disposed = false;
 
   constructor(private readonly opts: NostrTransportOptions) {
@@ -307,6 +309,9 @@ export class NostrTransport implements Transport {
         this.seen.setSyncedUntil(relay, this.nowS() - 60);
         this.pruneSeen();
         if (pending.delete(relay) && pending.size === 0) backlogIn();
+        for (const r of [...this.resyncs]) {
+          if (r.pending.delete(relay) && r.pending.size === 0) r.done();
+        }
       },
     });
   }
@@ -315,10 +320,33 @@ export class NostrTransport implements Transport {
     return this.backlog ?? Promise.resolve();
   }
 
+  /**
+   * Resolves once every own relay has reported again, after this call, that it handed over what it
+   * kept: after the device slept, a relay reconnects and catches up first (a live connection that
+   * survived proves itself with its next check). Callers wait only a while: a relay may be down.
+   */
+  caughtUpAgain(): Promise<void> {
+    if (!this.sub) return Promise.resolve();
+    const pending = new Set(this.opts.ownRelays);
+    if (pending.size === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const wait = {
+        pending,
+        done: () => {
+          this.resyncs.delete(wait);
+          resolve();
+        },
+      };
+      this.resyncs.add(wait);
+    });
+  }
+
   async stop(): Promise<void> {
     if (!this.sub) return;
     this.sub.close();
     this.sub = undefined;
+    // Nothing more arrives: nobody needs to wait for it.
+    for (const r of [...this.resyncs]) r.done();
   }
 
   /** Stops for good: wipes the key copy and closes the relay connections it opened itself. */

@@ -1,5 +1,6 @@
 import {
   BUILTIN_TEMPLATES,
+  alarmAlert,
   backupState,
   MemoryNetwork,
   SocialNode,
@@ -32,7 +33,18 @@ import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport, type SeenSnapshot } fr
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
 import { DEMO_KEYS, startDemoFriends } from './demo';
-import { cancelAlarm, clearNotifications, deliverAlert, pruneAlarms, scheduleAlarm, setBadge, setOpenThread as setNotificationThread, showToast } from './notifications';
+import {
+  alarmsRang,
+  cancelAlarm,
+  clearNotifications,
+  deliverAlert,
+  onAlarmDone,
+  pruneAlarms,
+  scheduleAlarm,
+  setBadge,
+  setOpenThread as setNotificationThread,
+  showToast,
+} from './notifications';
 import { desktop, deviceLabel, isBrowserPreview, isDesktop } from './platform';
 import type { Appearance } from './theme';
 import { DesktopVault, EncryptedFileVault, MemoryVault, type Vault } from './vault';
@@ -56,6 +68,12 @@ export interface Settings {
 /** `os`: the phone's OS has it, so it rings even with the app closed (see `deliverAlert`). */
 type SavedAlarm = Alarm & { os?: boolean };
 
+/** An alarm the phone's OS rang, or that was opened or swiped away, for the deadline due at `at`. */
+interface AlarmDone {
+  id: string;
+  at: number;
+}
+
 interface Persisted {
   v: 2;
   state: NodeState;
@@ -73,6 +91,14 @@ interface Persisted {
   trip?: SharingSession;
   /** Set on a freshly linked device until my other devices were told about it. */
   announceLinked?: boolean;
+  /** Phone alarms that rang or were opened or swiped away: they never ring again (see `noteAlarmDone`). */
+  alarmsDone?: AlarmDone[];
+  /**
+   * While the demo runs: the account as it was when the demo started. Ending the demo brings it
+   * back as it was, so nothing done in the demo (a watch or SOS for a real contact, a message, a
+   * group) ever reaches the real account.
+   */
+  beforeDemo?: Persisted;
 }
 
 export interface Snapshot {
@@ -127,6 +153,9 @@ const MAX_CHAT_CHARS_PER_THREAD = 400_000;
 const MAX_CHAT_CHARS_TOTAL = 3_000_000;
 const MAX_ACTIVITY = 300;
 const MAX_ALARMS = 100;
+const MAX_ALARMS_DONE = 200;
+/** A Windows alarm timer this late means the PC slept: what relays kept meanwhile may call it off. */
+const LATE_ALARM_MS = 60_000;
 /** A Windows alarm whose time passed while the PC was off still rings this long after it: as long as the core keeps a watch. */
 const MISSED_ALARM_KEEP_MS = 12 * 3600_000;
 const MAX_ACTIVITY_TITLE = 200;
@@ -187,6 +216,9 @@ function migrate(raw: unknown, selfKey: string): Persisted | undefined {
     seen: old.seen ?? { sync: 0, ids: [] },
     trip: old.trip,
     announceLinked: old.announceLinked,
+    alarmsDone: Array.isArray(old.alarmsDone) ? old.alarmsDone.filter((d) => typeof d?.id === 'string' && Number.isFinite(d.at)).slice(-MAX_ALARMS_DONE) : [],
+    // Checked when the demo ends (see `setDemo`).
+    beforeDemo: old.beforeDemo,
   };
 }
 
@@ -231,6 +263,7 @@ export class AppRuntime {
   private stopDemo: (() => void) | undefined;
   private openThread: string | undefined;
   private started = false;
+  private firstRoundDone: Promise<void> = Promise.resolve();
   /** Set by shutdown(): late events and timers must not write over what replaced this instance. */
   private disposed = false;
   hooks: PlatformHooks = { onLocationNeeds: () => {}, onPlacesChange: () => {}, freshFix: async () => {} };
@@ -265,11 +298,15 @@ export class AppRuntime {
         case 'alert': {
           const id = e.alert.id;
           const watch = id.startsWith('watch:');
+          const ringAt = watch ? this.watchRingAt(e.alert) : undefined;
           // On Windows the alarm timer may have rung for this deadline already; the core's overdue check reports it again.
-          const rang = isDesktop && watch && this.rangSince(id, this.watchRingAt(e.alert));
+          const rang = isDesktop && watch && this.rangSince(id, ringAt);
+          // On a phone the OS rang it already (and it may have been swiped away since): no second notification.
+          const shown = !isDesktop && watch && this.alarmDone(id, ringAt);
           this.addActivity(e.alert);
           // On a phone the OS has an alarm with the same id, which may have rung already.
-          if (!rang) deliverAlert(e.alert, watch ? () => this.data.alarms.find((a) => a.id === id && a.os)?.at : undefined);
+          if (!rang) deliverAlert(e.alert, watch ? () => this.data.alarms.find((a) => a.id === id && a.os)?.at : undefined, shown);
+          if (watch && !isDesktop && ringAt !== undefined) this.noteAlarmDone(id, ringAt);
           break;
         }
         case 'alarm.schedule': {
@@ -363,7 +400,7 @@ export class AppRuntime {
     this.tickTimer = setInterval(() => void this.tick(), TICK_MS);
     // Not awaited: sending what waited in the outbox can take a while on a slow network, and the
     // screens (the SOS button too) and background tasks such as an iOS geofence wake must not wait.
-    void this.firstRound();
+    this.firstRoundDone = this.firstRound().catch(() => {});
     if (!this.isDemo) {
       this.hooks.onLocationNeeds(this.node.locationNeeds());
       this.hooks.onPlacesChange(this.data.state.places);
@@ -379,8 +416,15 @@ export class AppRuntime {
     if (!this.disposed) await this.tick();
   }
 
+  /** Resolves once the first round after starting (sending what waited in the outbox) is over. */
+  whenFirstRoundDone(): Promise<void> {
+    return this.firstRoundDone;
+  }
+
   /** Housekeeping: expiring shares, overdue alarms, outbox retries. Also called when the app wakes up. */
   async tick(): Promise<void> {
+    // First, so an overdue alert of this round already knows which alarms the OS rang meanwhile.
+    await this.noteRangAlarms().catch(() => {});
     await this.node.tick().catch(() => {});
     const now = Date.now();
     const alarms = this.data.alarms.filter((a) => a.at > now - 24 * 3600_000);
@@ -613,12 +657,24 @@ export class AppRuntime {
     this.saveTimer = undefined;
   }
 
-  /** Switches between demo and real mode. The caller rebuilds the runtime afterwards. */
+  /**
+   * Switches between demo and real mode. The caller rebuilds the runtime afterwards. Starting the
+   * demo keeps a copy of the account; ending it brings that copy back unchanged, with only the
+   * settings of this device the person just chose (set up, keep-alive, look) taken along.
+   */
   async setDemo(demo: boolean): Promise<void> {
+    if (demo === this.isDemo) return;
     if (this.node.activeTrip) await this.node.stopTrip();
-    this.data.settings = { ...this.data.settings, demo };
     await this.shutdown(false);
-    if (!demo) this.removeDemoData();
+    this.data.seen = this.seen.snapshot();
+    this.data.statuses = this.node.exportStatuses();
+    if (demo) {
+      const { beforeDemo: _none, ...real } = this.data;
+      this.data.beforeDemo = JSON.parse(JSON.stringify(real)) as Persisted;
+      this.data.settings = { ...this.data.settings, demo: true };
+    } else {
+      this.leaveDemo();
+    }
     await this.write();
   }
 
@@ -658,6 +714,8 @@ export class AppRuntime {
    */
   private rearmDesktopAlarms(): void {
     const fire = (a: Alarm) => this.fireDesktopAlarm(a);
+    // Late on purpose, after the relays caught up: no second wait.
+    const fireCaughtUp = (a: Alarm) => this.fireDesktopAlarm(a, true);
     const now = Date.now();
     const missed = this.data.alarms.filter((a) => a.at <= now);
     for (const a of this.data.alarms) if (a.at > now) void scheduleAlarm(a, fire);
@@ -668,12 +726,21 @@ export class AppRuntime {
     void this.node.whenCaughtUp().then(() => {
       const oldest = Date.now() - MISSED_ALARM_KEEP_MS;
       // Not one cancelled or moved meanwhile: that entry is gone from the list.
-      for (const a of late) if (!this.disposed && this.data.alarms.includes(a) && a.at >= oldest) void scheduleAlarm(a, fire);
+      for (const a of late) if (!this.disposed && this.data.alarms.includes(a) && a.at >= oldest) void scheduleAlarm(a, fireCaughtUp);
     });
   }
 
-  private fireDesktopAlarm(alarm: Alarm): void {
+  /**
+   * A Windows alarm timer fired. Far too late means the PC slept through its time: the check-in or
+   * end that calls it off may be waiting on the relays, so it rings only once they handed over what
+   * they kept (or after a short wait), and not at all if the node cancelled or moved it meanwhile.
+   */
+  private fireDesktopAlarm(alarm: Alarm, caughtUp = false): void {
     if (this.disposed || !this.data.alarms.some((a) => a.id === alarm.id && a.at === alarm.at)) return;
+    if (!caughtUp && Date.now() - alarm.at > LATE_ALARM_MS) {
+      void this.node.catchUpAgain().then(() => this.fireDesktopAlarm(alarm, true));
+      return;
+    }
     // Rung once: without this, every restart within 24 h re-arms it with delay 0 and it rings again.
     this.data.alarms = this.data.alarms.filter((a) => a.id !== alarm.id);
     // The core's overdue check may have reported this deadline a moment earlier; ring only once.
@@ -683,10 +750,34 @@ export class AppRuntime {
     }
     // Never stamped before its time (a timer may fire a moment early by the clock), so the check
     // above and the one for the core's alert recognize this ring.
-    const at = Math.max(Date.now(), alarm.at);
-    const alert: Alert = { id: alarm.id, at, category: alarm.level === 'alarm' ? 'watch' : 'automation', level: alarm.level, title: alarm.title, body: alarm.body };
+    const alert = alarmAlert(alarm, Math.max(Date.now(), alarm.at));
     this.addActivity(alert);
     deliverAlert(alert);
+  }
+
+  /**
+   * Remembers that a phone alarm rang for the deadline due at `at`, or was opened or swiped away:
+   * the core's overdue alert for it (on a later wake, say) then posts no second notification.
+   */
+  noteAlarmDone(id: string, at: number): void {
+    if (this.disposed || this.alarmDone(id, at)) return;
+    const done = (this.data.alarmsDone ?? []).filter((d) => d.id !== id);
+    this.data.alarmsDone = [...done, { id, at }].slice(-MAX_ALARMS_DONE);
+    this.changed();
+  }
+
+  /** Whether the phone alarm with this id rang (or was opened or swiped away) for the deadline due at `at`, not an earlier one. */
+  private alarmDone(id: string, at: number | undefined): boolean {
+    return at !== undefined && (this.data.alarmsDone ?? []).some((d) => d.id === id && d.at >= at - 5_000);
+  }
+
+  /** Records the alarms handed to the phone's OS that it rang meanwhile, before it is swiped away and nothing tells any more. */
+  private async noteRangAlarms(): Promise<void> {
+    if (isDesktop) return;
+    const now = Date.now();
+    const open = this.data.alarms.filter((a) => a.os && a.at <= now && !this.alarmDone(a.id, a.at));
+    if (!open.length) return;
+    for (const a of await alarmsRang(open)) this.noteAlarmDone(a.id, a.at);
   }
 
   /**
@@ -711,10 +802,29 @@ export class AppRuntime {
     this.changed();
   }
 
+  /** Ending the demo: the account as it was before comes back (see `beforeDemo`). */
+  private leaveDemo(): void {
+    const settings = this.data.settings;
+    const real = this.data.beforeDemo && migrate(this.data.beforeDemo, this.data.state.self.key);
+    if (!real) {
+      // Saved by a version before the copy existed.
+      this.data.settings = { ...settings, demo: false };
+      this.removeDemoData();
+      return;
+    }
+    // Alarms the demo handed to the OS (my watches, quiet mode changed) that the account does not
+    // have like this: they would ring for nothing. The next start schedules those still due again.
+    for (const a of this.data.alarms) {
+      if (!real.alarms.some((r) => r.id === a.id && r.at === a.at && r.level === a.level)) void cancelAlarm(a.id).catch(() => {});
+    }
+    const { onboarded, keepAlive, appearance } = settings;
+    this.data = { ...real, settings: { ...real.settings, onboarded, keepAlive, appearance, demo: false }, beforeDemo: undefined };
+  }
+
   /**
-   * Leaving the demo: removes Lisa, Max and Oma Ilse and what belongs to them (also groups,
-   * watches and an SOS made with them in the demo), nothing else. Statuses need nothing here:
-   * the next start keeps only those of contacts.
+   * Leaving a demo started by an older version, which kept no copy: removes Lisa, Max and Oma Ilse
+   * and what belongs to them (also groups, watches and an SOS made with them in the demo), nothing
+   * else. Statuses need nothing here: the next start keeps only those of contacts.
    */
   private removeDemoData(): void {
     const demo = new Set(DEMO_KEYS);
@@ -868,6 +978,17 @@ function cleanChats(input: unknown): Record<string, ChatEntry[]> {
 }
 
 let runtime: Promise<AppRuntime> | undefined;
+
+// A phone alarm opened or swiped away (iOS reports that too, also with the app closed): saved at
+// once, so it never rings again on a later wake.
+onAlarmDone((id, at) => {
+  void getRuntime()
+    .then(async (r) => {
+      r.noteAlarmDone(id, at);
+      await r.flushIfDirty();
+    })
+    .catch(() => {});
+});
 
 /** The single runtime, created and started on first use (also from background tasks). */
 export function getRuntime(): Promise<AppRuntime> {

@@ -337,4 +337,39 @@ describe('NostrTransport', () => {
     await settle();
     expect(done).toBe(true);
   });
+
+  it('says when every own relay caught up again after a wake-up, not from what it said before', async () => {
+    let feed: FeedHandlers | undefined;
+    const pool: RelayPool = {
+      publish: async () => {},
+      subscribe: (_relays, handlers) => {
+        feed = handlers;
+        return { close: () => {} };
+      },
+      close: () => {},
+    };
+    const t = new NostrTransport({ secretKey: generateSecretKey(), ownRelays: [RELAY_A, RELAY_B], relaysFor: () => [], pool });
+    await t.start();
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    feed!.onSynced!(RELAY_A);
+    feed!.onSynced!(RELAY_B);
+    await t.caughtUp();
+    // The laptop slept; its timers fire on waking, before the connections are back.
+    let again = false;
+    void t.caughtUpAgain().then(() => (again = true));
+    await settle();
+    expect(again).toBe(false);
+    feed!.onSynced!(RELAY_B);
+    await settle();
+    expect(again).toBe(false);
+    feed!.onSynced!(RELAY_A);
+    await settle();
+    expect(again).toBe(true);
+    // Nothing to wait for once stopped: nothing more arrives.
+    let stopped = false;
+    void t.caughtUpAgain().then(() => (stopped = true));
+    await t.stop();
+    await settle();
+    expect(stopped).toBe(true);
+  });
 });
