@@ -2,7 +2,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { describe, expect, it, vi } from 'vitest';
 import type { Rule } from './automation/schema';
 import { BUILTIN_TEMPLATES, instantiateTemplate } from './automation/templates';
-import { SocialNode, TTL, type NodeEvent } from './node';
+import { MIN_WATCH_MS, SocialNode, TTL, type NodeEvent } from './node';
 import { createInitialState, type Alert, type NodeState } from './state';
 import { composeMessage } from './protocol/compose';
 import { encodeLinkInvite, LINK_TTL_MS, linkCommitment } from './sync/link';
@@ -425,6 +425,19 @@ describe('SocialNode: safety', () => {
     const { lisa, now } = await pairedPair();
     await expect(lisa.startWatch({ to: [MAX], label: 'x', dueAt: now() + 60_000 })).rejects.toThrow();
     await expect(lisa.startWatch({ to: [MAX], label: 'x', dueAt: now() + 72 * 3600_000 })).rejects.toThrow();
+  });
+
+  it('accepts the shortest watch the screen offers although the clock moved on since it read the time', async () => {
+    const { lisa, now, tick } = await pairedPair();
+    // The screen reads the time, adds exactly 5 minutes, and a millisecond passes before the node reads it again.
+    const dueAt = now() + MIN_WATCH_MS;
+    tick(1);
+    const watchId = await lisa.startWatch({ to: [MAX], label: 'Kurz', dueAt });
+    tick(1);
+    await expect(lisa.extendWatch(watchId, now() - 1 + MIN_WATCH_MS)).resolves.toBeUndefined();
+    expect(lisa.getState().watches.find((w) => w.watchId === watchId)?.dueAt).toBe(now() - 1 + MIN_WATCH_MS);
+    // Still refused when it really is shorter.
+    await expect(lisa.startWatch({ to: [MAX], label: 'x', dueAt: now() + MIN_WATCH_MS - 30_000 })).rejects.toThrow('5 Minuten');
   });
 
   it('ends a trip-linked watch automatically on arrival', async () => {

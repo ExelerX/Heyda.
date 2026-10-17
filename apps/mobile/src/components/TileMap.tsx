@@ -40,7 +40,8 @@ const markerColor = (t: Theme, kind: MapMarker['kind']) =>
 export function TileMap({ markers, height = 280, center, zoom, onPress, tileUrl = OSM_TILES }: {
   markers: MapMarker[];
   height?: number;
-  center?: { lat: number; lon: number };
+  /** A new `seq` moves the map there again, also to the same point after the person panned away. */
+  center?: { lat: number; lon: number; seq?: number };
   zoom?: number;
   onPress?: (p: { lat: number; lon: number }) => void;
   tileUrl?: string;
@@ -62,7 +63,7 @@ export function TileMap({ markers, height = 280, center, zoom, onPress, tileUrl 
   // more when the first markers arrive (unless the user has moved the map by then).
   useEffect(() => {
     if (center) setCam({ ...project(center.lat, center.lon), z: zoom ?? 15 });
-  }, [center?.lat, center?.lon, zoom]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [center?.lat, center?.lon, center?.seq, zoom]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (center || size.w === 0 || (cam && (fittedMarkers.current || userMoved.current || !markers.length))) return;
     setCam(fit());

@@ -36,7 +36,9 @@ export default function MapTab() {
   const { state, statuses, settings, isDemo } = useSnapshot();
   const now = useNow(30_000);
   const { height } = useWindowDimensions();
-  const [focus, setFocus] = useState<{ lat: number; lon: number; zoom: number }>();
+  // `seq`: tapping „Zeigen“ again centres the map again, even on the same point after panning away.
+  const [focus, setFocus] = useState<{ lat: number; lon: number; zoom: number; seq: number }>();
+  const show = (lat: number, lon: number, zoom: number) => setFocus((f) => ({ lat, lon, zoom, seq: (f?.seq ?? 0) + 1 }));
   const [me, setMe] = useState<{ lat: number; lon: number; accuracyM?: number }>();
   const [locating, setLocating] = useState(false);
 
@@ -118,7 +120,7 @@ export default function MapTab() {
         return;
       }
       setMe(p);
-      setFocus({ lat: p.lat, lon: p.lon, zoom: 15 });
+      show(p.lat, p.lon, 15);
     } catch (e) {
       notice('Standort gerade unbekannt', errorText(e));
     } finally {
@@ -207,7 +209,7 @@ export default function MapTab() {
                             compact
                             onPress={() => {
                               const at = i.point ?? i.cell!;
-                              setFocus({ lat: at.lat, lon: at.lon, zoom: i.cell ? 12 : 16 });
+                              show(at.lat, at.lon, i.cell ? 12 : 16);
                             }}
                           />
                         ) : null}

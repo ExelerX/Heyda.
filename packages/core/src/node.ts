@@ -2698,8 +2698,14 @@ function safeId(id: string): string {
   return clean.length >= 8 ? clean : randomId();
 }
 
+/**
+ * Screens offer exactly 5 minutes and add it to the time they read a moment before the node reads
+ * it again; without this slack such a watch failed whenever the clock ticked in between.
+ */
+const WATCH_TIME_SLACK_MS = 5_000;
+
 function checkWatchTime(dueAt: number, now: number): void {
-  if (!Number.isFinite(dueAt) || dueAt < now + MIN_WATCH_MS || dueAt > now + MAX_WATCH_MS) {
+  if (!Number.isFinite(dueAt) || dueAt < now + MIN_WATCH_MS - WATCH_TIME_SLACK_MS || dueAt > now + MAX_WATCH_MS) {
     throw new RangeError('Die Zeit muss zwischen 5 Minuten und 48 Stunden in der Zukunft liegen.');
   }
 }

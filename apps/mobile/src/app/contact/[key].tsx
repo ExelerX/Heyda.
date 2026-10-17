@@ -149,7 +149,7 @@ export default function ContactDetails() {
       : '';
     const ok = await confirm({
       title: `${name} entfernen?`,
-      message: `${name} bekommt dann nichts mehr von dir – keine Nachrichten, keine Ankunftszeiten, keinen Standort. Euer Chat wird auf diesem Gerät gelöscht.${groupsNote} Um wieder verbunden zu sein, scannt ihr erneut eure Codes.`,
+      message: `${name} bekommt dann nichts mehr von dir – keine Nachrichten, keine Ankunftszeiten, keinen Standort. Euer Chat wird ${state.devices.length ? 'auf deinen Geräten' : 'auf diesem Gerät'} gelöscht.${groupsNote} Um wieder verbunden zu sein, scannt ihr erneut eure Codes.`,
       ok: 'Entfernen',
       destructive: true,
     });

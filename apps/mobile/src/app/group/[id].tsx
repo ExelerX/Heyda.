@@ -94,13 +94,13 @@ export default function GroupDetails() {
       isOwner
         ? {
             title: 'Gruppe auflösen?',
-            message: `Du hast „${group!.name}“ erstellt. Wenn du gehst, wird die Gruppe für alle aufgelöst. Die bisherigen Nachrichten bleiben auf den Handys.`,
+            message: `Du hast „${group!.name}“ erstellt. Wenn du gehst, wird die Gruppe für alle aufgelöst und der Chat verschwindet.`,
             ok: 'Auflösen',
             destructive: true,
           }
         : {
             title: 'Gruppe verlassen?',
-            message: `Du bekommst keine Nachrichten aus „${group!.name}“ mehr. Nur wer die Gruppe erstellt hat, kann dich wieder hinzufügen.`,
+            message: `Du bekommst keine Nachrichten aus „${group!.name}“ mehr, und der Chat verschwindet. Nur wer die Gruppe erstellt hat, kann dich wieder hinzufügen.`,
             ok: 'Verlassen',
             destructive: true,
           },

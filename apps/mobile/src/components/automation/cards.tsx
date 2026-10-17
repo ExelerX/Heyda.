@@ -61,9 +61,12 @@ export function TemplateCard({ template, pluginName }: { template: RuleTemplate;
   );
 }
 
-/** react-native-web colours the "on" thumb with its own teal unless told otherwise. */
+/**
+ * react-native-web colours the "on" thumb with its own teal unless told otherwise, and draws the
+ * switch 40×20 (also in the Windows app): too small a target.
+ */
 const WEB_SWITCH = (t: { surface: string; text: string; dark: boolean }) =>
-  (Platform.OS === 'web' ? { activeThumbColor: t.dark ? t.text : t.surface } : {}) as object;
+  (Platform.OS === 'web' ? { activeThumbColor: t.dark ? t.text : t.surface, style: { height: 28 } } : {}) as object;
 
 const SOURCE_TEXT: Record<Rule['source'], string> = {
   template: 'Vorlage',

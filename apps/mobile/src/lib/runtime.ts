@@ -167,12 +167,14 @@ function migrate(raw: unknown, selfKey: string): Persisted | undefined {
     deviceId: old.state.self.deviceId || newDeviceId(),
     deviceName: old.state.self.deviceName || deviceLabel(),
   };
+  const state = normalizeState({ ...old.state, self });
   return {
     v: 2,
-    state: normalizeState({ ...old.state, self }),
+    state,
     statuses: old.statuses ?? {},
     chats: old.chats ?? {},
-    unread: old.unread ?? {},
+    // Counts of chats that are gone (saved before they were cleaned up) would keep the badge up.
+    unread: liveUnread(old.unread ?? {}, state),
     activity: Array.isArray(old.activity) ? old.activity : [],
     alarms: Array.isArray(old.alarms) ? old.alarms : [],
     // Checked again like an import: a plugin saved before a check existed is dropped.
@@ -241,8 +243,10 @@ export class AppRuntime {
     node.on((e) => {
       switch (e.type) {
         case 'state': {
-          const placesChanged = e.state.places !== this.data.state.places;
+          const prev = this.data.state;
+          const placesChanged = e.state.places !== prev.places;
           this.data.state = e.state;
+          if (e.state.contacts !== prev.contacts || e.state.groups !== prev.groups) this.dropGoneThreads(prev);
           if (placesChanged && !this.isDemo) this.hooks.onPlacesChange(e.state.places);
           this.changed();
           break;
@@ -392,14 +396,13 @@ export class AppRuntime {
 
   getSnapshot = (): Snapshot => {
     if (!this.snapshotCache) {
-      const unreadTotal = Object.values(this.data.unread).reduce((n, x) => n + x, 0);
       this.snapshotCache = {
         version: this.version,
         state: this.data.state,
         statuses: this.data.statuses,
         chats: this.data.chats,
         unread: this.data.unread,
-        unreadTotal,
+        unreadTotal: unreadTotal(this.data.unread),
         activity: this.data.activity,
         activeTrip: this.node.activeTrip,
         activeTripEta: this.node.activeTripEta,
@@ -713,9 +716,33 @@ export class AppRuntime {
     this.data.chats = trimChats({ ...this.data.chats, [thread]: trimThread([...list, entry].slice(-MAX_CHAT_PER_THREAD)) });
     if (entry.from !== 'me' && thread !== this.openThread) {
       this.data.unread = { ...this.data.unread, [thread]: (this.data.unread[thread] ?? 0) + 1 };
-      void setBadge(Object.values(this.data.unread).reduce((n, x) => n + x, 0));
+      void setBadge(unreadTotal(this.data.unread));
     }
     this.changed();
+  }
+
+  /**
+   * A contact removed (also on my other device) or a group gone for me (dissolved, taken off, left)
+   * has no chat row to open any more: its messages, unread count and activity go, as when I remove
+   * a contact here. Otherwise its unread count would keep the badge up for good. Only chats that
+   * had a row before go: my own messages synced for a chat this device doesn't know yet stay.
+   */
+  private dropGoneThreads(prev: NodeState): void {
+    const live = liveThreads(this.data.state);
+    const gone = new Set([...liveThreads(prev)].filter((t) => !live.has(t)));
+    const goneContacts = new Set(prev.contacts.map((c) => c.key).filter((k) => gone.has(k)));
+    const unread = liveUnread(this.data.unread, this.data.state);
+    if (!gone.size && unread === this.data.unread) return;
+    const before = unreadTotal(this.data.unread);
+    this.data.unread = unread;
+    if (gone.size) {
+      this.data.chats = Object.fromEntries(Object.entries(this.data.chats).filter(([t]) => !gone.has(t)));
+      this.data.statuses = Object.fromEntries(Object.entries(this.data.statuses).filter(([k]) => !goneContacts.has(k)));
+      this.data.activity = this.data.activity.filter(
+        (a) => !(a.thread && gone.has(a.thread)) && !(a.from && goneContacts.has(a.from)) && !(a.ref?.sosOwner && goneContacts.has(a.ref.sosOwner)),
+      );
+    }
+    if (unreadTotal(unread) !== before) void setBadge(unreadTotal(unread));
   }
 
   private flushSoon(): void {
@@ -816,6 +843,22 @@ export function getRuntime(): Promise<AppRuntime> {
 /** Drops the instance so the next `getRuntime()` rebuilds it, e.g. after leaving demo mode. */
 export function resetRuntime(): void {
   runtime = undefined;
+}
+
+/** The chats that have a row in the chat list: my contacts and the groups I am in. */
+function liveThreads(state: NodeState): Set<string> {
+  return new Set([...state.contacts.map((c) => c.key), ...state.groups.filter((g) => !g.dissolved).map((g) => `g:${g.id}`)]);
+}
+
+/** Unread counts of those chats only; the same object when nothing is dropped. */
+function liveUnread(unread: Record<string, number>, state: NodeState): Record<string, number> {
+  const live = liveThreads(state);
+  const kept = Object.entries(unread).filter(([t]) => live.has(t));
+  return kept.length === Object.keys(unread).length ? unread : Object.fromEntries(kept);
+}
+
+function unreadTotal(unread: Record<string, number>): number {
+  return Object.values(unread).reduce((n, x) => n + x, 0);
 }
 
 /** Shortens text for storage without splitting an emoji. */
