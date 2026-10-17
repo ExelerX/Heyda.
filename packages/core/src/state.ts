@@ -111,10 +111,15 @@ export interface MyStatus {
   expiresAt: number;
 }
 
+/** A phone runs what automations send to others; a computer (the Windows app) only when the account has no phone. */
+export type DeviceKind = 'phone' | 'computer';
+
 export interface LinkedDevice {
   deviceId: string;
   name: string;
   linkedAt: number;
+  /** Unknown for a device that has not said yet (older version): it might be the phone. */
+  kind?: DeviceKind;
 }
 
 export interface WhereRequest {

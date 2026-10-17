@@ -14,7 +14,7 @@ import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
 export default function Automations() {
   const t = useTheme();
   const runtime = useRuntime();
-  const { state, templates, plugins } = useSnapshot();
+  const { state, templates, plugins, automationsActHere } = useSnapshot();
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<RuleTemplate['category']>();
   const [tipIndex, setTipIndex] = useState(() => new Date().getDate() % TIPS.length);
@@ -46,6 +46,14 @@ export default function Automations() {
     <Screen title="Automationen">
       <Narrow>
         <T variant="muted">Kleine Helfer, die von selbst etwas tun. Sie laufen nur auf deinem Gerät und tun nur, was der Satz sagt.</T>
+
+        {!automationsActHere && (
+          <Banner tone="info" icon="💻" title="Dein Handy übernimmt">
+            <T variant="small" color={t.text}>
+              Hier zeigen Automationen nur Hinweise an. Was an andere geht, schickt dein Handy, damit nichts doppelt ankommt.
+            </T>
+          </Banner>
+        )}
 
         {!state.contacts.length && (
           <Banner tone="info" icon="👋" title="Noch keine Freunde">

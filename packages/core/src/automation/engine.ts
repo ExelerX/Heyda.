@@ -67,7 +67,10 @@ export const DEFAULT_LIMITS: EngineLimits = {
 
 export interface EngineContext {
   rules: () => Rule[];
+  /** How I see someone (my nickname for them): for notifications on my own devices. */
   contactName: (key: ContactKey) => string;
+  /** The name they chose: what messages, check-ins and my status say to others. Defaults to `contactName`. */
+  sentName?: (key: ContactKey) => string;
   placeName: (placeId: string) => string | undefined;
   isAtPlace: (placeId: string) => boolean;
   localTime?: (now: number) => LocalTime;
@@ -239,7 +242,8 @@ export class AutomationEngine {
   }
 
   private resolve(rule: Rule, action: Action, event: AutomationEvent, now: number): ActionIntent | undefined {
-    const vars = this.variables(event);
+    // Only a notification stays on my devices; everything else is read by others.
+    const vars = this.variables(event, action.do !== 'notify');
     switch (action.do) {
       case 'notify':
         return {
@@ -286,9 +290,10 @@ export class AutomationEngine {
     }
   }
 
-  private variables(event: AutomationEvent): Record<string, string> {
+  private variables(event: AutomationEvent, out: boolean): Record<string, string> {
     const vars: Record<string, string> = {};
-    if ('contact' in event) vars.contact = this.ctx.contactName(event.contact);
+    const name = out ? (this.ctx.sentName ?? this.ctx.contactName) : this.ctx.contactName;
+    if ('contact' in event) vars.contact = name(event.contact);
     if ('placeName' in event && event.placeName !== undefined) vars.place = event.placeName;
     if ('placeId' in event) vars.place = this.ctx.placeName(event.placeId) ?? '';
     if ('destinationName' in event) vars.destination = event.destinationName;

@@ -80,7 +80,7 @@ export default function Settings() {
           <Card>
             <Toggle
               label="🗺️ Karten anzeigen"
-              detail="Die Kartenbilder kommen von OpenStreetMap. Dabei sieht OpenStreetMap ungefähr, welche Gegend du dir anschaust, und deine Internet-Adresse. Ohne Karte funktioniert alles andere genauso."
+              detail="Die Kartenbilder kommen von OpenStreetMap. Dabei sieht OpenStreetMap deine Internet-Adresse und ungefähr, welche Gegend du dir anschaust – auch, wo ein Freund gerade ist, wenn du ihn auf der Karte ansiehst. Ohne Karte funktioniert alles andere genauso."
               value={settings.mapEnabled}
               onChange={(v) => runtime.updateSettings({ mapEnabled: v })}
             />

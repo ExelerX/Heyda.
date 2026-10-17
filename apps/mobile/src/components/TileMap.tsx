@@ -19,6 +19,12 @@ export interface MapMarker {
 const OSM_TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 const TILE_HEADERS = { 'User-Agent': 'Heyda/1.0 (+https://github.com/ExelerX)' }; // OSM tile usage policy
 const NO_MARKERS: Camera = { ...project(51.16, 10.45), z: 5 }; // Germany
+/**
+ * The closest the map zooms by itself while it shows someone else's location (about 6 km across
+ * in Germany): the tile server sees which tiles are loaded, so it learns only the rough area.
+ * Closer only when the person zooms in themselves.
+ */
+const SHARED_FIT_ZOOM = 12;
 const TAP_SLOP = 6;
 const DOUBLE_TAP_MS = 250;
 const WEB_SURFACE = (Platform.OS === 'web' ? { cursor: 'grab', userSelect: 'none', touchAction: 'none' } : {}) as ViewStyle;
@@ -29,6 +35,7 @@ const markerColor = (t: Theme, kind: MapMarker['kind']) =>
  * OpenStreetMap raster tiles drawn with plain Image components (Android, iOS, web/desktop).
  * Drag to pan; buttons, double tap, pinch or mouse wheel to zoom; tap to pick a point (onPress).
  * Mount it only after the user enabled the map: the tile server sees which area is viewed.
+ * Fitting to markers of other people stops at SHARED_FIT_ZOOM.
  */
 export function TileMap({ markers, height = 280, center, zoom, onPress, tileUrl = OSM_TILES }: {
   markers: MapMarker[];
@@ -47,7 +54,8 @@ export function TileMap({ markers, height = 280, center, zoom, onPress, tileUrl 
 
   const fit = (): Camera => {
     const pts = markers.map((m) => ({ ...m, radiusM: Math.max(m.accuracyM ?? 0, (m.cellM ?? 0) * 0.71) }));
-    const f = fitCamera(pts, size.w, size.h) ?? NO_MARKERS;
+    const shared = markers.some((m) => m.kind === 'friend' || m.kind === 'sos');
+    const f = fitCamera(pts, size.w, size.h, shared ? { maxZoom: SHARED_FIT_ZOOM, singleZoom: SHARED_FIT_ZOOM } : undefined) ?? NO_MARKERS;
     return zoom === undefined ? f : { ...f, z: zoom };
   };
   // Follow center/zoom props. Without them fit the markers once the size is known, and once

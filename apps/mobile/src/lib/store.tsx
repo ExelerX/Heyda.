@@ -92,6 +92,13 @@ export function useContactName(): (key: string) => string {
   };
 }
 
+/** The name someone chose for themselves, as automations write it to others (never my nickname for them). */
+export function useSentName(): (key: string) => string {
+  const { state } = useSnapshot();
+  const shown = useContactName();
+  return (key) => state.contacts.find((x) => x.key === key)?.name ?? shown(key);
+}
+
 /** Name of a chat thread: a contact or a group ("g:" + id). */
 export function useThreadName(): (thread: string) => string {
   const { state } = useSnapshot();

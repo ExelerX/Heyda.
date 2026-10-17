@@ -30,6 +30,7 @@ import {
   type Alert,
   type Contact,
   type ContactStatus,
+  type DeviceKind,
   type Group,
   type GroupMember,
   type LinkedDevice,
@@ -107,6 +108,8 @@ export interface SocialNodeOptions {
   tripOptions?: TripOptions;
   /** Delay before changed settings go to my other devices. 0: only on `tick()` / `flushSync()`. */
   syncDelayMs?: number;
+  /** What this device is (see `runsAutomationActions`). Default: phone. */
+  deviceKind?: DeviceKind;
 }
 
 /** How long relays should keep a message for an offline phone, in seconds. */
@@ -250,6 +253,8 @@ export class SocialNode {
     this.engine = new AutomationEngine({
       rules: () => this.state.rules,
       contactName: (k) => this.name(k),
+      // My nickname for someone stays on my devices: what goes to others uses their own name.
+      sentName: (k) => this.contact(k)?.name ?? this.name(k),
       placeName: (id) => this.state.places.find((p) => p.id === id)?.name,
       isAtPlace: (id) => this.geofence.isInside(id),
       localTime: this.localTime,
@@ -277,6 +282,9 @@ export class SocialNode {
     await this.transport.start();
     this.lastDndActive = this.dndActive();
     this.emitLocationNeeds();
+    // A computer waits for a phone it does not know about: let my other devices know what this one
+    // is, so another computer can tell it need not wait (they answer with what they are).
+    if (this.deviceKind === 'computer' && this.state.devices.some((d) => d.kind === undefined)) this.markSync();
   }
 
   async stop(): Promise<void> {
@@ -1220,6 +1228,24 @@ export class SocialNode {
 
   // ---- my other devices -----------------------------------------------------------------------
 
+  private get deviceKind(): DeviceKind {
+    return this.options.deviceKind ?? 'phone';
+  }
+
+  /**
+   * Whether automations set off by contacts may act here beyond notifications: send messages,
+   * pings and check-ins, start a trip, set my status or a shared quiet mode. Every device of my
+   * account gets the same messages and has the same rules, so only one kind of device does this,
+   * or contacts would get everything once per device. A phone always does; a computer only when
+   * none of my other devices is a phone or might be one (not told yet, e.g. an older version).
+   * Notifications show on every device; rules on my own arrival run where my location is.
+   */
+  get runsAutomationActions(): boolean {
+    if (this.deviceKind === 'phone') return true;
+    const self = this.state.self.deviceId;
+    return this.state.devices.every((d) => d.deviceId === self || d.kind === 'computer');
+  }
+
   /**
    * Where linking a new device stands (see `sync/link.ts`): `waiting` for the new device to
    * answer, then `compare` with the 6 digits. Undefined when nothing runs or the code expired.
@@ -1297,6 +1323,7 @@ export class SocialNode {
         relays: self.relays.filter((r) => RelayUrl.safeParse(r).success).slice(0, 8),
         deviceId: self.deviceId,
         deviceName: self.deviceName,
+        deviceKind: this.deviceKind,
         devices: this.state.devices,
         doc: buildSyncDoc(this.state),
       };
@@ -1376,6 +1403,8 @@ export class SocialNode {
       v: 1,
       deviceId: this.state.self.deviceId,
       deviceName: this.state.self.deviceName,
+      // Older versions ignore it; see `runsAutomationActions`.
+      deviceKind: this.deviceKind,
       doc: buildSyncDoc(this.state),
     };
     for (const chunk of chunkPayload(randomId(), 'sync', payload)) await this.sendToSelf(chunk, TTL.sync);
@@ -1675,13 +1704,15 @@ export class SocialNode {
 
   private onSyncPayload(raw: unknown): void {
     if (!raw || typeof raw !== 'object') return;
-    const p = raw as { format?: unknown; v?: unknown; deviceId?: unknown; deviceName?: unknown; doc?: unknown };
+    const p = raw as { format?: unknown; v?: unknown; deviceId?: unknown; deviceName?: unknown; deviceKind?: unknown; doc?: unknown };
     if (p.format !== 'heyda.sync' || p.v !== 1 || typeof p.deviceId !== 'string') return;
     if (p.deviceId === this.state.self.deviceId || !/^[A-Za-z0-9_-]{8,32}$/.test(p.deviceId)) return;
     const doc = parseSyncDoc(p.doc);
     if (!doc) return;
     const deviceName = typeof p.deviceName === 'string' ? p.deviceName.trim().slice(0, 40) : '';
-    this.upsertDevice(p.deviceId, deviceName || 'Gerät');
+    const kind = p.deviceKind === 'phone' || p.deviceKind === 'computer' ? p.deviceKind : undefined;
+    // First heard what that device is: tell it what this one is (once per device, so no loop).
+    if (this.upsertDevice(p.deviceId, deviceName || 'Gerät', kind)) this.markSync();
     const now = this.now();
     const patch = mergeSyncDoc(this.state, doc, now);
     if (patch.places) this.geofence.setPlaces(patch.places);
@@ -1714,11 +1745,16 @@ export class SocialNode {
     if (Object.keys(mergeSyncDoc(theirs, buildSyncDoc(this.state), now)).length) this.markSync();
   }
 
-  private upsertDevice(deviceId: string, name: string): void {
+  /** Adds or updates one of my devices. True when this told me for the first time what kind of device it is. */
+  private upsertDevice(deviceId: string, name: string, kind?: DeviceKind): boolean {
     const existing = this.state.devices.find((d) => d.deviceId === deviceId);
-    if (existing && existing.name === name) return;
+    const learned = kind !== undefined && existing?.kind !== kind;
+    if (existing && existing.name === name && !learned) return false;
     const device: LinkedDevice = { deviceId, name, linkedAt: existing?.linkedAt ?? this.now() };
+    const known = kind ?? existing?.kind;
+    if (known) device.kind = known;
     this.update({ devices: [...this.state.devices.filter((d) => d.deviceId !== deviceId), device].slice(-20) });
+    return learned;
   }
 
   private onPresence(from: ContactKey, m: MessageOf<'presence'>, at: number): void {
@@ -2252,8 +2288,11 @@ export class SocialNode {
   private async runAutomations(event: AutomationEvent): Promise<void> {
     // Something from before this device got the account: my other device acted on it back then.
     if (this.replaying) return;
+    // My other devices got the same message and have the same rules: only one acts for others.
+    const onlyHere = event.type.startsWith('contact.') && !this.runsAutomationActions;
     // Limits by my clock: a place event carries the time of its fix, which may come late.
     for (const intent of this.engine.handle(event, this.now())) {
+      if (onlyHere && !isLocalIntent(intent, this.state.prefs)) continue;
       // In ghost mode, rules that depend on where I am may only act on this device.
       if (this.state.ghost && !isLocalIntent(intent, this.state.prefs) && this.usesMyLocation(intent.ruleId)) continue;
       try {

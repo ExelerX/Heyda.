@@ -11,6 +11,7 @@ import {
   randomId,
   restoredState,
   safetyNumber,
+  storedPlugins,
   type Alarm,
   type BackupContents,
   type Alert,
@@ -91,6 +92,8 @@ export interface Snapshot {
   locationNeeds: LocationNeeds;
   /** Linking a new device from here: waiting for it, or the 6 digits to compare. */
   linkStatus: LinkStatus | undefined;
+  /** False on a computer while my phone sends what automations send (they only notify here). */
+  automationsActHere: boolean;
 }
 
 /** Hooks the platform layer (location, geofences) sets when a runtime is created. */
@@ -168,7 +171,8 @@ function migrate(raw: unknown, selfKey: string): Persisted | undefined {
     unread: old.unread ?? {},
     activity: Array.isArray(old.activity) ? old.activity : [],
     alarms: Array.isArray(old.alarms) ? old.alarms : [],
-    plugins: Array.isArray(old.plugins) ? old.plugins : [],
+    // Checked again like an import: a plugin saved before a check existed is dropped.
+    plugins: storedPlugins(old.plugins),
     settings: { ...DEFAULT_SETTINGS, ...old.settings },
     seen: old.seen ?? { sync: 0, ids: [] },
     trip: old.trip,
@@ -295,7 +299,7 @@ export class AppRuntime {
     let node: SocialNode;
     let startDemo: ((node: SocialNode) => () => void) | undefined;
     let transport: NostrTransport | undefined;
-    const common = { initialState: data.state, initialStatuses: data.statuses };
+    const common = { initialState: data.state, initialStatuses: data.statuses, deviceKind: isDesktop ? ('computer' as const) : ('phone' as const) };
     if (data.settings.demo) {
       const network = new MemoryNetwork();
       node = new SocialNode({ ...common, transport: network.createTransport(selfKey) });
@@ -380,6 +384,7 @@ export class AppRuntime {
         dndEndsAt: this.node.dndEndsAt(),
         locationNeeds: this.node.locationNeeds(),
         linkStatus: this.node.linkStatus,
+        automationsActHere: this.node.runsAutomationActions,
       };
     }
     return this.snapshotCache;
@@ -714,7 +719,7 @@ export async function restoreBackupContents(contents: BackupContents): Promise<{
   // relays from before now fill in chats and statuses without ringing (see core `restoredState`).
   const state = restoredState({ ...data.state, self: { ...data.state.self, key, deviceId: newDeviceId(), deviceName: deviceLabel() } }, Date.now());
   await writeAccount(secret, state, {
-    plugins: Array.isArray(data.plugins) ? data.plugins : [],
+    plugins: storedPlugins(data.plugins),
     settings: { ...DEFAULT_SETTINGS, ...data.settings, onboarded: true, demo: false },
     chats: cleanChats(data.chats),
   });

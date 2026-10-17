@@ -25,7 +25,7 @@ import { ActionParams, ConditionParams, TriggerParams } from '../../components/a
 import { Banner, Bullet, errorText, Field, leave, Narrow, NotFound, param } from '../../components/setup/kit';
 import { Button, Card, Screen, T, Toggle } from '../../components/ui';
 import { confirm, notice } from '../../lib/confirm';
-import { useContactName, useRuntime, useSnapshot } from '../../lib/store';
+import { useContactName, useRuntime, useSentName, useSnapshot } from '../../lib/store';
 import { spacing, useTheme } from '../../lib/theme';
 
 export default function RuleScreen() {
@@ -71,6 +71,7 @@ function Builder({ initial }: { initial?: Rule }) {
   const runtime = useRuntime();
   const { state } = useSnapshot();
   const contactName = useContactName();
+  const sentName = useSentName();
   const [draft, setDraft] = useState<Draft>(() =>
     initial ? fromRule(initial) : { id: randomId(), name: '', enabled: true, conditions: [], actions: [], source: 'blocks' },
   );
@@ -83,6 +84,7 @@ function Builder({ initial }: { initial?: Rule }) {
     if (!draft.trigger || !draft.actions.length) return undefined;
     const names = {
       contactName: (k: string) => (k ? contactName(k) : '[Person]'),
+      sentName: (k: string) => (k ? sentName(k) : '[Person]'),
       placeName: (pid: string) => state.places.find((p) => p.id === pid)?.name ?? '[Ort]',
     };
     if (result.ok) return describeRule(result.rule, names);
@@ -92,7 +94,7 @@ function Builder({ initial }: { initial?: Rule }) {
     } catch {
       return undefined;
     }
-  }, [draft, result, state.places, contactName]);
+  }, [draft, result, state.places, contactName, sentName]);
 
   const update = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
   const patchTrigger = (patch: Obj) => setDraft((d) => (d.trigger ? { ...d, trigger: { ...d.trigger, ...patch } } : d));

@@ -281,12 +281,8 @@ function LocationCard({ sos, name, mapEnabled, now, ended }: { sos: Sos; name: s
       <T variant="h2">📍 {ended ? 'Letzter Standort' : 'Genauer Standort'}</T>
       {mapEnabled ? (
         <View style={{ borderRadius: radius.md, overflow: 'hidden' }}>
-          <TileMap
-            height={240}
-            center={{ lat: p.lat, lon: p.lon }}
-            zoom={16}
-            markers={[{ id: 'sos', lat: p.lat, lon: p.lon, label: name, kind: 'sos', accuracyM: p.accuracyM }]}
-          />
+          {/* Starts at the rough area only (the tile server sees it); + zooms in. */}
+          <TileMap height={240} markers={[{ id: 'sos', lat: p.lat, lon: p.lon, label: name, kind: 'sos', accuracyM: p.accuracyM }]} />
         </View>
       ) : null}
       <View style={{ gap: 2 }}>

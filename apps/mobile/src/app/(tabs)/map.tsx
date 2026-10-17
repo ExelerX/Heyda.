@@ -93,7 +93,7 @@ export default function MapTab() {
     items.push({ id: `place-${p.id}`, icon: '📍', title: p.name, detail: 'Dein Ort', kind: 'place', point: { lat: p.center.lat, lon: p.center.lon, accuracyM: p.radiusM }, shared: false });
   }
   if (me) {
-    items.push({ id: 'me', icon: '🔵', title: 'Du', detail: 'Nur auf deinem Gerät, wird nicht geteilt', kind: 'me', point: { lat: me.lat, lon: me.lon, accuracyM: me.accuracyM ?? 0 }, shared: false });
+    items.push({ id: 'me', icon: '🔵', title: 'Du', detail: 'Nur für dich, deine Freunde sehen das nicht', kind: 'me', point: { lat: me.lat, lon: me.lon, accuracyM: me.accuracyM ?? 0 }, shared: false });
   }
 
   const markers: MapMarker[] = items.map((i) => {
@@ -141,9 +141,10 @@ export default function MapTab() {
               Karte einschalten?
             </T>
             <T variant="muted">
-              Die Kartenbilder kommen von openstreetmap.org. Dieser Dienst sieht dabei ungefähr, welche Gegend du dir ansiehst –
-              aber nicht, wer deine Freunde sind. Was deine Freunde mit dir teilen, bleibt Ende-zu-Ende-verschlüsselt und geht
-              nicht an openstreetmap.org.
+              Die Kartenbilder kommen von openstreetmap.org. Der Dienst sieht dabei deine Internet-Adresse und welche Gegend die
+              Karte zeigt – also auch ungefähr, wo ein Freund ist, wenn du ihn auf der Karte ansiehst. Wer deine Freunde sind und
+              was sie dir schreiben, sieht er nicht. Von selbst zeigt die Karte Freunde nur grob, auf ein paar Kilometer. Näher
+              geht es, wenn du hineinzoomst.
             </T>
             <Button title="Karte einschalten" icon="🗺️" onPress={() => runtime.updateSettings({ mapEnabled: true })} />
             <T variant="small" style={{ textAlign: 'center' }}>

@@ -100,7 +100,9 @@ export function instantiateTemplate(
   const errors: string[] = [];
   const filled: SlotValues = {};
   for (const slot of template.slots) {
-    const value = values[slot.name] ?? slot.default;
+    // The user picks every person: a contact gap may only start out as "anyone".
+    const fallback = slot.kind === 'contact' && slot.default !== 'any' ? undefined : slot.default;
+    const value = values[slot.name] ?? fallback;
     const problem = checkSlotValue(slot, value);
     if (problem) errors.push(problem);
     else filled[slot.name] = typeof value === 'string' ? value.trim() : value!;

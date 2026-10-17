@@ -39,7 +39,7 @@ Heyda. auf dem Handy hat, verbindet den PC unter *Ich → Meine Geräte*.
 | Deine Kontakte | Was du freigibst: Ankunftszeit (gerundet), Ankunft/Abfahrt an freigegebenen Orten, Status, Ruhemodus; nur wenn du es wählst: ein ~2-km-Raster oder den genauen Punkt (mit Ablaufzeit oder bis du es beendest) | Koordinaten deiner Orte, deinen Standort, wenn du nichts teilst |
 | Deine Notfallkontakte, wenn **du** einen Notruf auslöst | Deinen genauen Standort (auch im Geistmodus) | |
 | Nostr-Relays | Für welchen (anonymen) Schlüssel eine Nachricht bestimmt ist, ungefähre Zeit (bis zu 2 Tage zufällig verschoben), Größe, deine IP-Adresse | Inhalt, Absender, Art der Nachricht |
-| openstreetmap.org (nur wenn du die Karte einschaltest) | Welche Kartenausschnitte du ansiehst | Wer du bist und was deine Freunde teilen |
+| openstreetmap.org (nur wenn du die Karte einschaltest) | Deine IP-Adresse und welche Kartenausschnitte du ansiehst, also auch ungefähr, wo ein Freund ist, den du dir auf der Karte anschaust (von selbst zoomt die Karte dabei nur auf ein paar Kilometer heran) | Wer deine Freunde sind und was sie dir schicken |
 | Wir (die Entwickler) | Nichts. Es gibt keinen Server und keine Telemetrie. | |
 
 Freigaben enden von selbst: Fahrten bei Ankunft oder spätestens nach 24 Std., der Live-Standort nach der gewählten
@@ -61,8 +61,10 @@ Zeit oder wenn du ihn ausschaltest; was gerade läuft, steht immer oben auf dem 
   eine Zufallszahl bei, das neue legt sich vorher fest (Commit-Reveal); ein untergeschobener Code hat so nur einen
   Versuch mit 1 zu 1 Million. Der Code gilt 10 Min.
 - **Eingaben werden streng geprüft** (zod-Schemas, Größenlimits, Ablaufzeiten, Schutz gegen Wiederholung).
-- **Plugins enthalten keinen Code**, nur Vorlagen. Automationen haben feste Limits (höchstens 20 Auslösungen pro
-  Stunde) und können das Teilen nur auf Stufe „Ankunftszeit“ starten.
+- **Plugins enthalten keinen Code**, nur Vorlagen. Wen eine Automation betrifft, wählst immer du; der Satz vor dem
+  Speichern zeigt jeden Text, der an andere geht. Automationen haben feste Limits (höchstens 20 Auslösungen pro
+  Stunde) und können das Teilen nur auf Stufe „Ankunftszeit“ starten. Mit Handy und PC schickt nur das Handy, was
+  Automationen an andere senden; der PC zeigt nur Hinweise.
 - **Nur lokale Benachrichtigungen:** kein Push-Token, keine Registrierung bei Apple, Google oder Expo.
 - **Windows-App:** gehärtetes Electron (Sandbox, Context Isolation, strenge Content-Security-Policy, keine
   Navigation nach außen, geprüfte IPC-Schnittstelle).
@@ -82,6 +84,7 @@ Zeit oder wenn du ihn ausschaltest; was gerade läuft, steht immer oben auf dem 
   (siehe unten); danach einmal neu installieren (vorher Sicherung machen).
 - **Windows ohne Zertifikat:** SmartScreen warnt beim ersten Start, bis ein Code-Signing-Zertifikat genutzt wird.
 - **iPhone-Verteilung** ohne Apple Developer Program (99 USD/Jahr) nur per Sideloading mit 7-Tage-Limit.
+- **Zwei Handys mit demselben Konto:** Automationen, die auf Kontakte reagieren, senden dann von beiden Handys.
 - **Verlorenes Gerät:** Alle deine Geräte teilen eine Identität. „Gerät entfernen“ stoppt das Synchronisieren, kann
   ein gestohlenes Gerät aber nicht aussperren. Sag dann deinen Kontakten Bescheid und richte Heyda. neu ein.
 - **Keine Forward Secrecy** in v1: Wer einen Geräteschlüssel stiehlt, könnte alte, noch auf Relays liegende

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { LinkNonce, RelayUrl, type BodyOf } from '../protocol/messages';
-import { createInitialState, type LinkedDevice, type NodeState } from '../state';
+import { createInitialState, type DeviceKind, type LinkedDevice, type NodeState } from '../state';
 import type { ContactKey, IncomingMessage } from '../transport/transport';
 import { base64urlDecode, base64urlEncode } from '../util/base64url';
 import { mergeSyncDoc, parseSyncDoc, type SyncDoc } from './doc';
@@ -16,11 +16,14 @@ export interface LinkPayload {
   /** The device that sent the account. */
   deviceId: string;
   deviceName: string;
+  /** Sent by newer versions. */
+  deviceKind?: DeviceKind;
   devices: LinkedDevice[];
   doc: SyncDoc;
 }
 
 const deviceId = z.string().regex(/^[A-Za-z0-9_-]{8,32}$/);
+const deviceKind = z.enum(['phone', 'computer']).optional();
 const PayloadSchema = z.object({
   format: z.literal('heyda.link'),
   v: z.literal(2),
@@ -29,8 +32,9 @@ const PayloadSchema = z.object({
   relays: z.array(RelayUrl).min(1).max(8),
   deviceId,
   deviceName: z.string().trim().min(1).max(40),
+  deviceKind,
   devices: z
-    .array(z.object({ deviceId, name: z.string().trim().min(1).max(40), linkedAt: z.number().int().nonnegative() }))
+    .array(z.object({ deviceId, name: z.string().trim().min(1).max(40), linkedAt: z.number().int().nonnegative(), kind: deviceKind }))
     .max(20),
   doc: z.unknown(),
 });
@@ -112,6 +116,7 @@ export class LinkReceiver {
       relays: p.data.relays,
       deviceId: p.data.deviceId,
       deviceName: p.data.deviceName,
+      deviceKind: p.data.deviceKind,
       devices: p.data.devices,
       doc,
     };
@@ -199,7 +204,7 @@ export function createLinkedState(
   return {
     ...merged,
     self: { ...merged.self, name: payload.doc.profileName || merged.self.name },
-    devices: [...others, { deviceId: payload.deviceId, name: payload.deviceName, linkedAt: now }],
+    devices: [...others, { deviceId: payload.deviceId, name: payload.deviceName, linkedAt: now, ...(payload.deviceKind && { kind: payload.deviceKind }) }],
     // My other device already handled what relays still hold from before: no alarms for it here.
     historyBefore: now,
   };

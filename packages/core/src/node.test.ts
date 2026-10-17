@@ -676,6 +676,21 @@ describe('SocialNode: offline and own devices', () => {
     expect(desktopChats).toEqual(['ich: Hallo vom Handy', 'max: Hallo zurück']);
   });
 
+  it('a computer linked from a phone knows at once that the phone acts for automations', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    await lisa.start();
+    const n = await newDevice(w);
+    await lisa.startLink(n.code);
+    await flush();
+    await lisa.confirmLink(LISA_SECRET);
+    await flush();
+    const initial = createLinkedState(n.payload!, { deviceId: 'dev-desktop-1', deviceName: 'PC' }, w.now());
+    expect(initial.devices).toEqual([expect.objectContaining({ deviceId: lisa.getState().self.deviceId, kind: 'phone' })]);
+    const desktop = new SocialNode({ transport: w.net.createTransport(LISA, w.now), initialState: initial, now: w.now, syncDelayMs: 0, deviceKind: 'computer' });
+    expect(desktop.runsAutomationActions).toBe(false);
+  });
+
   it('refuses a linked account that does not belong to the sender', async () => {
     const w = world();
     const n = await newDevice(w, { publicKeyOf: () => MAX }); // the secret belongs to Max, not to the sender

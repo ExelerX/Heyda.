@@ -27,7 +27,10 @@ export function durationText(minutes: number): string {
 }
 
 export interface DescribeNames {
+  /** How I see someone (my nickname for them, if I gave one). */
   contactName: (key: string) => string;
+  /** The name they chose, which is what messages to others say. Defaults to `contactName`. */
+  sentName?: (key: string) => string;
   placeName: (placeId: string) => string;
 }
 
@@ -94,10 +97,14 @@ function describeCondition(c: Condition, n: DescribeNames): string {
   }
 }
 
-/** Shows `{{contact}}` etc. the way they will read when the rule fires. */
-function fillVariables(text: string, t: Trigger, n: DescribeNames): string {
+/**
+ * Shows `{{contact}}` etc. the way they will read when the rule fires. `out`: the text goes to
+ * other people, so it names the person the way they named themselves, never by my nickname.
+ */
+function fillVariables(text: string, t: Trigger, n: DescribeNames, out = true): string {
+  const person = out ? (n.sentName ?? n.contactName) : n.contactName;
   return text.replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (_, name: string) => {
-    if (name === 'contact' && 'contact' in t) return t.contact === 'any' ? '[Person]' : n.contactName(t.contact);
+    if (name === 'contact' && 'contact' in t) return t.contact === 'any' ? '[Person]' : person(t.contact);
     if (name === 'place' && 'place' in t && t.place) return t.on.startsWith('me.') ? n.placeName(t.place) : t.place;
     if (name === 'eta') return 'in X min';
     const label: Record<string, string> = { place: 'Ort', destination: 'Ziel', text: 'Nachricht' };
@@ -108,10 +115,11 @@ function fillVariables(text: string, t: Trigger, n: DescribeNames): string {
 function describeAction(a: Action, n: DescribeNames, t: Trigger): string {
   switch (a.do) {
     case 'notify':
-      return `zeige „${fillVariables(a.title, t, n)}“ an`;
+      return `zeige „${fillVariables(a.title, t, n, false)}“ an`;
     case 'send_ping': {
       const to = n.contactName(a.to);
-      if (a.kind === 'custom') return `schicke ${to} „${fillVariables(a.text ?? '👋', t, n)}“`;
+      // Its own text replaces the label for every kind of ping (see `pingText`): it is what they read.
+      if (a.text?.trim()) return `schicke ${to} „${PING_LABELS[a.kind].emoji} ${fillVariables(a.text, t, n)}“`;
       return `schicke ${to} „${PING_ACTION_TEXT[a.kind]}“`;
     }
     case 'send_message':
@@ -121,7 +129,7 @@ function describeAction(a: Action, n: DescribeNames, t: Trigger): string {
     case 'set_dnd':
       return a.minutes === 0 ? 'schalte den Ruhemodus aus' : `schalte den Ruhemodus für ${durationText(a.minutes)} an`;
     case 'set_status':
-      return `setze deinen Status auf „${[a.emoji, a.text].filter(Boolean).join(' ')}“`;
+      return `setze deinen Status auf „${[a.emoji, fillVariables(a.text, t, n)].filter(Boolean).join(' ')}“`;
     case 'start_trip':
       return `teile deine Ankunftszeit nach „${n.placeName(a.destination)}“ mit ${a.to.map(n.contactName).join(', ')}`;
   }

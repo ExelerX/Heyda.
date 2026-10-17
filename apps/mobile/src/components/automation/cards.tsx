@@ -1,7 +1,7 @@
 import { describeRule, type Rule, type RuleTemplate, type SlotValues } from '@heyda/core';
 import { router } from 'expo-router';
 import { Platform, Pressable, Switch, Text, View } from 'react-native';
-import { useContactName, useSnapshot } from '../../lib/store';
+import { useContactName, useSentName, useSnapshot } from '../../lib/store';
 import { CATEGORY_ICON, isPluginTemplate, sentenceParts } from '../../lib/templates-ui';
 import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
 import { Card, Pill, Row, T } from '../ui';
@@ -78,8 +78,9 @@ export function RuleCard({ rule, onToggle, onDelete }: { rule: Rule; onToggle: (
   const t = useTheme();
   const { state } = useSnapshot();
   const contactName = useContactName();
+  const sentName = useSentName();
   const placeName = (id: string) => state.places.find((p) => p.id === id)?.name ?? 'einem gelöschten Ort';
-  const sentence = describeRule(rule, { contactName, placeName });
+  const sentence = describeRule(rule, { contactName, sentName, placeName });
   return (
     <Card style={{ gap: spacing.sm, opacity: rule.enabled ? 1 : 0.75 }}>
       <Row gap={spacing.md} style={{ alignItems: 'flex-start' }}>

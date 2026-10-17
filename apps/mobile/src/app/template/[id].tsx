@@ -8,7 +8,7 @@ import { ContactPick, NumberPick, PlacePick } from '../../components/automation/
 import { Banner, Bullet, errorText, Field, leave, Narrow, NotFound, param } from '../../components/setup/kit';
 import { Button, Card, Chip, Pill, Screen, Section, T, Wrap } from '../../components/ui';
 import { notice } from '../../lib/confirm';
-import { useContactName, useRuntime, useSnapshot } from '../../lib/store';
+import { useContactName, useRuntime, useSentName, useSnapshot } from '../../lib/store';
 import { durationLabel, isPluginTemplate } from '../../lib/templates-ui';
 import { spacing, useTheme } from '../../lib/theme';
 
@@ -51,8 +51,12 @@ function TemplateForm({ template }: { template: RuleTemplate }) {
   const runtime = useRuntime();
   const { state, plugins } = useSnapshot();
   const contactName = useContactName();
+  const sentName = useSentName();
+  // A person is never filled in ahead, only "anyone" (the import refuses anything else too).
   const [values, setValues] = useState<SlotValues>(() =>
-    Object.fromEntries(template.slots.flatMap((s) => (s.default !== undefined ? [[s.name, s.default]] : []))),
+    Object.fromEntries(
+      template.slots.flatMap((s) => (s.default !== undefined && (s.kind !== 'contact' || s.default === 'any') ? [[s.name, s.default]] : [])),
+    ),
   );
   const [tried, setTried] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -111,7 +115,7 @@ function TemplateForm({ template }: { template: RuleTemplate }) {
         <View style={{ marginTop: spacing.lg, gap: spacing.md }}>
           {preview.ok ? (
             <Banner tone="success" title="So funktioniert es">
-              {describeRule(preview.value, { contactName, placeName })}
+              {describeRule(preview.value, { contactName, sentName, placeName })}
             </Banner>
           ) : (
             <Card style={{ gap: spacing.xs, borderColor: tried ? t.danger : t.border }}>

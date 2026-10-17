@@ -156,7 +156,16 @@ export function ActionParams({ action, trigger, onPatch }: { action: Obj; trigge
             <PickLabel>Welcher Ping?</PickLabel>
             <OptionPick value={action.kind} onChange={(kind) => onPatch({ kind })} options={PING_OPTIONS} />
           </View>
-          {action.kind === 'custom' && <VarText label="Eigener Text" value={action.text} onChange={(text) => onPatch({ text })} maxLength={280} vars={vars} optional placeholder="👋" />}
+          {/* For every kind: its own text replaces the label, so it is always shown and can be changed. */}
+          <VarText
+            label="Eigener Text"
+            value={action.text}
+            onChange={(text) => onPatch({ text })}
+            maxLength={280}
+            vars={vars}
+            optional
+            placeholder={PING_LABELS[action.kind as PingKind]?.text ?? '👋'}
+          />
         </View>
       );
     case 'send_message':
