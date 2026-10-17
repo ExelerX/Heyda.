@@ -85,7 +85,8 @@ Zeit oder wenn du ihn ausschaltest; was gerade läuft, steht immer oben auf dem 
 - **Verlorenes Gerät:** Alle deine Geräte teilen eine Identität. „Gerät entfernen“ stoppt das Synchronisieren, kann
   ein gestohlenes Gerät aber nicht aussperren. Sag dann deinen Kontakten Bescheid und richte Heyda. neu ein.
 - **Keine Forward Secrecy** in v1: Wer einen Geräteschlüssel stiehlt, könnte alte, noch auf Relays liegende
-  Nachrichten lesen. Deshalb verfallen Nachrichten auf den Relays (Fahrten 6 Std., Orte 1 Tag, Chat 7 Tage).
+  Nachrichten lesen. Deshalb sollen die Relays jede Nachricht nach höchstens 9 Tagen löschen. Die Frist ist für alle
+  Nachrichten gleich, damit niemand an ihr erkennt, ob es ein Chat, ein Standort oder ein Notruf ist.
 - **Öffentliche Relays** können ausfallen oder Nachrichten verwerfen; Heyda. versendet über mehrere Relays und
   wiederholt automatisch.
 

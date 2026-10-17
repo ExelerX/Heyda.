@@ -203,6 +203,7 @@ export class SocialNode {
   private syncTimer: ReturnType<typeof setTimeout> | undefined;
   private flushingOutbox = false;
   private running = false;
+  private redeliverQueued = false;
   private pendingLink: PendingLink | undefined;
 
   constructor(private readonly options: SocialNodeOptions) {
@@ -2166,6 +2167,7 @@ export class SocialNode {
   }
 
   private update(patch: Partial<NodeState>, syncFields: SyncField[] = []): void {
+    const before = this.state;
     let next: NodeState = { ...this.state, ...patch };
     if (syncFields.length) {
       const rev = { ...next.syncRev };
@@ -2175,6 +2177,21 @@ export class SocialNode {
     this.state = next;
     this.emit({ type: 'state', state: this.state });
     if (syncFields.length) this.markSync();
+    if (next.contacts !== before.contacts || next.groups !== before.groups) this.redeliverSoon();
+  }
+
+  /**
+   * Someone new may be accepted now (a contact from my other device's sync, a member from a group
+   * update): the transport hands on again what it turned away from them a moment ago. Deferred,
+   * so it never runs in the middle of handling the message that caused it.
+   */
+  private redeliverSoon(): void {
+    if (this.redeliverQueued || !this.transport.redeliverRefused) return;
+    this.redeliverQueued = true;
+    queueMicrotask(() => {
+      this.redeliverQueued = false;
+      if (this.running) this.transport.redeliverRefused?.();
+    });
   }
 
   private emitLocationNeeds(): void {

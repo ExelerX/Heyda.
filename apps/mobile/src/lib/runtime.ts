@@ -25,7 +25,7 @@ import {
   type RuleTemplate,
   type SharingSession,
 } from '@heyda/core';
-import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@heyda/transport-nostr';
+import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport, type SeenSnapshot } from '@heyda/transport-nostr';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
 import { DEMO_KEYS, startDemoFriends } from './demo';
@@ -62,7 +62,7 @@ interface Persisted {
   alarms: Alarm[];
   plugins: Plugin[];
   settings: Settings;
-  seen: { sync: number; ids: string[] };
+  seen: SeenSnapshot;
   /** The running trip, so it survives the OS killing and relaunching the app. */
   trip?: SharingSession;
   /** Set on a freshly linked device until my other devices were told about it. */
@@ -222,6 +222,8 @@ export class AppRuntime {
     private data: Persisted,
     private readonly seen: MemorySeenStore,
     private readonly startDemo: ((node: SocialNode) => () => void) | undefined,
+    /** Keeps a copy of the identity key in memory while running; shutdown() wipes it. */
+    private readonly transport: NostrTransport | undefined,
   ) {
     node.on((e) => {
       switch (e.type) {
@@ -290,13 +292,15 @@ export class AppRuntime {
 
     let node: SocialNode;
     let startDemo: ((node: SocialNode) => () => void) | undefined;
+    let transport: NostrTransport | undefined;
     const common = { initialState: data.state, initialStatuses: data.statuses };
     if (data.settings.demo) {
       const network = new MemoryNetwork();
       node = new SocialNode({ ...common, transport: network.createTransport(selfKey) });
       startDemo = (n) => startDemoFriends(network, n);
     } else {
-      const transport = new NostrTransport({
+      // Keeps its own copy of the key, so this array can be wiped below.
+      transport = new NostrTransport({
         secretKey,
         ownRelays: data.state.self.relays.length ? data.state.self.relays : DEFAULT_RELAYS,
         relaysFor: (k) => node.relaysFor(k),
@@ -307,7 +311,7 @@ export class AppRuntime {
       node = new SocialNode({ ...common, transport });
     }
     secretKey.fill(0);
-    const runtime = new AppRuntime(node, vault, data, seen, startDemo);
+    const runtime = new AppRuntime(node, vault, data, seen, startDemo, transport);
     for (const hook of createdHooks) hook(runtime);
     return runtime;
   }
@@ -553,6 +557,8 @@ export class AppRuntime {
     this.stopDemo = undefined;
     if (this.started) await this.node.stop().catch(() => {});
     this.started = false;
+    // Wipes the key copy and closes the relay connections; this instance never sends again.
+    await this.transport?.dispose().catch(() => {});
     if (save) await this.flush();
     // From here on nothing saves any more (also a save scheduled while the node was stopping):
     // a restore, a link or a wipe may be about to replace the data on disk.

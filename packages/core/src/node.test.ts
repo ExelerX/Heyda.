@@ -546,6 +546,25 @@ describe('SocialNode: groups', () => {
     expect(max.name(MIA)).toBe('Mia');
   });
 
+  it('has its transport hand on refused messages again once it learns new members or contacts', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    const redeliver = vi.fn();
+    const max = w.make(MAX, 'Max', { transport: Object.assign(w.net.createTransport(MAX, w.now), { redeliverRefused: redeliver }) });
+    const mia = w.make(MIA, 'Mia');
+    for (const n of [lisa, max, mia]) await n.start();
+    await w.pair(lisa, mia);
+    await w.pair(lisa, max);
+    expect(redeliver).toHaveBeenCalled();
+    redeliver.mockClear();
+
+    // Mia's first group message can reach Max before the update that makes her a member of his copy.
+    await lisa.createGroup('Familie', [MAX, MIA]);
+    await flush();
+    expect(max.getState().groups).toHaveLength(1);
+    expect(redeliver).toHaveBeenCalledTimes(1);
+  });
+
   it('ignores group messages from outsiders and roster changes by non-owners', async () => {
     const { net, lisa, max } = await trio();
     const group = await lisa.createGroup('Familie', [MAX, MIA]);

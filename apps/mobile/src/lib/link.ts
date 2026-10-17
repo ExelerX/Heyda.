@@ -33,6 +33,8 @@ export async function beginLinkReceive(): Promise<LinkSession> {
   const temp = generateSecretKey();
   const { invite, secret } = createLinkInvite({ tempKey: getPublicKey(temp), relays: DEFAULT_RELAYS, now: Date.now() });
   const transport = new NostrTransport({ secretKey: temp, ownRelays: invite.relays, relaysFor: () => invite.relays });
+  // The transport keeps its own copy of the one-time key and wipes it in dispose().
+  temp.fill(0);
   const receiver = new LinkReceiver(invite, secret, (hex) => getPublicKey(hexToBytes(hex)));
   secret.fill(0);
   let settle: (p: LinkPayload) => void = () => {};
@@ -52,7 +54,7 @@ export async function beginLinkReceive(): Promise<LinkSession> {
     done = true;
     clearTimeout(timer);
     receiver.dispose();
-    void transport.stop().finally(() => temp.fill(0));
+    void transport.dispose().catch(() => {});
   };
   const timer = setTimeout(() => {
     finish();

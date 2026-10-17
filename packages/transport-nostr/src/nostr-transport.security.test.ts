@@ -10,7 +10,9 @@ import { MemoryRelayPool } from './pool';
 const RELAY = 'wss://relay.example';
 
 function setup(opts: { seen?: MemorySeenStore; aliceSkewMs?: number; accept?: (from: string) => boolean } = {}) {
-  let clock = 1_800_000_000_000;
+  // Real time: nostr-tools' createWrap dates wraps by the real clock, and the transport skips wraps
+  // too old to hold a message younger than maxAge.
+  let clock = Date.now();
   const pool = new MemoryRelayPool();
   const aliceKey = generateSecretKey();
   const bobKey = generateSecretKey();

@@ -13,7 +13,8 @@ export interface IncomingMessage {
 export interface SendOptions {
   /**
    * How long relays should keep the message for an offline recipient.
-   * A hint only: a relay can ignore it, so nothing secret may depend on deletion.
+   * A hint only: a relay can ignore it, so nothing secret may depend on deletion. A transport may
+   * also keep every message equally long, so the lifetime does not tell what kind of message it is.
    */
   ttlSeconds?: number;
   /** Publish to these relays instead of the recipient's known ones (e.g. a device being linked). */
@@ -34,4 +35,9 @@ export interface Transport {
   send(to: ContactKey, message: AppMessage, options?: SendOptions): Promise<void>;
   /** Registers a handler and returns a function that removes it. */
   onMessage(handler: (incoming: IncomingMessage) => void): () => void;
+  /**
+   * Optional: hands on again messages the transport turned away because their sender was not
+   * known yet. The node calls it after it learned new contacts or group members.
+   */
+  redeliverRefused?(): void;
 }
