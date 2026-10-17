@@ -614,3 +614,50 @@ describe('SocialNode: a batch of fixes dated in the future', () => {
     expect(lats(sent('live.update').map((m) => m.point))).toEqual([at(300)]);
   });
 });
+
+describe('SocialNode: my own clock is off', () => {
+  /** Fixes handed over one at a time, as tracking does, each `spacingMs` apart. */
+  async function fixes(node: SocialNode, tick: (ms: number) => void, now: () => number, offsets: number[], spacingMs = 15_000) {
+    for (const off of offsets) {
+      tick(spacingMs);
+      await node.onLocationFix({ ...north(10), timestamp: now() + off, accuracyM: 10 });
+    }
+  }
+
+  it('says so when GPS time and my clock differ by more than five minutes, and when it is right again', async () => {
+    const { lisa, now, tick } = await pairedPair();
+    const seen: (number | undefined)[] = [];
+    lisa.on((e) => e.type === 'clock' && seen.push(e.aheadMs));
+    expect(lisa.clockAheadMs).toBeUndefined();
+    // My clock runs ten minutes behind: the fixes are dated ten minutes ahead of it.
+    await fixes(lisa, tick, now, [10 * MIN, 10 * MIN + 2_000, 10 * MIN - 1_000]);
+    expect(lisa.clockAheadMs).toBeDefined();
+    expect(Math.round(lisa.clockAheadMs! / MIN)).toBe(-10);
+    // Set right: the next fixes agree with it again.
+    await fixes(lisa, tick, now, [500, -800, 0]);
+    expect(lisa.clockAheadMs).toBeUndefined();
+    expect(seen.map((x) => (x === undefined ? undefined : Math.round(x / MIN)))).toEqual([-10, undefined]);
+  });
+
+  it('also when it runs ahead', async () => {
+    const { lisa, now, tick } = await pairedPair();
+    await fixes(lisa, tick, now, [-HOUR, -HOUR + 3_000, -HOUR - 2_000]);
+    expect(Math.round(lisa.clockAheadMs! / MIN)).toBe(60);
+  });
+
+  it('stays quiet for small differences, a single old fix, or fixes that disagree with each other', async () => {
+    const { lisa, now, tick } = await pairedPair();
+    await fixes(lisa, tick, now, [30_000, -40_000, 4 * MIN]);
+    expect(lisa.clockAheadMs).toBeUndefined();
+    // An old cached position, then good ones.
+    await fixes(lisa, tick, now, [-2 * HOUR, 0, 1_000]);
+    expect(lisa.clockAheadMs).toBeUndefined();
+    // The same old position handed over again and again is one sample, not three.
+    const stale = now() - 3 * HOUR;
+    for (let i = 0; i < 4; i++) {
+      tick(15_000);
+      await lisa.onLocationFix({ ...north(10), timestamp: stale, accuracyM: 10 });
+    }
+    expect(lisa.clockAheadMs).toBeUndefined();
+  });
+});

@@ -128,6 +128,37 @@ describe('automations on more than one device', () => {
     expect(pc.activeTrip).toBeUndefined();
   });
 
+  it('the Windows app does not start a trip without GPS, and notes that in the activity list', async () => {
+    const w = world();
+    const max = w.make(MAX, 'Max');
+    const pc = w.make(LISA, 'Lisa', { deviceKind: 'computer' });
+    await max.start();
+    await pc.start();
+    await w.pair(pc, max);
+    pc.setPlaces([{ id: 'home', name: 'Zuhause', center: { lat: 52.52, lon: 13.405 }, radiusM: 100 }]);
+    pc.setRules([
+      {
+        id: 'trip-on-ping-2',
+        name: 'Abholen',
+        enabled: true,
+        trigger: { on: 'contact.ping', contact: MAX, kind: 'pickup-request' },
+        conditions: [],
+        actions: [{ do: 'start_trip', to: [MAX], destination: 'home', level: 'eta' }],
+        source: 'manual',
+      },
+    ]);
+    expect(pc.runsAutomationActions).toBe(true);
+    const got = alerts(pc);
+    await max.sendPing(LISA, 'pickup-request');
+    await flush();
+    expect(pc.activeTrip).toBeUndefined();
+    expect(max.getStatus(LISA).trip).toBeUndefined();
+    expect(w.net.log.filter((l) => l.from === LISA && l.message.type.startsWith('session.'))).toEqual([]);
+    const note = got.filter((a) => a.category === 'automation');
+    expect(note.map((a) => [a.title, a.level])).toEqual([['Ankunftszeit nicht geteilt', 'feed']]);
+    expect(note[0]!.body).toContain('Zuhause');
+  });
+
   it('the Windows app does it all when the account has no phone', async () => {
     const w = world();
     const max = w.make(MAX, 'Max');

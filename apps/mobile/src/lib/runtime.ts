@@ -86,7 +86,11 @@ interface Persisted {
   alarms: SavedAlarm[];
   plugins: Plugin[];
   settings: Settings;
-  seen: SeenSnapshot;
+  /**
+   * What the seen store took in since its own file (`SEEN_FILE`) was last written (see
+   * `MemorySeenStore.journal`): small, saved with every change, so that file can be written rarely.
+   */
+  seenRecent?: SeenSnapshot;
   /** The running trip, so it survives the OS killing and relaunching the app. */
   trip?: SharingSession;
   /** Set on a freshly linked device until my other devices were told about it. */
@@ -125,6 +129,8 @@ export interface Snapshot {
   automationsActHere: boolean;
   /** The device chosen in "Automationen senden von", if it is still in the list; else the usual rule. */
   automationDevice: string | undefined;
+  /** How far this device's clock runs ahead of GPS time (negative: behind), once off by more than 5 minutes. */
+  clockAheadMs: number | undefined;
 }
 
 /** Hooks the platform layer (location, geofences) sets when a runtime is created. */
@@ -154,13 +160,20 @@ const MAX_CHAT_CHARS_TOTAL = 3_000_000;
 const MAX_ACTIVITY = 300;
 const MAX_ALARMS = 100;
 const MAX_ALARMS_DONE = 200;
-/** A Windows alarm timer this late means the PC slept: what relays kept meanwhile may call it off. */
-const LATE_ALARM_MS = 60_000;
 /** A Windows alarm whose time passed while the PC was off still rings this long after it: as long as the core keeps a watch. */
 const MISSED_ALARM_KEEP_MS = 12 * 3600_000;
 const MAX_ACTIVITY_TITLE = 200;
 const MAX_ACTIVITY_BODY = 600;
 const DATA_FILE = 'app-data';
+/**
+ * The transport's seen store (handled ids, held messages, relay sync times), about 3 MB when full.
+ * Written apart from the app data and at most every SEEN_SAVE_MS, plus when the app goes to the
+ * background or stops; what came in meanwhile is in the app data (`seenRecent`).
+ */
+const SEEN_FILE = 'transport-data';
+const SEEN_SAVE_MS = 30_000;
+/** A journal this long (a big catch-up) is worth a full save before the time is up. */
+const SEEN_JOURNAL_MAX = 2_000;
 const TICK_MS = 20_000;
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -213,7 +226,7 @@ function migrate(raw: unknown, selfKey: string): Persisted | undefined {
     // Checked again like an import: a plugin saved before a check existed is dropped.
     plugins: storedPlugins(old.plugins),
     settings: { ...DEFAULT_SETTINGS, ...old.settings },
-    seen: old.seen ?? { sync: 0, ids: [] },
+    seenRecent: old.seenRecent,
     trip: old.trip,
     announceLinked: old.announceLinked,
     alarmsDone: Array.isArray(old.alarmsDone) ? old.alarmsDone.filter((d) => typeof d?.id === 'string' && Number.isFinite(d.at)).slice(-MAX_ALARMS_DONE) : [],
@@ -233,16 +246,24 @@ export function freshData(selfKey: string, name = 'Ich', demo = false): Persiste
     alarms: [],
     plugins: [],
     settings: { ...DEFAULT_SETTINGS, demo },
-    seen: { sync: 0, ids: [] },
   };
+}
+
+/** The seen store's file: for this account's key only, so another account's never counts. */
+interface SeenFile {
+  key: string;
+  seen: SeenSnapshot;
 }
 
 /** Writes app data for an account (after linking or restoring) before the runtime starts. */
 export async function writeAccount(secretKey: Uint8Array, state: NodeState, extra: Partial<Persisted> = {}): Promise<void> {
   const vault = getVault();
   await vault.setSecretKey(secretKey);
-  const data: Persisted = { ...freshData(getPublicKey(secretKey)), ...extra, state, v: 2 };
+  const key = getPublicKey(secretKey);
+  const data: Persisted = { ...freshData(key), ...extra, state, v: 2 };
   data.settings = { ...DEFAULT_SETTINGS, ...extra.settings, onboarded: true, demo: false };
+  // Nothing of what the account this one replaces handled or held may carry over.
+  await vault.save(SEEN_FILE, { key, seen: { sync: 0, ids: [] } } satisfies SeenFile);
   await vault.save(DATA_FILE, data);
   // Alarms and notifications of the account (or demo) this one replaces: nothing in the new data
   // could cancel them, and they would ring or show names later.
@@ -259,6 +280,8 @@ export class AppRuntime {
   private snapshotCache: Snapshot | undefined;
   private readonly listeners = new Set<() => void>();
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When `SEEN_FILE` was last written. */
+  private seenSavedAt = 0;
   private tickTimer: ReturnType<typeof setInterval> | undefined;
   private stopDemo: (() => void) | undefined;
   private openThread: string | undefined;
@@ -338,6 +361,7 @@ export class AppRuntime {
           this.changed(false);
           break;
         case 'link':
+        case 'clock':
           // Only in memory: nothing to save.
           this.changed(false);
           break;
@@ -357,7 +381,10 @@ export class AppRuntime {
     // nothing between page loads, so it skips onboarding (still reachable at /welcome) and every
     // screen can be opened directly by its address.
     if (isBrowserPreview) data.settings = { ...data.settings, demo: true, onboarded: stored ? data.settings.onboarded : true };
-    const seen = MemorySeenStore.restore(data.seen);
+    const seenFile = await vault.load<Partial<SeenFile>>(SEEN_FILE);
+    const seen = MemorySeenStore.restore(seenFile?.key === selfKey ? seenFile.seen : undefined);
+    // What came in after that file was written, saved with the app data.
+    seen.merge(data.seenRecent);
 
     let node: SocialNode;
     let startDemo: ((node: SocialNode) => () => void) | undefined;
@@ -373,8 +400,9 @@ export class AppRuntime {
         secretKey,
         ownRelays: data.state.self.relays.length ? data.state.self.relays : DEFAULT_RELAYS,
         relaysFor: (k) => node.relaysFor(k),
-        // Strangers' messages are dropped before they take room in the saved seen store.
-        accept: (from, message) => node.acceptsMessage(from, message),
+        // Strangers' messages are dropped before they take room in the saved seen store; a
+        // contact's message that waits for something (a group's roster) is held there.
+        accept: (from, message) => node.judgeMessage(from, message),
         seen,
       });
       node = new SocialNode({ ...common, transport });
@@ -464,6 +492,7 @@ export class AppRuntime {
         linkStatus: this.node.linkStatus,
         automationsActHere: this.node.runsAutomationActions,
         automationDevice: this.node.automationDevice,
+        clockAheadMs: this.node.clockAheadMs,
       };
     }
     return this.snapshotCache;
@@ -666,7 +695,6 @@ export class AppRuntime {
     if (demo === this.isDemo) return;
     if (this.node.activeTrip) await this.node.stopTrip();
     await this.shutdown(false);
-    this.data.seen = this.seen.snapshot();
     this.data.statuses = this.node.exportStatuses();
     if (demo) {
       const { beforeDemo: _none, ...real } = this.data;
@@ -675,34 +703,51 @@ export class AppRuntime {
     } else {
       this.leaveDemo();
     }
-    await this.write();
+    await this.write(true);
   }
 
   async wipeEverything(): Promise<void> {
     await this.shutdown(false);
-    await this.vault.wipe([DATA_FILE]);
+    await this.vault.wipe([DATA_FILE, SEEN_FILE]);
     // Also every alarm with the OS (the app's own list may have lost some) and the notifications
     // on screen, which show names and message previews.
     await clearNotifications();
   }
 
-  /** Persist now, e.g. when the app goes to the background. */
+  /** Persist now, the seen store too, e.g. when the app goes to the background. */
   async flush(): Promise<void> {
+    await this.save(true);
+  }
+
+  private async save(allSeen: boolean): Promise<void> {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
     if (this.disposed) return;
-    await this.write();
+    await this.write(allSeen);
   }
 
-  private async write(): Promise<void> {
-    this.data.seen = this.seen.snapshot();
+  /**
+   * Writes the app data, and the seen store's own file when `allSeen` or due (see `SEEN_FILE`).
+   * That file is taken before the app data and written after it, so it never knows of a message
+   * whose effects the app data lacks: a crash in between can only make the journal repeat ids.
+   */
+  private async write(allSeen = false): Promise<void> {
+    const now = Date.now();
+    const due = allSeen || now - this.seenSavedAt >= SEEN_SAVE_MS || now < this.seenSavedAt || this.seen.journalSize() > SEEN_JOURNAL_MAX;
+    const full = due ? this.seen.snapshot() : undefined;
+    const mark = this.seen.journalMark();
+    this.data.seenRecent = this.seen.journal();
     this.data.statuses = this.node.exportStatuses();
     await this.vault.save(DATA_FILE, this.data);
+    if (!full) return;
+    await this.vault.save(SEEN_FILE, { key: this.data.state.self.key, seen: full } satisfies SeenFile);
+    this.seen.saved(mark);
+    this.seenSavedAt = now;
   }
 
   /** For background tasks: persist only if something changed, before the OS suspends us. */
   async flushIfDirty(): Promise<void> {
-    if (this.saveTimer) await this.flush();
+    if (this.saveTimer) await this.save(false);
   }
 
   // ---- internals ---------------------------------------------------------------------------
@@ -731,13 +776,14 @@ export class AppRuntime {
   }
 
   /**
-   * A Windows alarm timer fired. Far too late means the PC slept through its time: the check-in or
-   * end that calls it off may be waiting on the relays, so it rings only once they handed over what
-   * they kept (or after a short wait), and not at all if the node cancelled or moved it meanwhile.
+   * A Windows alarm timer fired. It rings at once only if the PC was awake and connected at its
+   * time (see `SocialNode.awakeAt`). Otherwise, however late it fired, the check-in or end that
+   * calls it off may be waiting on the relays: it rings only once they handed over what they kept
+   * (or after a short wait), and not at all if the node cancelled or moved it meanwhile.
    */
   private fireDesktopAlarm(alarm: Alarm, caughtUp = false): void {
     if (this.disposed || !this.data.alarms.some((a) => a.id === alarm.id && a.at === alarm.at)) return;
-    if (!caughtUp && Date.now() - alarm.at > LATE_ALARM_MS) {
+    if (!caughtUp && !this.node.awakeAt(alarm.at)) {
       void this.node.catchUpAgain().then(() => this.fireDesktopAlarm(alarm, true));
       return;
     }
@@ -923,7 +969,7 @@ export class AppRuntime {
     for (const l of [...this.listeners]) l();
     if (persist && !this.disposed) {
       if (this.saveTimer) clearTimeout(this.saveTimer);
-      this.saveTimer = setTimeout(() => void this.flush().catch(this.reportSaveError), 500);
+      this.saveTimer = setTimeout(() => void this.save(false).catch(this.reportSaveError), 500);
     }
   }
 }

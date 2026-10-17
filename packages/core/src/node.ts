@@ -48,7 +48,7 @@ import {
 import { buildSyncDoc, mergeSyncDoc, parseSyncDoc } from './sync/doc';
 import { decodeLinkInvite, LINK_SECRET_BYTES, LINK_TTL_MS, linkCode, linkCommitment, randomLinkSecret, type LinkInvite } from './sync/link';
 import { chunkPayload, Reassembler } from './sync/xfer';
-import type { ContactKey, IncomingMessage, Transport } from './transport/transport';
+import type { Acceptance, ContactKey, IncomingMessage, Transport } from './transport/transport';
 import { base64urlDecode, base64urlEncode } from './util/base64url';
 import { RateLimiter, RecentIds } from './util/rate-limit';
 import { randomId } from './util/random';
@@ -69,7 +69,9 @@ export type NodeEvent =
   | { type: 'location'; needs: LocationNeeds }
   | { type: 'state'; state: NodeState }
   /** The device link this device is sending its account through changed (see `linkStatus`). */
-  | { type: 'link'; status: LinkStatus | undefined };
+  | { type: 'link'; status: LinkStatus | undefined }
+  /** Whether my clock is off, and by how much (see `clockAheadMs`). */
+  | { type: 'clock'; aheadMs: number | undefined };
 
 /**
  * Where linking a new device stands on the existing device: waiting for the new device to
@@ -168,10 +170,17 @@ const SOS_KEEP_MS = 3 * DAY;
  */
 const BACKLOG_WAIT_MS = 15_000;
 /**
- * A deadline seen this long after it passed, with no tick in between: the device slept or the app
- * was frozen meanwhile (ticks come every 15–60 s), so what relays kept may hold its check-in.
+ * Ticks come every 15–60 s: a longer gap between two means the device slept or the app was frozen
+ * in it, and a deadline in the gap may have a check-in waiting on the relays (see `awakeAt`).
  */
-const LATE_RING_MS = 60_000;
+const TICK_GAP_MS = 90_000;
+/** My clock and GPS time differing by more than this: my clock is off (see `clockAheadMs`). */
+const CLOCK_OFF_MS = 5 * 60_000;
+/** Fixes whose time is compared with my clock; the median of the recent ones counts. */
+const CLOCK_SAMPLES = 5;
+/** The newest this many must agree within CLOCK_AGREE_MS, so an old cached position says nothing. */
+const CLOCK_SAMPLES_NEEDED = 3;
+const CLOCK_AGREE_MS = 2 * 60_000;
 
 /** Message types whose newer copy replaces an older one still waiting in the outbox. */
 const REPLACEABLE = new Set(['presence', 'session.update', 'live.update', 'sos.update']);
@@ -222,6 +231,10 @@ export class SocialNode {
   private readonly sosTracker = new LiveTracker(SOS_CADENCE);
   /** My clock at the last tick or fix, to notice it jumping back. */
   private lastNow = 0;
+  /** My clock minus the time of recent fixes (see `clockAheadMs`), and the newest fix time compared. */
+  private clockSamples: number[] = [];
+  private lastSampleFix: number | undefined;
+  private clockAhead: number | undefined;
   /** Trips, live shares, watches and SOS alerts that ended, so late messages can't revive them. */
   private readonly ended = new RecentIds(1000);
   /** Per sender: notifications in a short window. More only land in the activity list. */
@@ -265,6 +278,8 @@ export class SocialNode {
   private starts = 0;
   /** When `tick()` last ran (or the node started), to notice a device that slept through a deadline. */
   private lastTickAt: number | undefined;
+  /** Since when ticks have come without a gap (see `awakeAt`). */
+  private awakeSince: number | undefined;
   /**
    * Set while the synchronous part of handling a message sent before this device got the account
    * runs (see `NodeState.historyBefore`): `alert` and `runAutomations` then do nothing. Handlers
@@ -319,6 +334,7 @@ export class SocialNode {
     await this.transport.start();
     this.awaitBacklog();
     this.lastTickAt = this.now();
+    this.awakeSince = this.lastTickAt;
     this.lastDndActive = this.dndActive();
     this.emitLocationNeeds();
     this.rearmAlarms(this.now());
@@ -392,14 +408,31 @@ export class SocialNode {
     return this.backlogDone;
   }
 
-  /** A deadline passed more than LATE_RING_MS ago without a tick since it passed: the device slept through it. */
-  private sleptThroughDeadline(now: number): boolean {
+  /**
+   * Whether this device was demonstrably awake and connected at `at` (epoch ms): it has ticked
+   * without a gap since before then, up to now, and every relay has been live since before then.
+   * Only then has a check-in sent before `at` surely arrived, and a deadline at `at` may ring at
+   * once. Otherwise (it slept, the app was frozen, a relay was down) the check-in may still wait
+   * on the relays: wait for `catchUpAgain()` first. The platform asks this for an alarm timer of
+   * its own (the Windows app's).
+   */
+  awakeAt(at: number): boolean {
+    const now = this.now();
     const last = this.lastTickAt;
-    if (last === undefined || now - last <= LATE_RING_MS) return false;
+    // Since the last tick, ticks should have come: the device sleeps or the app is frozen.
+    if (!this.running || last === undefined || this.awakeSince === undefined || now - last > TICK_GAP_MS) return false;
+    if (this.awakeSince > at) return false;
+    if (!this.transport.liveSince) return true;
+    const live = this.transport.liveSince();
+    return live !== undefined && live <= at;
+  }
+
+  /** A deadline passed while the device was not demonstrably awake and connected (see `awakeAt`). */
+  private passedWhileAway(now: number): boolean {
     for (const status of this.statuses.values()) {
       for (const w of status.watches ?? []) {
         const at = watchRingTime(w);
-        if (w.firedAt === undefined && at > last && at < now - LATE_RING_MS) return true;
+        if (w.firedAt === undefined && at <= now && !this.awakeAt(at)) return true;
       }
     }
     return false;
@@ -809,8 +842,39 @@ export class SocialNode {
    * dated in the future counts as now (see `normalizeFix`).
    */
   async onLocationFix(raw: LocationFix): Promise<void> {
-    const fix = normalizeFix(raw, this.now());
-    if (fix) await this.takeFix(fix);
+    const fix = normalizeFix(raw, this.now(), Number.POSITIVE_INFINITY);
+    if (fix) this.compareClock(fix.timestamp);
+    const taken = normalizeFix(raw, this.now());
+    if (taken) await this.takeFix(taken);
+  }
+
+  /**
+   * How far my clock runs ahead of GPS time (negative: behind), once they differ by more than five
+   * minutes; otherwise undefined. A wrong clock makes my messages look old or from the future to
+   * others, and theirs to me: the app warns. Learned from the times of location fixes.
+   */
+  get clockAheadMs(): number | undefined {
+    return this.clockAhead;
+  }
+
+  /** Compares the time of the newest fix the OS handed over with my clock (see `clockAheadMs`). */
+  private compareClock(fixTime: number): void {
+    if (fixTime === this.lastSampleFix) return;
+    this.lastSampleFix = fixTime;
+    this.clockSamples = [...this.clockSamples, this.now() - fixTime].slice(-CLOCK_SAMPLES);
+    const recent = this.clockSamples.slice(-CLOCK_SAMPLES_NEEDED);
+    const sorted = [...this.clockSamples].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)]!;
+    const agree = recent.length >= CLOCK_SAMPLES_NEEDED && Math.max(...recent) - Math.min(...recent) <= CLOCK_AGREE_MS;
+    let ahead: number | undefined;
+    if (agree) ahead = Math.abs(median) > CLOCK_OFF_MS ? median : undefined;
+    // Fixes that disagree tell nothing new: what was known stays.
+    else if (this.clockAhead === undefined) return;
+    else ahead = this.clockAhead;
+    // Minutes are what the app shows: smaller changes are not news.
+    if (ahead === this.clockAhead || (ahead !== undefined && this.clockAhead !== undefined && Math.abs(ahead - this.clockAhead) < 60_000)) return;
+    this.clockAhead = ahead;
+    this.emit({ type: 'clock', aheadMs: ahead });
   }
 
   /**
@@ -819,6 +883,9 @@ export class SocialNode {
    * newest (see `normalizeFixes`).
    */
   async onLocationFixes(raw: readonly LocationFix[]): Promise<void> {
+    // The newest of a batch is the one just taken; older ones may have waited in the OS.
+    const newest = normalizeFixes(raw, this.now(), Number.POSITIVE_INFINITY).reduce((max, f) => Math.max(max, f.timestamp), Number.NEGATIVE_INFINITY);
+    if (Number.isFinite(newest)) this.compareClock(newest);
     for (const fix of normalizeFixes(raw, this.now())) await this.takeFix(fix);
   }
 
@@ -1587,8 +1654,11 @@ export class SocialNode {
   async tick(): Promise<void> {
     const now = this.now();
     this.noteClock(now);
-    if (this.sleptThroughDeadline(now)) void this.catchUpAgain();
+    // A gap since the last tick: asleep or frozen in it, awake only from now on.
+    if (this.lastTickAt === undefined || now - this.lastTickAt > TICK_GAP_MS || now < this.lastTickAt) this.awakeSince = now;
     this.lastTickAt = now;
+    // Rings only once what the relays kept meanwhile is in (or after a short wait).
+    if (this.passedWhileAway(now)) void this.catchUpAgain();
     if (this.trip && !this.trip.isEnded) {
       const end = this.trip.expire(now);
       if (end.length) {
@@ -1688,8 +1758,21 @@ export class SocialNode {
    * hands on again what it turned down once contacts, groups or SOS alerts change (`redeliverRefused`).
    */
   acceptsMessage(from: ContactKey, message: AppMessage): boolean {
-    if (from === this.state.self.key) return true;
-    if (this.contact(from)) return !this.waitsForState(from, message);
+    return this.judgeMessage(from, message) === 'accept';
+  }
+
+  /**
+   * `acceptsMessage` with the reason a message is not taken now: `hold` for a contact's message
+   * that waits for something still on its way (see `waitsForState`), `refuse` for everything else.
+   * A transport keeps held messages apart, where strangers cannot push them out, and across restarts.
+   */
+  judgeMessage(from: ContactKey, message: AppMessage): Acceptance {
+    if (from === this.state.self.key) return 'accept';
+    if (this.contact(from)) return this.waitsForState(from, message) ? 'hold' : 'accept';
+    return this.acceptsFromNonContact(from, message) ? 'accept' : 'refuse';
+  }
+
+  private acceptsFromNonContact(from: ContactKey, message: AppMessage): boolean {
     switch (message.type) {
       case 'hello':
         return message.inviteNonce !== undefined && this.state.openInvites.some((i) => i.nonce === message.inviteNonce);
@@ -2548,6 +2631,16 @@ export class SocialNode {
           case 'start_trip': {
             const place = this.state.places.find((p) => p.id === intent.destination);
             if (!place || this.activeTrip) break;
+            // A computer has no GPS: the trip would never send an arrival time, only that one began.
+            if (this.deviceKind === 'computer') {
+              this.alert({
+                category: 'automation',
+                feed: true,
+                title: 'Ankunftszeit nicht geteilt',
+                body: `Am PC gibt es kein GPS. Teile deine Ankunftszeit nach „${place.name}“ am Handy.`,
+              });
+              break;
+            }
             await this.startTrip({ recipients: intent.to, destinationName: place.name, destination: place.center, level: intent.level });
             break;
           }
@@ -2681,20 +2774,23 @@ export class SocialNode {
   /**
    * `followUp` marks news about an emergency that already rang (a helper is on the way, the
    * person is safe): it comes through quiet mode and can't be switched off like the SOS itself,
-   * but as a normal notification, not a second alarm.
+   * but as a normal notification, not a second alarm. `feed`: only for the activity list, never
+   * a notification.
    */
   private alert(
-    input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean; followUp?: boolean; overBudget?: boolean },
+    input: Omit<Alert, 'id' | 'at' | 'level'> & { id?: string; urgent?: boolean; followUp?: boolean; overBudget?: boolean; feed?: boolean },
   ): void {
     // From before this device got the account: my other device showed it back then. Its time
     // here would be wrong too, so it does not even go into the activity list.
     if (this.replaying) return;
     const now = this.now();
-    const { urgent, id, followUp, overBudget, ...rest } = input;
+    const { urgent, id, followUp, overBudget, feed, ...rest } = input;
     const c = input.from ? this.contact(input.from) : undefined;
-    let level: AlertLevel = followUp
-      ? 'normal'
-      : alertLevel({ category: input.category, favorite: c?.favorite, muted: c?.muted, urgent, overBudget }, this.state.prefs, this.dndActive());
+    let level: AlertLevel = feed
+      ? 'feed'
+      : followUp
+        ? 'normal'
+        : alertLevel({ category: input.category, favorite: c?.favorite, muted: c?.muted, urgent, overBudget }, this.state.prefs, this.dndActive());
     const critical = input.category === 'sos' || input.category === 'watch';
     if (!critical && input.from && level !== 'feed' && !this.alertLimiter.allow(input.from, now)) level = 'feed';
     this.emit({ type: 'alert', alert: { ...rest, id: id ?? randomId(), at: now, level } });

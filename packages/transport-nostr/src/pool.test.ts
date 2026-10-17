@@ -46,7 +46,8 @@ function world(caps: Record<string, number> = {}) {
 const texts = (inbox: IncomingMessage[], prefix: string) =>
   inbox.filter((m) => m.message.type === 'chat.text' && m.message.text.startsWith(prefix)).length;
 const chat = (text: string) => composeMessage({ type: 'chat.text', text });
-const sinceOf = (reqs: Filter[][], key: string) => reqs.filter((r) => r[0]?.['#p']?.[0] === key).map((r) => r[0]!);
+/** The catch-up requests for `key`'s wraps (the live one asks for no stored events, and has no `since`). */
+const sinceOf = (reqs: Filter[][], key: string) => reqs.filter((r) => r[0]?.['#p']?.[0] === key && r[0]?.limit !== 0).map((r) => r[0]!);
 
 describe('SimpleRelayPool', () => {
   it('still gets everything after a relay connection drops, and keeps every other relay working', async () => {

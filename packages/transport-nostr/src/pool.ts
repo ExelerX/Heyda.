@@ -6,9 +6,14 @@ import { verifyEvent, type NostrEvent } from 'nostr-tools/pure';
 
 /** What a subscription asks of each relay and reports back. */
 export interface FeedHandlers {
-  /** The filter for one relay. Asked again before every (re)subscription, so its `since` can move. */
+  /**
+   * The filter for one relay's catch-up. Asked again before every (re)subscription, so its `since`
+   * can move. Live events are asked for apart, with it but without `since`, `until` or stored events
+   * (see `liveFilter`): relays apply `since` to live events too.
+   */
   filter(relay: string): Filter;
-  onEvent(event: NostrEvent): void;
+  /** `live`: it came on the live stream, just now, not from what the relay stored. */
+  onEvent(event: NostrEvent, live: boolean): void;
   /**
    * Whether this event id was dealt with already. Its copies are dropped without checking their
    * signature (dropping needs no proof), but still count while paging through stored events.
@@ -20,6 +25,20 @@ export interface FeedHandlers {
    * while the connection is known to be alive; never after one cut off at `maxPages`.
    */
   onSynced?(relay: string): void;
+  /** `relay`'s live stream has a gap from now on (the connection dropped or is renewed); `onSynced` follows once it caught up again. */
+  onLost?(relay: string): void;
+}
+
+/**
+ * The live part of a feed: new events only, whatever their created_at. A relay applies a filter's
+ * `since` to live events too, so one shared with the catch-up kept out everything a sender whose
+ * clock runs behind sent, an SOS included. `limit: 0` asks for no stored events (NIP-01).
+ */
+export function liveFilter(base: Filter): Filter {
+  const live: Filter = { ...base, limit: 0 };
+  delete live.since;
+  delete live.until;
+  return live;
 }
 
 /** The two things the transport needs from relays. Small on purpose, so tests can fake it. */
@@ -27,7 +46,7 @@ export interface RelayPool {
   /** Resolves once at least one relay accepted the event, rejects if none did. */
   publish(relays: string[], event: NostrEvent): Promise<void>;
   /**
-   * Stored events, then live ones, from each relay, until closed. Survives dropped connections
+   * Live events and the stored backlog from each relay, until closed. Survives dropped connections
    * without losing events (asking again with a fresh filter) and fetches the whole backlog,
    * also past a relay's per-request cap.
    */
@@ -125,6 +144,8 @@ class RelayFeed {
   private failures = 0;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private probeTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When the next check of the connection is due (see `frozen`). */
+  private probeDue: number | undefined;
   private readonly subs = new Set<Subscription>();
 
   constructor(
@@ -162,8 +183,11 @@ class RelayFeed {
 
     const base = this.handlers.filter(this.url);
     const limit = this.cfg.pageSize;
-    // Stored events (newest first, one page), then live ones for as long as the connection holds.
-    let page = await this.request(relay, attempt, { ...base, limit }, true);
+    // New events for as long as the connection holds, whatever their created_at. Opened first, so
+    // nothing falls between the catch-up and the live stream; copies of both are dropped as handled.
+    if (!(await this.request(relay, attempt, liveFilter(base), true))) return;
+    // Then stored events, newest first, one page at a time.
+    let page = await this.request(relay, attempt, { ...base, limit }, false);
     // Then older pages. A relay's cap is unknown, so a short page does not prove the end; only a
     // page with nothing older in it does.
     let complete = false;
@@ -201,11 +225,12 @@ class RelayFeed {
   /** Checks the connection now and then; an answer proves the live stream had no gap. */
   private scheduleProbe(relay: AbstractRelay, attempt: number, complete: boolean): void {
     const due = Date.now() + this.cfg.probeEveryMs;
+    this.probeDue = due;
     this.probeTimer = setTimeout(async () => {
       if (attempt !== this.attempt) return;
       // Far too late: the device slept or the app was frozen in the background. The socket is
       // then most likely dead without having said so; renew it now rather than after a timeout.
-      if (Date.now() - due > this.cfg.probeEveryMs) {
+      if (this.frozen()) {
         this.fail(attempt, true);
         return;
       }
@@ -214,6 +239,14 @@ class RelayFeed {
       if (complete) this.handlers.onSynced?.(this.url);
       this.scheduleProbe(relay, attempt, complete);
     }, this.cfg.probeEveryMs);
+  }
+
+  /**
+   * The check of the connection is far overdue: the device slept or the app was frozen. Events it
+   * gets now may have waited in the socket for hours: not live, whatever stream they came on.
+   */
+  private frozen(): boolean {
+    return this.probeDue !== undefined && Date.now() - this.probeDue > this.cfg.probeEveryMs;
   }
 
   /**
@@ -251,7 +284,7 @@ class RelayFeed {
         onevent: (event) => {
           if (attempt !== this.attempt) return;
           take(event);
-          this.handlers.onEvent(event);
+          this.handlers.onEvent(event, live && eosed && !this.frozen());
         },
         // Failed the pool's check. A copy of something handled was not even checked, and still counts
         // for paging; one handled only by another subscription of this pool is checked here.
@@ -261,7 +294,7 @@ class RelayFeed {
           if (this.handled(event.id)) take(event);
           else if (verifyEvent(event)) {
             take(event);
-            this.handlers.onEvent(event);
+            this.handlers.onEvent(event, live && eosed && !this.frozen());
           }
         },
         oneose: () => {
@@ -291,6 +324,7 @@ class RelayFeed {
   private fail(attempt: number, renewConnection: boolean): void {
     if (attempt !== this.attempt || this.closed) return;
     this.reset();
+    this.handlers.onLost?.(this.url);
     // A relay that stopped answering: drop the socket, the next attempt opens a new one.
     if (renewConnection) this.pool.close([this.url]);
     const delays = this.cfg.reconnectDelaysMs;
@@ -302,6 +336,7 @@ class RelayFeed {
     this.attempt++;
     clearTimeout(this.retryTimer);
     clearTimeout(this.probeTimer);
+    this.probeDue = undefined;
     const subs = [...this.subs];
     this.subs.clear();
     // After a dropped connection nostr-tools closes them itself.
@@ -336,15 +371,17 @@ export class MemoryRelayPool implements RelayPool {
 
   subscribe(relays: string[], handlers: FeedHandlers): { close(): void } {
     const filters = new Map(relays.map((r) => [r, handlers.filter(r)]));
-    const matches = (on: string[], e: NostrEvent) =>
+    const live = new Map([...filters].map(([r, f]) => [r, liveFilter(f)]));
+    const matching = (which: Map<string, Filter>) => (on: string[], e: NostrEvent) =>
       on.some((r) => {
-        const f = filters.get(r);
+        const f = which.get(r);
         return f !== undefined && matchFilter(f, e);
       });
-    const sub = { matches, onEvent: (e: NostrEvent) => handlers.onEvent(e) };
+    const sub = { matches: matching(live), onEvent: (e: NostrEvent) => handlers.onEvent(e, true) };
     this.subs.add(sub);
     // Like a real relay: first replay what is stored, then stream new events.
-    for (const { relays: on, event } of this.events) if (matches(on, event)) handlers.onEvent(event);
+    const stored = matching(filters);
+    for (const { relays: on, event } of this.events) if (stored(on, event)) handlers.onEvent(event, false);
     for (const r of filters.keys()) handlers.onSynced?.(r);
     return { close: () => this.subs.delete(sub) };
   }

@@ -60,6 +60,9 @@ export class FakeWebSocket {
   static readonly CLOSED = 3;
   readyState = 0;
   stalled = false;
+  /** While set, what the relay sends waits in `held` (a frozen app's socket buffer); see `release`. */
+  holding = false;
+  private readonly held: string[] = [];
   onopen: Handler = null;
   onclose: Handler = null;
   onerror: Handler = null;
@@ -134,9 +137,19 @@ export class FakeWebSocket {
     }
   }
 
+  /** Hands over at once, in this very call, what waited while `holding`: the app runs again. */
+  release(): void {
+    this.holding = false;
+    for (const data of this.held.splice(0)) if (this.readyState === 1) this.onmessage?.({ data });
+  }
+
   private out(msg: unknown[]): void {
     if (this.readyState !== 1 || this.stalled) return;
     const data = JSON.stringify(msg);
+    if (this.holding) {
+      this.held.push(data);
+      return;
+    }
     setTimeout(() => {
       if (this.readyState === 1 && !this.stalled) this.onmessage?.({ data });
     }, 1);

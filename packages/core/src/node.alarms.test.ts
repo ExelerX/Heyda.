@@ -83,6 +83,14 @@ class SleepyRelay implements Transport {
   }
 }
 
+/** Also says since when its relays have been live without a gap (`undefined`: not live now). */
+class LiveRelay extends SleepyRelay {
+  liveFrom: number | undefined = 0;
+  liveSince(): number | undefined {
+    return this.liveFrom;
+  }
+}
+
 function world() {
   let clock = 30 * DAY;
   const now = () => clock;
@@ -225,7 +233,7 @@ describe('a laptop that slept through a deadline', () => {
    * Lisa watches over herself until 22:30 with Max, whose laptop runs. At 22:20 it goes to sleep;
    * Lisa's check-in (or nothing) waits on the relays. At 22:35 it wakes up again.
    */
-  async function sleptOverDeadline(lisaChecksIn: boolean, extra: Partial<SocialNodeOptions> = {}) {
+  async function sleptOverDeadline(lisaChecksIn: boolean, extra: Partial<SocialNodeOptions> = {}, wakeMs = 10 * MIN) {
     const w = world();
     const lisa = w.make(LISA, 'Lisa');
     const relay = new SleepyRelay(w.net.createTransport(MAX, w.now));
@@ -245,7 +253,7 @@ describe('a laptop that slept through a deadline', () => {
       await lisa.endWatch(watchId, 'ok');
       await flush();
     }
-    w.tick(10 * MIN);
+    w.tick(wakeMs);
     const watchAlarms = () => got.filter((a) => a.category === 'watch');
     return { ...w, max, relay, got, watchAlarms, watchId };
   }
@@ -299,7 +307,7 @@ describe('a laptop that slept through a deadline', () => {
     expect(relay.asked).toBe(1);
   });
 
-  it('does not wait after a short pause between ticks, or when no deadline passed meanwhile', async () => {
+  it('does not wait while it ticks right through the deadline, or when no deadline passed in a pause', async () => {
     const w = world();
     const lisa = w.make(LISA, 'Lisa');
     const relay = new SleepyRelay(w.net.createTransport(MAX, w.now));
@@ -317,10 +325,91 @@ describe('a laptop that slept through a deadline', () => {
     w.tick(15 * MIN);
     await max.tick();
     expect(relay.asked).toBe(0);
-    // The deadline passed only half a minute ago: rings as before.
-    w.tick(5 * MIN + 30_000);
-    await max.tick();
+    // Awake and ticking every 20 s across the deadline: it rings as soon as it passed.
+    for (let i = 0; i < 16; i++) {
+      w.tick(20_000);
+      await max.tick();
+    }
     expect(relay.asked).toBe(0);
     expect(got.filter((a) => a.category === 'watch')).toHaveLength(1);
+  });
+
+  // Before, a deadline that passed less than 60 s before the wake-up rang at once, also after a
+  // long sleep: the check-in sent during the sleep still waited on the relays (a false alarm).
+  // That old expectation was the bug: what counts is whether the device slept across the deadline.
+  it('waits when it wakes up shortly after the deadline, however recently it passed', async () => {
+    // It wakes up 20 s after the deadline.
+    const { max, relay, got, watchAlarms } = await sleptOverDeadline(true, {}, 5 * MIN + 20_000);
+    await max.tick();
+    expect(relay.asked).toBe(1);
+    expect(watchAlarms()).toEqual([]);
+    await relay.wake();
+    relay.resynced();
+    await flush();
+    await max.tick();
+    expect(watchAlarms()).toEqual([]);
+    expect(got.map((a) => a.body)).toContain('✅ hat sich gemeldet („Heimweg“)');
+  });
+
+  it('waits when a relay was not live at the deadline, although the device was awake', async () => {
+    const w = world();
+    const lisa = w.make(LISA, 'Lisa');
+    const relay = new LiveRelay(w.net.createTransport(MAX, w.now));
+    const max = new SocialNode({ transport: relay, initialState: state(MAX, 'Max'), now: w.now, localTime, syncDelayMs: 0, backlogWaitMs: 30 });
+    await lisa.start();
+    await max.start();
+    await max.acceptInvite(lisa.createInvite());
+    await flush();
+    const got = alerts(max);
+    const watchId = await lisa.startWatch({ to: [MAX], label: 'Heimweg', dueAt: w.now() + 30 * MIN });
+    await flush();
+    const due = w.now() + 30 * MIN;
+    for (let i = 0; i < 88; i++) {
+      w.tick(20_000);
+      await max.tick();
+    }
+    // The connection drops 40 s before the deadline and is back 10 s after it.
+    relay.liveFrom = undefined;
+    w.tick(20_000);
+    await max.tick();
+    expect(relay.asked).toBe(0);
+    w.tick(30_000);
+    relay.liveFrom = w.now();
+    w.tick(10_000);
+    expect(max.awakeAt(due)).toBe(false);
+    expect(max.awakeAt(w.now())).toBe(true);
+    await max.tick();
+    expect(relay.asked).toBe(1);
+    expect(got.filter((a) => a.category === 'watch')).toEqual([]);
+    // No check-in came: it rings after the short wait.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(got.filter((a) => a.category === 'watch').map((a) => a.ref?.watchId)).toEqual([watchId]);
+  });
+
+  it('tells the platform whether it was awake and connected at a time, for an alarm timer of its own', async () => {
+    const w = world();
+    const relay = new LiveRelay(w.net.createTransport(MAX, w.now));
+    const max = new SocialNode({ transport: relay, initialState: state(MAX, 'Max'), now: w.now, localTime, syncDelayMs: 0 });
+    await max.start();
+    const startedAt = w.now();
+    relay.liveFrom = startedAt;
+    w.tick(20_000);
+    await max.tick();
+    // Before it ran nothing can be known; since then it ticked and the relays were live.
+    expect(max.awakeAt(startedAt - 1_000)).toBe(false);
+    expect(max.awakeAt(startedAt + 10_000)).toBe(true);
+    // The timer fires a little early by the clock: still fine.
+    expect(max.awakeAt(w.now() + 1_000)).toBe(true);
+    // The laptop slept: until the next tick nothing counts as awake, and after it only from then on.
+    w.tick(10 * MIN);
+    expect(max.awakeAt(w.now() - 30_000)).toBe(false);
+    await max.tick();
+    expect(max.awakeAt(w.now() - 30_000)).toBe(false);
+    w.tick(20_000);
+    await max.tick();
+    expect(max.awakeAt(w.now() - 10_000)).toBe(true);
+    // A relay that is not live now.
+    relay.liveFrom = undefined;
+    expect(max.awakeAt(w.now() - 10_000)).toBe(false);
   });
 });

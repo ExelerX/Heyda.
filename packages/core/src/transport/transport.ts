@@ -10,6 +10,14 @@ export interface IncomingMessage {
   receivedAt: number;
 }
 
+/**
+ * What the app does with a message (see `SocialNode.judgeMessage`): takes it now, wants it held
+ * until something it waits for is here (a contact's group text before the roster), or turns it
+ * down (a stranger). A transport keeps held messages apart from refused ones, so strangers cannot
+ * push them out, and offers both again in `redeliverRefused`.
+ */
+export type Acceptance = 'accept' | 'hold' | 'refuse';
+
 export interface SendOptions {
   /**
    * How long relays should keep the message for an offline recipient.
@@ -36,8 +44,9 @@ export interface Transport {
   /** Registers a handler and returns a function that removes it. */
   onMessage(handler: (incoming: IncomingMessage) => void): () => void;
   /**
-   * Optional: hands on again messages the transport turned away because their sender was not
-   * known yet. The node calls it after it learned new contacts or group members.
+   * Optional: hands on again messages the transport held or turned away because their sender was
+   * not known yet or the app waited for something. The node calls it after it learned new
+   * contacts, group members or SOS alerts.
    */
   redeliverRefused?(): void;
   /**
@@ -50,4 +59,10 @@ export interface Transport {
    * it kept, after this call (e.g. after the device slept). May never resolve, like `caughtUp`.
    */
   caughtUpAgain?(): Promise<void>;
+  /**
+   * Optional, while started: since when (epoch ms, my clock) every relay of this device has handed
+   * over new messages live, without a gap; undefined while one has not. Whatever was sent before
+   * then has arrived. A transport without it counts as always connected (in memory).
+   */
+  liveSince?(): number | undefined;
 }
