@@ -32,7 +32,7 @@ import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport, type SeenSnapshot } fr
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
 import { DEMO_KEYS, startDemoFriends } from './demo';
-import { cancelAlarm, deliverAlert, pruneAlarms, scheduleAlarm, setBadge, setOpenThread as setNotificationThread, showToast } from './notifications';
+import { cancelAlarm, clearNotifications, deliverAlert, pruneAlarms, scheduleAlarm, setBadge, setOpenThread as setNotificationThread, showToast } from './notifications';
 import { desktop, deviceLabel, isBrowserPreview, isDesktop } from './platform';
 import type { Appearance } from './theme';
 import { DesktopVault, EncryptedFileVault, MemoryVault, type Vault } from './vault';
@@ -53,6 +53,9 @@ export interface Settings {
   smsFallback: boolean;
 }
 
+/** `os`: the phone's OS has it, so it rings even with the app closed (see `deliverAlert`). */
+type SavedAlarm = Alarm & { os?: boolean };
+
 interface Persisted {
   v: 2;
   state: NodeState;
@@ -62,7 +65,7 @@ interface Persisted {
   unread: Record<string, number>;
   activity: Alert[];
   /** Alarms scheduled with the OS, so they can be re-armed or cancelled later. */
-  alarms: Alarm[];
+  alarms: SavedAlarm[];
   plugins: Plugin[];
   settings: Settings;
   seen: SeenSnapshot;
@@ -203,6 +206,9 @@ export async function writeAccount(secretKey: Uint8Array, state: NodeState, extr
   const data: Persisted = { ...freshData(getPublicKey(secretKey)), ...extra, state, v: 2 };
   data.settings = { ...DEFAULT_SETTINGS, ...extra.settings, onboarded: true, demo: false };
   await vault.save(DATA_FILE, data);
+  // Alarms and notifications of the account (or demo) this one replaces: nothing in the new data
+  // could cancel them, and they would ring or show names later.
+  await clearNotifications();
 }
 
 /**
@@ -249,17 +255,28 @@ export class AppRuntime {
           this.appendChat(e.thread, e.entry);
           break;
         case 'alert': {
+          const id = e.alert.id;
+          const watch = id.startsWith('watch:');
           // On Windows the alarm timer already rang for this watch; the core's overdue check reports it again.
-          const rang = isDesktop && e.alert.id.startsWith('watch:') && this.data.activity.some((a) => a.id === e.alert.id);
+          const rang = isDesktop && watch && this.data.activity.some((a) => a.id === id);
           this.addActivity(e.alert);
-          if (!rang) deliverAlert(e.alert);
+          // On a phone the OS has an alarm with the same id, which may have rung already.
+          if (!rang) deliverAlert(e.alert, watch ? () => this.data.alarms.find((a) => a.id === id && a.os)?.at : undefined);
           break;
         }
-        case 'alarm.schedule':
-          this.data.alarms = [...this.data.alarms.filter((a) => a.id !== e.alarm.id), e.alarm].slice(-MAX_ALARMS);
-          void scheduleAlarm(e.alarm, (a) => this.fireDesktopAlarm(a)).catch(() => {});
+        case 'alarm.schedule': {
+          const alarm: SavedAlarm = { ...e.alarm };
+          this.data.alarms = [...this.data.alarms.filter((a) => a.id !== alarm.id), alarm].slice(-MAX_ALARMS);
+          const handedOver = () => {
+            // Not if it was moved or cancelled meanwhile: that entry is no longer this one.
+            if (this.disposed || !this.data.alarms.includes(alarm)) return;
+            alarm.os = true;
+            this.changed();
+          };
+          void scheduleAlarm(alarm, (a) => this.fireDesktopAlarm(a), handedOver).catch(() => {});
           this.changed();
           break;
+        }
         case 'alarm.cancel':
           if (this.data.alarms.some((a) => a.id === e.id)) {
             this.data.alarms = this.data.alarms.filter((a) => a.id !== e.id);
@@ -599,8 +616,10 @@ export class AppRuntime {
 
   async wipeEverything(): Promise<void> {
     await this.shutdown(false);
-    for (const a of this.data.alarms) await cancelAlarm(a.id);
     await this.vault.wipe([DATA_FILE]);
+    // Also every alarm with the OS (the app's own list may have lost some) and the notifications
+    // on screen, which show names and message previews.
+    await clearNotifications();
   }
 
   /** Persist now, e.g. when the app goes to the background. */

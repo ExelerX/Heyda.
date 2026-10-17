@@ -227,11 +227,44 @@ function inOrder(identifier: string, call: () => Promise<void>): Promise<void> {
   return run;
 }
 
+/** When this JS context started. A restart of the phone or an app update since would have ended it. */
+const STARTED_AT = Date.now();
+
+/**
+ * Whether the OS already rang the alarm with this identifier, due at `at` (undefined: the OS
+ * never got it). One that has not rung yet is cancelled: the caller shows the alert now instead,
+ * and the alarm must not ring a second time a moment later.
+ */
+async function alarmRang(identifier: string, at: number | undefined): Promise<boolean> {
+  const pending = await Notifications.getAllScheduledNotificationsAsync().catch(() => undefined);
+  if (!pending || pending.some((n) => n.identifier === identifier)) {
+    await Notifications.cancelScheduledNotificationAsync(identifier).catch(() => {});
+    return false;
+  }
+  if (at === undefined) return false;
+  // Gone from the OS's list: it rang, and may have been swiped away since. Only when the phone
+  // restarted (or the app was updated) after its time does Android drop it without ringing, and
+  // both end this process: one running since before its time saw it ring.
+  if (STARTED_AT < at) return true;
+  // Started later: only a notification still on screen tells (not an older ring of the same watch).
+  const shown = await Notifications.getPresentedNotificationsAsync().catch(() => []);
+  return shown.some((n) => n.request.identifier === identifier && postedAt(n.date) >= at - 5_000);
+}
+
+/** Android reports milliseconds, iOS seconds. */
+function postedAt(date: number): number {
+  return date < 1e11 ? date * 1000 : date;
+}
+
 /**
  * Shows an alert by its level. In the open app a banner (and for alarms the alarm screen);
  * in the background a system notification. `feed` alerts only go to the activity list.
+ *
+ * `alarmAt` is for an alert with the id of an alarm handed to the OS earlier (a contact's overdue
+ * watch): it returns when that alarm was due, or undefined if the OS never got it. The two then
+ * ring once, whichever comes first.
  */
-export function deliverAlert(alert: Alert): void {
+export function deliverAlert(alert: Alert, alarmAt?: () => number | undefined): void {
   if (alert.level === 'feed') return;
   const active = AppState.currentState === 'active' || !isNative;
   if (active && (alert.level === 'alarm' || !alert.thread || alert.thread !== openThread)) {
@@ -244,19 +277,25 @@ export function deliverAlert(alert: Alert): void {
     if (alert.level === 'alarm') void desktop.attention().catch(() => {});
     return;
   }
-  if (!isNative || active) return;
-  void (async () => {
-    if (!(await notificationsAllowed())) return;
+  if (!isNative || (active && !alarmAt)) return;
+  const identifier = nid(alert.id);
+  // In the same queue as the alarm: a schedule still on its way to the OS counts.
+  void inOrder(identifier, async () => {
+    if (alarmAt && (await alarmRang(identifier, alarmAt()))) return;
+    if (active || !(await notificationsAllowed())) return;
     await Notifications.scheduleNotificationAsync({
-      identifier: nid(alert.id),
+      identifier,
       content: content(alert.title, alert.body, alert.level, { alertId: alert.id, thread: alert.thread ?? null }),
       trigger: Platform.OS === 'android' ? { channelId: await channelFor(alert.level) } : null,
     });
-  })().catch(() => {});
+  }).catch(() => {});
 }
 
-/** A notification at a fixed time that fires even if the app is closed by then. */
-export async function scheduleAlarm(alarm: Alarm, onDesktopFire?: (alarm: Alarm) => void): Promise<void> {
+/**
+ * A notification at a fixed time that fires even if the app is closed by then. `onScheduled`
+ * runs once the OS has it.
+ */
+export async function scheduleAlarm(alarm: Alarm, onDesktopFire?: (alarm: Alarm) => void, onScheduled?: () => void): Promise<void> {
   if (alarm.level === 'feed') return;
   if (desktop || !isNative) {
     // The Windows app keeps running in the tray, so a timer is enough.
@@ -283,6 +322,8 @@ export async function scheduleAlarm(alarm: Alarm, onDesktopFire?: (alarm: Alarm)
       content: content(alarm.title, alarm.body, alarm.level, { alertId: alarm.id }),
       trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: alarm.at, channelId: await channelFor(alarm.level) },
     });
+    // Still in this alarm's queue, so an alert for it that follows already knows.
+    onScheduled?.();
   });
 }
 
@@ -320,6 +361,22 @@ export async function pruneAlarms(known: () => readonly Alarm[] | undefined): Pr
       }),
     ),
   );
+}
+
+/**
+ * Removes everything the app left with the OS: scheduled alarms and notifications still on
+ * screen, which show names and message previews. For when the account on this device is wiped
+ * or replaced; nothing in the new data could cancel them. The keep-alive notification stays.
+ */
+export async function clearNotifications(): Promise<void> {
+  for (const t of desktopTimers.values()) clearTimeout(t);
+  desktopTimers.clear();
+  if (desktop) await desktop.setBadge(0).catch(() => {});
+  if (!isNative) return;
+  // Calls still on their way to the OS go first, so none of them lands afterwards.
+  await Promise.all([...alarmCalls.values()]);
+  await Notifications.cancelAllScheduledNotificationsAsync().catch(() => {});
+  await Notifications.dismissAllNotificationsAsync().catch(() => {});
 }
 
 export async function setBadge(count: number): Promise<void> {
