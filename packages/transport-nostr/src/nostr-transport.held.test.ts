@@ -127,6 +127,22 @@ describe('a contact message held until the app can take it', () => {
     expect(w.chats).toEqual(['Hallo Familie']);
   }, 30_000);
 
+  it('keeps the newest of a sender over budget, also when they come in newest first as in a catch-up', () => {
+    // Relays hand stored messages over newest first: an SOS's last positions come before its
+    // start, and were the ones pushed out, so a helper saw an old position as the latest.
+    const seen = new MemorySeenStore();
+    const from = 'a'.repeat(64);
+    const hex = (n: number) => n.toString(16).padStart(64, '0');
+    for (let i = 59; i >= 0; i--) {
+      seen.hold({ id: hex(i), wrap: hex(1000 + i), wrapUntil: 2_000_000_000, keepUntil: 1_900_000_000 + i, from, content: `{"n":${i}}` });
+    }
+    const kept = seen.heldMessages().map((h) => h.keepUntil - 1_900_000_000);
+    expect(kept.sort((a, b) => a - b)).toEqual(Array.from({ length: 50 }, (_, i) => i + 10));
+    // The same after a restart.
+    const back = MemorySeenStore.restore(JSON.parse(JSON.stringify(seen.snapshot())));
+    expect(back.heldMessages().map((h) => h.keepUntil - 1_900_000_000).sort((a, b) => a - b)).toEqual(kept);
+  });
+
   it('tells hold from refuse: a contact waiting for state is held, a stranger refused', async () => {
     const w = world();
     await w.run(w.initial, new MemorySeenStore());

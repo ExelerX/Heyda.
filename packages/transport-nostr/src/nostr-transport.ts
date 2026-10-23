@@ -129,8 +129,10 @@ class HeldList {
   hold(entry: HeldMessage): void {
     if (this.items.has(entry.id)) return;
     this.items.set(entry.id, entry);
-    // First the sender's own budget: only their oldest go.
-    let theirs = this.heldMessages().filter((h) => h.from === entry.from);
+    // First the sender's own budget: only their oldest go, by when they were sent. Not by when they
+    // came in: a catch-up hands stored messages over newest first, so the first to come in are the
+    // newest, e.g. the last positions of an SOS whose start comes last.
+    let theirs = byAge(this.heldMessages().filter((h) => h.from === entry.from));
     while (theirs.length > MAX_HELD_PER_SENDER || heldChars(theirs) > MAX_HELD_CHARS_PER_SENDER) {
       this.items.delete(theirs[0]!.id);
       theirs = theirs.slice(1);
@@ -140,7 +142,7 @@ class HeldList {
       const per = new Map<string, number>();
       for (const h of this.items.values()) per.set(h.from, (per.get(h.from) ?? 0) + h.content.length);
       const most = [...per].sort((a, b) => b[1] - a[1])[0]![0];
-      this.items.delete(this.heldMessages().find((h) => h.from === most)!.id);
+      this.items.delete(byAge(this.heldMessages().filter((h) => h.from === most))[0]!.id);
     }
   }
   heldMessages(): HeldMessage[] {
@@ -155,6 +157,8 @@ class HeldList {
 }
 
 const heldChars = (list: HeldMessage[]) => list.reduce((n, h) => n + h.content.length, 0);
+/** Oldest sent first (`keepUntil` follows the send time); those sent in the same second in the order they came in. */
+const byAge = (list: HeldMessage[]) => [...list].sort((a, b) => a.keepUntil - b.keepUntil);
 
 export interface SeenSnapshot {
   /** Written by older versions: one time for all relays. Only a fallback now. */
