@@ -381,7 +381,7 @@ function ClockBanner({ aheadMs }: { aheadMs: number }) {
         <Text style={{ fontSize: 26 }} accessible={false}>
           🕐
         </Text>
-        <View style={{ flex: 1, gap: 2 }} accessible accessibilityLiveRegion="polite" accessibilityLabel={[title, text, hint].filter(Boolean).join('. ')}>
+        <View style={{ flex: 1, gap: 2 }} accessible accessibilityLiveRegion="polite" accessibilityLabel={[`${title}.`, text, hint].filter(Boolean).join(' ')}>
           <T variant="h2" color={t.accent}>
             {title}
           </T>
