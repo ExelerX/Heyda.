@@ -1,3 +1,5 @@
+import { CLOCK_TOLERANCE_MS } from '../geo/fix';
+import type { CheckinKind, PingKind } from '../protocol/messages';
 import type { ContactKey } from '../transport/transport';
 import type { Action, Condition, Rule, Trigger } from './schema';
 
@@ -25,26 +27,20 @@ export type AutomationEvent =
       at: number;
     }
   | { type: 'contact.message'; contact: ContactKey; text: string; at: number }
-  | {
-      type: 'contact.ping';
-      contact: ContactKey;
-      kind: 'help-carry' | 'pickup-request' | 'custom';
-      text?: string;
-      at: number;
-    }
+  | { type: 'contact.ping'; contact: ContactKey; kind: PingKind; text?: string; at: number }
+  | { type: 'contact.checkin'; contact: ContactKey; kind: CheckinKind; text?: string; placeName?: string; at: number }
+  | { type: 'contact.sos'; contact: ContactKey; at: number }
   | { type: 'me.arrive'; placeId: string; at: number }
   | { type: 'me.leave'; placeId: string; at: number };
 
 /** A resolved action for the app to carry out. The engine itself has no side effects. */
 export type ActionIntent =
   | { kind: 'notify'; ruleId: string; title: string; body: string }
-  | {
-      kind: 'send_ping';
-      ruleId: string;
-      to: ContactKey;
-      pingKind: 'help-carry' | 'pickup-request' | 'custom';
-      text?: string;
-    }
+  | { kind: 'send_ping'; ruleId: string; to: ContactKey; pingKind: PingKind; text?: string }
+  | { kind: 'send_message'; ruleId: string; to: ContactKey; text: string }
+  | { kind: 'send_checkin'; ruleId: string; to: ContactKey[]; checkinKind: CheckinKind; text?: string }
+  | { kind: 'set_dnd'; ruleId: string; minutes: number }
+  | { kind: 'set_status'; ruleId: string; text: string; emoji?: string; hours: number }
   | { kind: 'start_trip'; ruleId: string; to: ContactKey[]; destination: string; level: 'eta' };
 
 export interface LocalTime {
@@ -71,7 +67,10 @@ export const DEFAULT_LIMITS: EngineLimits = {
 
 export interface EngineContext {
   rules: () => Rule[];
+  /** How I see someone (my nickname for them): for notifications on my own devices. */
   contactName: (key: ContactKey) => string;
+  /** The name they chose: what messages, check-ins and my status say to others. Defaults to `contactName`. */
+  sentName?: (key: ContactKey) => string;
   placeName: (placeId: string) => string | undefined;
   isAtPlace: (placeId: string) => boolean;
   localTime?: (now: number) => LocalTime;
@@ -79,6 +78,24 @@ export interface EngineContext {
 }
 
 const HOUR = 60 * 60 * 1000;
+
+/**
+ * When a rule fired, or an automation messaged someone, for the cooldown and the hourly caps.
+ * `at` is the time it happened. `noLaterThan` starts the same and moves back to `now` whenever
+ * `now` lies further before `at` than the tolerance: the clock was set back since. A stamp counts
+ * while either time says it is recent, so the limits still hold right after the clock was set
+ * back, but for at most their own length from then on, not until the clock catches up.
+ */
+interface Stamp {
+  at: number;
+  noLaterThan: number;
+}
+
+/** Whether a stamp is less than `windowMs` before `now`, or only a little after it (event clocks differ slightly). */
+function isRecent(s: Stamp, now: number, windowMs: number): boolean {
+  const recent = (t: number) => now - t >= -CLOCK_TOLERANCE_MS && now - t < windowMs;
+  return recent(s.at) || recent(s.noLaterThan);
+}
 
 export function systemLocalTime(now: number): LocalTime {
   const d = new Date(now);
@@ -89,8 +106,8 @@ export function systemLocalTime(now: number): LocalTime {
 export class AutomationEngine {
   private readonly limits: EngineLimits;
   private readonly localTime: (now: number) => LocalTime;
-  private readonly fires = new Map<string, number[]>();
-  private readonly pings = new Map<ContactKey, number[]>();
+  private readonly fires = new Map<string, Stamp[]>();
+  private readonly pings = new Map<ContactKey, Stamp[]>();
   /** `ruleId|sessionId` pairs whose ETA threshold already fired. */
   private readonly etaFired = new Set<string>();
 
@@ -99,19 +116,25 @@ export class AutomationEngine {
     this.localTime = ctx.localTime ?? systemLocalTime;
   }
 
-  handle(event: AutomationEvent): ActionIntent[] {
+  /**
+   * `now` is the clock the cooldown and the hourly caps are measured with. Pass the same clock
+   * for every event (event times may come from different clocks, e.g. a place event carries the
+   * time of its fix). Conditions like `time_between` use the event's time.
+   */
+  handle(event: AutomationEvent, now: number = event.at): ActionIntent[] {
     if (event.type === 'contact.trip_end') this.forgetSession(event.sessionId);
+    this.settle(now);
 
     const intents: ActionIntent[] = [];
     for (const rule of this.ctx.rules()) {
       if (!rule.enabled || !this.matches(rule, event)) continue;
       if (!rule.conditions.every((c) => this.holds(c, event.at))) continue;
-      if (!this.allowFire(rule.id, event.at)) continue;
+      if (!this.allowFire(rule.id, now)) continue;
       if (rule.trigger.on === 'contact.eta_below' && event.type === 'contact.eta') {
         this.etaFired.add(`${rule.id}|${event.sessionId}`);
       }
       for (const action of rule.actions) {
-        const intent = this.resolve(rule, action, event);
+        const intent = this.resolve(rule, action, event, now);
         if (intent) intents.push(intent);
       }
     }
@@ -156,6 +179,14 @@ export class AutomationEngine {
           contactOk(t.contact, event.contact) &&
           (t.kind === undefined || t.kind === event.kind)
         );
+      case 'contact.checkin':
+        return (
+          event.type === 'contact.checkin' &&
+          contactOk(t.contact, event.contact) &&
+          (t.kind === undefined || t.kind === event.kind)
+        );
+      case 'contact.sos':
+        return event.type === 'contact.sos' && contactOk(t.contact, event.contact);
       case 'me.arrive':
         return event.type === 'me.arrive' && event.placeId === t.place;
       case 'me.leave':
@@ -180,26 +211,39 @@ export class AutomationEngine {
     }
   }
 
+  /** Moves the stamps that `now` lies before (see `Stamp`) and drops those that no longer count. */
+  private settle(now: number): void {
+    for (const map of [this.fires, this.pings]) {
+      for (const [key, stamps] of map) {
+        const recent = stamps
+          .map((s) => (s.at - now > CLOCK_TOLERANCE_MS ? { at: s.at, noLaterThan: Math.min(s.noLaterThan, now) } : s))
+          .filter((s) => isRecent(s, now, HOUR));
+        if (recent.length) map.set(key, recent);
+        else map.delete(key);
+      }
+    }
+  }
+
+  /** Expects `settle(now)` to have run for this event. */
   private allowFire(ruleId: string, now: number): boolean {
-    const recent = (this.fires.get(ruleId) ?? []).filter((t) => now - t < HOUR);
-    const last = recent[recent.length - 1];
-    if (last !== undefined && now - last < this.limits.ruleCooldownMs) return false;
+    const recent = this.fires.get(ruleId) ?? [];
+    if (recent.some((s) => isRecent(s, now, this.limits.ruleCooldownMs))) return false;
     if (recent.length >= this.limits.maxFiresPerRulePerHour) return false;
-    recent.push(now);
-    this.fires.set(ruleId, recent);
+    this.fires.set(ruleId, [...recent, { at: now, noLaterThan: now }]);
     return true;
   }
 
+  /** Expects `settle(now)` to have run for this event. */
   private allowPing(to: ContactKey, now: number): boolean {
-    const recent = (this.pings.get(to) ?? []).filter((t) => now - t < HOUR);
+    const recent = this.pings.get(to) ?? [];
     if (recent.length >= this.limits.maxPingsPerContactPerHour) return false;
-    recent.push(now);
-    this.pings.set(to, recent);
+    this.pings.set(to, [...recent, { at: now, noLaterThan: now }]);
     return true;
   }
 
-  private resolve(rule: Rule, action: Action, event: AutomationEvent): ActionIntent | undefined {
-    const vars = this.variables(event);
+  private resolve(rule: Rule, action: Action, event: AutomationEvent, now: number): ActionIntent | undefined {
+    // Only a notification stays on my devices; everything else is read by others.
+    const vars = this.variables(event, action.do !== 'notify');
     switch (action.do) {
       case 'notify':
         return {
@@ -209,7 +253,7 @@ export class AutomationEngine {
           body: render(action.body, vars, 200),
         };
       case 'send_ping':
-        if (!this.allowPing(action.to, event.at)) return undefined;
+        if (!this.allowPing(action.to, now)) return undefined;
         return {
           kind: 'send_ping',
           ruleId: rule.id,
@@ -219,13 +263,38 @@ export class AutomationEngine {
         };
       case 'start_trip':
         return { kind: 'start_trip', ruleId: rule.id, to: action.to, destination: action.destination, level: 'eta' };
+      case 'send_message':
+        if (!this.allowPing(action.to, now)) return undefined;
+        return { kind: 'send_message', ruleId: rule.id, to: action.to, text: render(action.text, vars, 280) };
+      case 'send_checkin': {
+        const to = action.to.filter((k) => this.allowPing(k, now));
+        if (!to.length) return undefined;
+        return {
+          kind: 'send_checkin',
+          ruleId: rule.id,
+          to,
+          checkinKind: action.kind,
+          text: action.text === undefined ? undefined : render(action.text, vars, 140),
+        };
+      }
+      case 'set_dnd':
+        return { kind: 'set_dnd', ruleId: rule.id, minutes: action.minutes };
+      case 'set_status':
+        return {
+          kind: 'set_status',
+          ruleId: rule.id,
+          text: render(action.text, vars, 80),
+          emoji: action.emoji,
+          hours: action.hours,
+        };
     }
   }
 
-  private variables(event: AutomationEvent): Record<string, string> {
+  private variables(event: AutomationEvent, out: boolean): Record<string, string> {
     const vars: Record<string, string> = {};
-    if ('contact' in event) vars.contact = this.ctx.contactName(event.contact);
-    if ('placeName' in event) vars.place = event.placeName;
+    const name = out ? (this.ctx.sentName ?? this.ctx.contactName) : this.ctx.contactName;
+    if ('contact' in event) vars.contact = name(event.contact);
+    if ('placeName' in event && event.placeName !== undefined) vars.place = event.placeName;
     if ('placeId' in event) vars.place = this.ctx.placeName(event.placeId) ?? '';
     if ('destinationName' in event) vars.destination = event.destinationName;
     if (event.type === 'contact.eta') vars.eta = event.etaMinutes === 0 ? 'gleich' : `in ca. ${event.etaMinutes} min`;

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CheckinKind, PingKind } from '../protocol/messages';
 
 /**
  * Automations are data, not code: a trigger, optional conditions and a few actions.
@@ -29,11 +30,9 @@ export const Trigger = z.discriminatedUnion('on', [
     reason: z.enum(['arrived', 'stopped', 'expired']).optional(),
   }),
   z.strictObject({ on: z.literal('contact.message'), contact: ContactRef, contains: label(60).optional() }),
-  z.strictObject({
-    on: z.literal('contact.ping'),
-    contact: ContactRef,
-    kind: z.enum(['help-carry', 'pickup-request', 'custom']).optional(),
-  }),
+  z.strictObject({ on: z.literal('contact.ping'), contact: ContactRef, kind: PingKind.optional() }),
+  z.strictObject({ on: z.literal('contact.checkin'), contact: ContactRef, kind: CheckinKind.optional() }),
+  z.strictObject({ on: z.literal('contact.sos'), contact: ContactRef }),
   z.strictObject({ on: z.literal('me.arrive'), place: placeId }),
   z.strictObject({ on: z.literal('me.leave'), place: placeId }),
 ]);
@@ -50,11 +49,23 @@ export const Condition = z.discriminatedUnion('if', [
 export const Action = z.discriminatedUnion('do', [
   /** Local notification. Text may use {{contact}}, {{place}}, {{destination}}, {{eta}}, {{text}}. */
   z.strictObject({ do: z.literal('notify'), title: label(60), body: label(200) }),
+  z.strictObject({ do: z.literal('send_ping'), to: contactKey, kind: PingKind, text: label(280).optional() }),
+  /** A chat message. Text may use the same placeholders as notify. */
+  z.strictObject({ do: z.literal('send_message'), to: contactKey, text: label(280) }),
+  /** "Gut angekommen" and friends, to up to 10 people. */
   z.strictObject({
-    do: z.literal('send_ping'),
-    to: contactKey,
-    kind: z.enum(['help-carry', 'pickup-request', 'custom']),
-    text: label(280).optional(),
+    do: z.literal('send_checkin'),
+    to: z.array(contactKey).min(1).max(10),
+    kind: CheckinKind,
+    text: label(140).optional(),
+  }),
+  /** Quiet mode on for `minutes` (1 to 1440), or off with 0. */
+  z.strictObject({ do: z.literal('set_dnd'), minutes: z.number().int().min(0).max(1440) }),
+  z.strictObject({
+    do: z.literal('set_status'),
+    text: label(80),
+    emoji: label(16).optional(),
+    hours: z.number().int().min(1).max(24),
   }),
   /**
    * Starts sharing my ETA. Automations may only start the least revealing level,

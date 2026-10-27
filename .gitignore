@@ -5,3 +5,11 @@ coverage/
 .DS_Store
 .env*
 !.env.example
+# Generated native projects (expo prebuild runs in CI)
+apps/mobile/android/
+apps/mobile/ios/
+# Smoke test output
+web-smoke/
+android-smoke/
+ios-smoke/
+windows-smoke/

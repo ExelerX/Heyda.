@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "node20",
+    "moduleResolution": "node16",
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "build",
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": false,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

@@ -7,7 +7,10 @@ import { validateRule, type Rule, type RuleSource, type ValidateResult } from '.
  * e.g. "Tell me when {contact} arrives at {place}".
  * The rule inside uses `{{slot:name}}` placeholders that get replaced by the choices.
  */
-export const SlotKind = z.enum(['contact', 'place_name', 'my_place', 'minutes', 'text']);
+export const TEMPLATE_CATEGORIES = ['ankunft', 'unterwegs', 'reise', 'sicherheit', 'familie', 'freunde', 'ruhe', 'alltag'] as const;
+export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
+
+export const SlotKind = z.enum(['contact', 'place_name', 'my_place', 'minutes', 'duration', 'text']);
 export type SlotKind = z.infer<typeof SlotKind>;
 
 export const SlotDef = z.strictObject({
@@ -25,7 +28,7 @@ export const RuleTemplate = z.strictObject({
   title: z.string().trim().min(1).max(60),
   /** The sentence shown to the user; `{slot}` marks a gap. */
   sentence: z.string().trim().min(1).max(160),
-  category: z.enum(['ankunft', 'unterwegs', 'sicherheit', 'alltag']),
+  category: z.enum(TEMPLATE_CATEGORIES),
   slots: z.array(SlotDef).max(6),
   rule: z.strictObject({
     name: z.string().trim().min(1).max(60),
@@ -50,6 +53,11 @@ function checkSlotValue(slot: SlotDef, value: string | number | undefined): stri
       return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 120
         ? undefined
         : `${slot.label}: 0 bis 120 Minuten`;
+    case 'duration':
+      // Quiet-mode length in minutes: 15 minutes to a day.
+      return typeof value === 'number' && Number.isInteger(value) && value >= 15 && value <= 1440
+        ? undefined
+        : `${slot.label}: 15 Minuten bis 24 Stunden`;
     case 'my_place':
       return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? undefined : `${slot.label}: kein gültiger Ort`;
     case 'place_name':
@@ -92,7 +100,9 @@ export function instantiateTemplate(
   const errors: string[] = [];
   const filled: SlotValues = {};
   for (const slot of template.slots) {
-    const value = values[slot.name] ?? slot.default;
+    // The user picks every person: a contact gap may only start out as "anyone".
+    const fallback = slot.kind === 'contact' && slot.default !== 'any' ? undefined : slot.default;
+    const value = values[slot.name] ?? fallback;
     const problem = checkSlotValue(slot, value);
     if (problem) errors.push(problem);
     else filled[slot.name] = typeof value === 'string' ? value.trim() : value!;
@@ -174,14 +184,14 @@ export const BUILTIN_TEMPLATES: RuleTemplate[] = [
   {
     id: 'core.home-safe',
     title: 'Gut angekommen',
-    sentence: 'Wenn ich bei {myplace} ankomme, sag {contact} Bescheid',
+    sentence: 'Wenn ich bei {myplace} ankomme, melde {contact} „gut angekommen“',
     category: 'sicherheit',
     slots: [{ name: 'myplace', kind: 'my_place', label: 'Mein Ort' }, contactSlot()],
     rule: {
       name: 'Gut angekommen',
       trigger: { on: 'me.arrive', place: '{{slot:myplace}}' },
       conditions: [],
-      actions: [{ do: 'send_ping', to: '{{slot:contact}}', kind: 'custom', text: 'Bin gut bei {{place}} angekommen ✅' }],
+      actions: [{ do: 'send_checkin', to: ['{{slot:contact}}'], kind: 'arrived', text: 'Bin gut bei {{place}} angekommen ✅' }],
     },
   },
   {
@@ -212,6 +222,126 @@ export const BUILTIN_TEMPLATES: RuleTemplate[] = [
       trigger: { on: 'contact.ping', contact: '{{slot:contact}}', kind: 'pickup-request' },
       conditions: [],
       actions: [{ do: 'notify', title: '{{contact}} möchte abgeholt werden', body: '{{text}}' }],
+    },
+  },
+  {
+    id: 'core.travel-arrived',
+    title: 'Am Urlaubsort angekommen',
+    sentence: 'Wenn ich in {myplace} ankomme, sag {contact} Bescheid, dass alles gut ist',
+    category: 'reise',
+    slots: [{ name: 'myplace', kind: 'my_place', label: 'Reiseziel' }, contactSlot()],
+    rule: {
+      name: 'Gut am Reiseziel',
+      trigger: { on: 'me.arrive', place: '{{slot:myplace}}' },
+      conditions: [],
+      actions: [{ do: 'send_checkin', to: ['{{slot:contact}}'], kind: 'arrived', text: 'Bin gut in {{place}} angekommen ✈️' }],
+    },
+  },
+  {
+    id: 'core.home-status',
+    title: 'Zuhause-Status',
+    sentence: 'Wenn ich nach {myplace} komme, zeige meinen Status „Zuhause 🏠“',
+    category: 'familie',
+    slots: [{ name: 'myplace', kind: 'my_place', label: 'Zuhause' }],
+    rule: {
+      name: 'Status: Zuhause',
+      trigger: { on: 'me.arrive', place: '{{slot:myplace}}' },
+      conditions: [],
+      actions: [{ do: 'set_status', text: 'Zuhause', emoji: '🏠', hours: 12 }],
+    },
+  },
+  {
+    id: 'core.home-family',
+    title: 'Zuhause angekommen',
+    sentence: 'Wenn ich nach {myplace} komme, melde {contact} „bin zuhause“',
+    category: 'familie',
+    slots: [{ name: 'myplace', kind: 'my_place', label: 'Zuhause' }, contactSlot()],
+    rule: {
+      name: 'Bin zuhause',
+      trigger: { on: 'me.arrive', place: '{{slot:myplace}}' },
+      conditions: [],
+      actions: [{ do: 'send_checkin', to: ['{{slot:contact}}'], kind: 'home' }],
+    },
+  },
+  {
+    id: 'core.quiet-at-place',
+    title: 'Ruhe bei der Arbeit',
+    sentence: 'Wenn ich bei {myplace} ankomme, schalte den Ruhemodus für {duration} an',
+    category: 'ruhe',
+    slots: [
+      { name: 'myplace', kind: 'my_place', label: 'Ort' },
+      { name: 'duration', kind: 'duration', label: 'Dauer', default: 480 },
+    ],
+    rule: {
+      name: 'Ruhemodus bei {{slot:myplace}}',
+      trigger: { on: 'me.arrive', place: '{{slot:myplace}}' },
+      conditions: [],
+      actions: [{ do: 'set_dnd', minutes: '{{slot:duration}}' }],
+    },
+  },
+  {
+    id: 'core.quiet-off-leave',
+    title: 'Ruhe aus beim Gehen',
+    sentence: 'Wenn ich {myplace} verlasse, schalte den Ruhemodus aus',
+    category: 'ruhe',
+    slots: [{ name: 'myplace', kind: 'my_place', label: 'Ort' }],
+    rule: {
+      name: 'Ruhemodus aus',
+      trigger: { on: 'me.leave', place: '{{slot:myplace}}' },
+      conditions: [],
+      actions: [{ do: 'set_dnd', minutes: 0 }],
+    },
+  },
+  {
+    id: 'core.see-you-soon',
+    title: 'Bis gleich!',
+    sentence: 'Wenn {contact} „bin unterwegs“ schickt, antworte „Bis gleich! 👋“',
+    category: 'freunde',
+    slots: [contactSlot(true)],
+    rule: {
+      name: 'Bis gleich',
+      trigger: { on: 'contact.ping', contact: '{{slot:contact}}', kind: 'on-my-way' },
+      conditions: [],
+      actions: [{ do: 'notify', title: '{{contact}} ist unterwegs zu dir', body: 'Mach dich bereit 🙂' }],
+    },
+  },
+  {
+    id: 'core.checkin-heart',
+    title: 'Herz zurück',
+    sentence: 'Wenn {contact} „gut angekommen“ meldet, schicke ein Herz zurück',
+    category: 'freunde',
+    slots: [contactSlot()],
+    rule: {
+      name: 'Herz bei Ankunft',
+      trigger: { on: 'contact.checkin', contact: '{{slot:contact}}' },
+      conditions: [],
+      actions: [{ do: 'send_ping', to: '{{slot:contact}}', kind: 'thinking-of-you' }],
+    },
+  },
+  {
+    id: 'core.sos-forward',
+    title: 'Notruf weitersagen',
+    sentence: 'Wenn {contact} einen Notruf sendet, schreibe auch {other}',
+    category: 'sicherheit',
+    slots: [contactSlot(true), { name: 'other', kind: 'contact', label: 'Wem noch' }],
+    rule: {
+      name: 'Notruf weitersagen',
+      trigger: { on: 'contact.sos', contact: '{{slot:contact}}' },
+      conditions: [],
+      actions: [{ do: 'send_message', to: '{{slot:other}}', text: '🆘 {{contact}} hat in Heyda. einen Notruf ausgelöst. Bitte melde dich bei mir!' }],
+    },
+  },
+  {
+    id: 'core.late-evening',
+    title: 'Spät unterwegs',
+    sentence: 'Wenn {contact} abends nach 22 Uhr losfährt, sag mir Bescheid',
+    category: 'familie',
+    slots: [contactSlot(true)],
+    rule: {
+      name: 'Spät unterwegs',
+      trigger: { on: 'contact.trip_start', contact: '{{slot:contact}}' },
+      conditions: [{ if: 'time_between', from: '22:00', to: '06:00' }],
+      actions: [{ do: 'notify', title: '{{contact}} ist noch unterwegs', body: 'Ziel: {{destination}}' }],
     },
   },
 ];

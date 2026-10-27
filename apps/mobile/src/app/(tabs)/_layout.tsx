@@ -12,7 +12,7 @@ const icon = (glyph: string) =>
 export default function TabsLayout() {
   const t = useTheme();
   const insets = useSafeAreaInsets();
-  const { settings } = useSnapshot();
+  const { settings, unreadTotal } = useSnapshot();
   if (!settings.onboarded) return <Redirect href="/welcome" />;
 
   return (
@@ -34,7 +34,11 @@ export default function TabsLayout() {
       }}
     >
       <Tabs.Screen name="index" options={{ title: 'Start', tabBarIcon: icon('🏠') }} />
-      <Tabs.Screen name="chats" options={{ title: 'Chats', tabBarIcon: icon('💬') }} />
+      <Tabs.Screen
+        name="chats"
+        options={{ title: 'Chats', tabBarIcon: icon('💬'), tabBarBadge: unreadTotal ? (unreadTotal > 99 ? '99+' : unreadTotal) : undefined }}
+      />
+      <Tabs.Screen name="map" options={{ title: 'Karte', tabBarIcon: icon('🗺️') }} />
       <Tabs.Screen name="automations" options={{ title: 'Automationen', tabBarIcon: icon('⚡') }} />
       <Tabs.Screen name="me" options={{ title: 'Ich', tabBarIcon: icon('🙂') }} />
     </Tabs>

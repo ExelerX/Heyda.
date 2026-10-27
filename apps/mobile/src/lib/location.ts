@@ -1,4 +1,4 @@
-import type { LocationFix, Place } from '@heyda/core';
+import type { LocationFix, LocationNeeds, Place } from '@heyda/core';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import { Platform } from 'react-native';
@@ -6,7 +6,7 @@ import { getRuntime } from './runtime';
 
 /**
  * Bridges the OS location services to the SocialNode. The exact position only ever
- * goes into `node.onLocationFix`; what leaves the phone is decided by the core's
+ * goes into `node.onLocationFixes`; what leaves the phone is decided by the core's
  * privacy gate, never here.
  */
 export const GEOFENCE_TASK = 'heyda-geofence';
@@ -39,7 +39,10 @@ function toFix(l: Location.LocationObject): LocationFix {
 
 async function feed(locations: Location.LocationObject[]): Promise<void> {
   const runtime = await getRuntime();
-  for (const l of locations) await runtime.node.onLocationFix(toFix(l));
+  // The demo never gets the real location (tracking left over from before it is stopped).
+  if (runtime.isDemo) return;
+  // As one batch: if the fixes are dated ahead of the phone's clock, they keep their order and spacing.
+  await runtime.node.onLocationFixes(locations.map(toFix));
   await runtime.flushIfDirty();
 }
 
@@ -58,6 +61,7 @@ if (locationSupported) {
     const placeId = data?.region?.identifier;
     if (error || !placeId) return;
     const runtime = await getRuntime();
+    if (runtime.isDemo) return;
     const inside = data.eventType === Location.GeofencingEventType.Enter;
     if (Date.now() - registeredAt < REGISTRATION_GRACE_MS) runtime.node.syncPlaceState(placeId, inside);
     else await runtime.node.onPlaceTransition(placeId, inside ? 'arrive' : 'leave');
@@ -91,49 +95,98 @@ export async function currentPosition(): Promise<{ lat: number; lon: number; acc
   return { lat: l.coords.latitude, lon: l.coords.longitude, accuracyM: l.coords.accuracy ?? undefined };
 }
 
+let currentMode: LocationNeeds['mode'] = 'off';
+
+const NOTIFICATION_TEXT: Record<string, { title: string; body: string }> = {
+  sos: { title: '🆘 Notruf läuft', body: 'Dein Standort geht an deine Notfallkontakte.' },
+  trip: { title: 'Du teilst deine Ankunftszeit', body: 'Endet automatisch bei Ankunft.' },
+  live: { title: 'Du teilst deinen Standort live', body: 'Öffne Heyda., um es zu beenden.' },
+};
+
 /**
- * Follows the phone while a trip is shared. With "always" access this keeps running in
- * the background, with a visible notification (Android) or the blue pill (iOS);
- * otherwise only while the app is open.
+ * Runs one call at a time with the latest input. Each call waits for the OS several times; two
+ * calls side by side could both start tracking (one watch never removed), or a call for "low"
+ * could start tracking after a later "off" had already stopped it.
  */
-export async function startTripTracking(): Promise<LocationAccess> {
+function latestOnly<I, O>(apply: (input: I) => Promise<O>, fallback: O): (input: I) => Promise<O> {
+  let latest: I;
+  let queue: Promise<O> = Promise.resolve(fallback);
+  return (input) => {
+    latest = input;
+    queue = queue.catch(() => fallback).then(() => apply(latest));
+    return queue;
+  };
+}
+
+/**
+ * Runs the location tracking the core asks for: precise and frequent during a trip,
+ * an SOS or a precise live share; rare and coarse for an area-only live share; otherwise none.
+ * With "always" access it keeps running in the background with a visible notification
+ * (Android) or the blue pill (iOS); otherwise only while the app is open.
+ */
+export const applyLocationNeeds = latestOnly(applyNeedsNow, 'denied' as LocationAccess);
+
+/**
+ * Stops all tracking, also what an earlier run of the app left running with the OS, e.g. when the
+ * demo takes over from a real account. In line with `applyLocationNeeds`, so no earlier call starts it again.
+ */
+export function stopLocation(): Promise<LocationAccess> {
+  return applyLocationNeeds({ mode: 'off', reasons: [], force: true });
+}
+
+/** `force`: stop whatever runs, even when this run of the app thinks nothing does. */
+async function applyNeedsNow(needs: LocationNeeds & { force?: boolean }): Promise<LocationAccess> {
+  if (!locationSupported) return 'denied';
   const access = await currentLocationAccess();
+  if (!needs.force && needs.mode === currentMode && (needs.mode === 'off' || foregroundWatch || (await isTracking()))) return access;
+  await stopTracking();
+  currentMode = needs.mode;
+  if (needs.mode === 'off' || access === 'denied') return access;
+  const high = needs.mode === 'high';
+  const reason = needs.reasons.includes('sos') ? 'sos' : needs.reasons.includes('trip') ? 'trip' : 'live';
+  const opts = high
+    ? { accuracy: Location.Accuracy.High, distanceInterval: 25, timeInterval: 15_000 }
+    : { accuracy: Location.Accuracy.Balanced, distanceInterval: 300, timeInterval: 5 * 60_000 };
   if (access === 'always') {
-    if (!(await Location.hasStartedLocationUpdatesAsync(TRIP_TASK))) {
-      await Location.startLocationUpdatesAsync(TRIP_TASK, {
-        accuracy: Location.Accuracy.High,
-        distanceInterval: 50,
-        timeInterval: 20_000,
-        showsBackgroundLocationIndicator: true,
-        pausesUpdatesAutomatically: false,
-        activityType: Location.ActivityType.OtherNavigation,
-        foregroundService: {
-          notificationTitle: 'Du teilst deine Ankunftszeit',
-          notificationBody: 'Endet automatisch bei Ankunft. Öffne die App, um früher zu stoppen.',
-          notificationColor: '#F5A524',
-          killServiceOnDestroy: false,
-        },
-      });
-    }
-  } else if (access === 'while-using' && !foregroundWatch) {
-    foregroundWatch = await Location.watchPositionAsync(
-      { accuracy: Location.Accuracy.High, distanceInterval: 50, timeInterval: 20_000 },
-      (l) => void feed([l]),
-    );
+    await Location.startLocationUpdatesAsync(TRIP_TASK, {
+      ...opts,
+      showsBackgroundLocationIndicator: true,
+      pausesUpdatesAutomatically: false,
+      activityType: Location.ActivityType.Other,
+      foregroundService: {
+        notificationTitle: NOTIFICATION_TEXT[reason]!.title,
+        notificationBody: NOTIFICATION_TEXT[reason]!.body,
+        notificationColor: reason === 'sos' ? '#E5484D' : '#F5A524',
+        killServiceOnDestroy: false,
+      },
+    });
+  } else {
+    foregroundWatch = await Location.watchPositionAsync(opts, (l) => void feed([l]));
   }
   return access;
 }
 
-export async function stopTripTracking(): Promise<void> {
+async function isTracking(): Promise<boolean> {
+  return Location.hasStartedLocationUpdatesAsync(TRIP_TASK).catch(() => false);
+}
+
+async function stopTracking(): Promise<void> {
   foregroundWatch?.remove();
   foregroundWatch = undefined;
-  if (locationSupported && (await Location.hasStartedLocationUpdatesAsync(TRIP_TASK))) {
-    await Location.stopLocationUpdatesAsync(TRIP_TASK);
-  }
+  if (await isTracking()) await Location.stopLocationUpdatesAsync(TRIP_TASK).catch(() => {});
+}
+
+/** One fix right now, e.g. for an SOS or an answer to "where are you?". Feeds it to the node too. */
+export async function freshFix(): Promise<void> {
+  if (!locationSupported || (await currentLocationAccess()) === 'denied') return;
+  const l = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+  await feed([l]);
 }
 
 /** Hands my places to the OS, which watches them even while the app is closed. */
-export async function registerGeofences(places: Place[]): Promise<void> {
+export const registerGeofences = latestOnly(registerGeofencesNow, undefined);
+
+async function registerGeofencesNow(places: Place[]): Promise<void> {
   if (!locationSupported) return;
   const running = await Location.hasStartedGeofencingAsync(GEOFENCE_TASK);
   if (!places.length || (await currentLocationAccess()) !== 'always') {

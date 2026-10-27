@@ -1,126 +1,211 @@
-import { describeRule, type RuleTemplate } from '@heyda/core';
+import type { Plugin, Rule, RuleTemplate } from '@heyda/core';
 import { router } from 'expo-router';
 import { useMemo, useState } from 'react';
-import { Pressable, Text, TextInput, View } from 'react-native';
-import { Card, Empty, Hint, Pill, Row, Screen, Section, T, Toggle } from '../../components/ui';
-import { useContactName, useRuntime, useSnapshot } from '../../lib/store';
-import { CATEGORY_TEXT, matchesSearch, TIPS } from '../../lib/templates-ui';
+import { Pressable, ScrollView, Text, View } from 'react-native';
+import { LIMITS_TEXT } from '../../components/automation/catalog';
+import { RuleCard, SmallAction, TemplateCard } from '../../components/automation/cards';
+import { Banner, errorText, Field, Narrow } from '../../components/setup/kit';
+import { Button, Card, Chip, Empty, Hint, Row, Screen, Section, T, Wrap } from '../../components/ui';
+import { confirm, notice } from '../../lib/confirm';
+import { useRuntime, useSnapshot } from '../../lib/store';
+import { CATEGORY_ICON, CATEGORY_TEXT, groupTemplates, TIPS } from '../../lib/templates-ui';
 import { radius, spacing, TOUCH, useTheme } from '../../lib/theme';
 
 export default function Automations() {
   const t = useTheme();
   const runtime = useRuntime();
-  const { state, templates } = useSnapshot();
-  const contactName = useContactName();
+  const { state, templates, plugins, automationsActHere, automationDevice } = useSnapshot();
   const [query, setQuery] = useState('');
-  const tip = useMemo(() => TIPS[new Date().getDate() % TIPS.length]!, []);
+  const [category, setCategory] = useState<RuleTemplate['category']>();
+  const [tipIndex, setTipIndex] = useState(() => new Date().getDate() % TIPS.length);
 
-  const placeName = (id: string) => state.places.find((p) => p.id === id)?.name ?? 'einem Ort';
-  const found = templates.filter((tpl) => matchesSearch(tpl, query));
-  const groups = Object.entries(CATEGORY_TEXT)
-    .map(([cat, label]) => ({ label, items: found.filter((tpl) => tpl.category === cat) }))
-    .filter((g) => g.items.length);
+  const groups = useMemo(() => groupTemplates(templates, query, category), [templates, query, category]);
+  const categories = useMemo(
+    () => (Object.keys(CATEGORY_TEXT) as RuleTemplate['category'][]).filter((c) => templates.some((x) => x.category === c)),
+    [templates],
+  );
+  const pluginOf = (tpl: RuleTemplate) => plugins.find((p) => p.templates.some((x) => x.id === tpl.id))?.name;
+  const rules = [...state.rules].sort((a, b) => Number(b.enabled) - Number(a.enabled));
+  // Only one device sends what automations send to others; with more than one, I choose which.
+  const devices = [
+    { deviceId: state.self.deviceId, name: state.self.deviceName, here: true },
+    ...state.devices.filter((d) => d.deviceId !== state.self.deviceId).map((d) => ({ deviceId: d.deviceId, name: d.name, here: false })),
+  ];
+  const sender = devices.find((d) => d.deviceId === automationDevice);
+
+  function chooseSender(deviceId: string | undefined) {
+    try {
+      runtime.node.setAutomationDevice(deviceId);
+    } catch (e) {
+      notice('Das hat nicht geklappt', errorText(e));
+    }
+  }
+
+  async function deleteRule(rule: Rule) {
+    const ok = await confirm({ title: `„${rule.name}“ löschen?`, message: 'Die Automation ist dann weg. Du kannst sie jederzeit neu einrichten.', ok: 'Löschen', destructive: true });
+    if (ok) runtime.removeRule(rule.id);
+  }
+
+  async function removePlugin(p: Plugin) {
+    const ok = await confirm({
+      title: `Plugin „${p.name}“ entfernen?`,
+      message: 'Seine Vorlagen verschwinden. Automationen, die du schon daraus eingerichtet hast, laufen weiter.',
+      ok: 'Entfernen',
+      destructive: true,
+    });
+    if (ok) runtime.removePlugin(p.id);
+  }
 
   return (
     <Screen title="Automationen">
-      <TextInput
-        value={query}
-        onChangeText={setQuery}
-        placeholder="🔎  Was soll passieren? z. B. „tragen“"
-        placeholderTextColor={t.textMuted}
-        accessibilityLabel="Vorlagen durchsuchen"
-        style={{
-          backgroundColor: t.surface,
-          borderColor: t.border,
-          borderWidth: 1,
-          borderRadius: radius.md,
-          color: t.text,
-          fontSize: 16,
-          padding: spacing.md,
-          minHeight: TOUCH,
-        }}
-      />
+      <Narrow>
+        <T variant="muted">Kleine Helfer, die von selbst etwas tun. Sie laufen nur auf deinem Gerät und tun nur, was der Satz sagt.</T>
 
-      {!query && (
-        <Section title="Meine Automationen">
-          {state.rules.length === 0 ? (
-            <Empty icon="⚡" title="Noch keine" text="Wähle unten eine Vorlage. Du füllst nur die Lücken aus, ganz ohne Code." />
+        {!automationsActHere && (
+          <Banner tone="info" icon={sender ? '📤' : '💻'} title={sender ? `„${sender.name}“ übernimmt` : 'Dein Handy übernimmt'}>
+            <T variant="small" color={t.text}>
+              {`Hier zeigen Automationen nur Hinweise an. Was an andere geht, schickt ${sender ? `„${sender.name}“` : 'dein Handy'}, damit nichts doppelt ankommt.`}
+            </T>
+          </Banner>
+        )}
+
+        {devices.length > 1 && (
+          <Section title="Von welchem Gerät?">
+            <T>{`Automationen senden von: ${sender ? (sender.here ? `${sender.name} (dieses Gerät)` : sender.name) : 'automatisch'}`}</T>
+            <T variant="small">Was an andere geht, schickt nur ein Gerät, damit nichts doppelt ankommt. Hinweise siehst du überall.</T>
+            <Wrap>
+              <Chip label="Automatisch" selected={!sender} onPress={() => chooseSender(undefined)} />
+              {devices.map((d) => (
+                <Chip key={d.deviceId} label={d.here ? `${d.name} (hier)` : d.name} selected={sender?.deviceId === d.deviceId} onPress={() => chooseSender(d.deviceId)} />
+              ))}
+            </Wrap>
+            {!sender && <T variant="small">Automatisch heißt: Jedes Handy schickt. Ein PC nur, wenn es kein Handy gibt.</T>}
+          </Section>
+        )}
+
+        {!state.contacts.length && (
+          <Banner tone="info" icon="👋" title="Noch keine Freunde">
+            <T variant="small" color={t.text}>
+              Die meisten Automationen reagieren auf Freunde oder schreiben ihnen. Füge zuerst jemanden hinzu.
+            </T>
+            <Button title="Freund hinzufügen" kind="ghost" compact onPress={() => router.push('/pair')} style={{ alignSelf: 'flex-start' }} />
+          </Banner>
+        )}
+
+        <Section title={rules.length ? `Meine Automationen (${rules.length})` : 'Meine Automationen'}>
+          {rules.length === 0 ? (
+            <Empty icon="⚡" title="Noch keine Automationen" text="Wähle unten eine Vorlage. Du füllst nur die Lücken aus, ganz ohne Code." />
           ) : (
-            state.rules.map((rule) => (
-              <Card key={rule.id}>
-                <Toggle
-                  label={rule.name}
-                  detail={describeRule(rule, { contactName, placeName })}
-                  value={rule.enabled}
-                  onChange={(v) => runtime.toggleRule(rule.id, v)}
-                />
-                <Row style={{ justifyContent: 'flex-end' }}>
-                  <Pressable
-                    onPress={() => runtime.removeRule(rule.id)}
-                    accessibilityRole="button"
-                    accessibilityLabel={`${rule.name} löschen`}
-                    style={{ minHeight: TOUCH, justifyContent: 'center', paddingHorizontal: spacing.sm }}
-                  >
-                    <Text style={{ color: t.danger, fontWeight: '600' }}>Löschen</Text>
-                  </Pressable>
-                </Row>
-              </Card>
+            rules.map((rule) => (
+              <RuleCard key={rule.id} rule={rule} onToggle={(on) => runtime.toggleRule(rule.id, on)} onDelete={() => void deleteRule(rule)} />
             ))
           )}
         </Section>
-      )}
 
-      {groups.map((g) => (
-        <Section key={g.label} title={g.label}>
-          {g.items.map((tpl) => (
-            <TemplateCard key={tpl.id} template={tpl} />
+        <Pressable
+          onPress={() => router.push('/rule/new')}
+          accessibilityRole="button"
+          accessibilityLabel="Eigene Automation bauen"
+          style={({ pressed }) => ({
+            marginTop: spacing.md,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: spacing.md,
+            padding: spacing.lg,
+            borderRadius: radius.md,
+            borderWidth: 2,
+            borderStyle: 'dashed',
+            borderColor: t.accent,
+            backgroundColor: pressed ? t.surfaceRaised : t.surface,
+          })}
+        >
+          <Text style={{ fontSize: 30 }} accessible={false}>
+            🧩
+          </Text>
+          <View style={{ flex: 1, gap: 2 }}>
+            <T variant="h2">Eigene Automation bauen</T>
+            <T variant="small">Wenn … und nur wenn … dann … – aus Bausteinen zusammenstecken.</T>
+          </View>
+          <Text style={{ color: t.accent, fontSize: 24 }} accessible={false}>
+            ›
+          </Text>
+        </Pressable>
+
+        <Section title="Vorlagen">
+          <Field value={query} onChangeText={setQuery} placeholder="🔎  Suchen, z. B. „tragen“ oder „zuhause“" maxLength={60} />
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: spacing.sm, paddingVertical: 2 }}>
+            <Chip label="Alle" selected={!category} onPress={() => setCategory(undefined)} />
+            {categories.map((c) => (
+              <Chip key={c} icon={CATEGORY_ICON[c]} label={CATEGORY_TEXT[c]} selected={category === c} onPress={() => setCategory(category === c ? undefined : c)} />
+            ))}
+          </ScrollView>
+          {groups.map((g) => (
+            <View key={g.category} style={{ gap: spacing.sm, marginTop: spacing.sm }}>
+              <T variant="small" style={{ fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                {`${CATEGORY_ICON[g.category]} ${g.label}`}
+              </T>
+              {g.items.map((tpl) => (
+                <TemplateCard key={tpl.id} template={tpl} pluginName={pluginOf(tpl)} />
+              ))}
+            </View>
           ))}
+          {!groups.length && (
+            <Card>
+              <T variant="muted">Keine passende Vorlage. Versuch ein anderes Wort, z. B. „ankommen“, oder bau dir eine eigene Automation.</T>
+              <Button
+                title="Suche zurücksetzen"
+                kind="ghost"
+                compact
+                onPress={() => {
+                  setQuery('');
+                  setCategory(undefined);
+                }}
+              />
+            </Card>
+          )}
         </Section>
-      ))}
-      {query && !found.length && <T variant="muted">Keine passende Vorlage. Versuch ein anderes Wort, z. B. „ankommen“.</T>}
 
-      {!query && (
-        <Section title="Mehr">
-          <Hint>{tip}</Hint>
-          <Card onPress={() => router.push('/plugin')} label="Plugin importieren">
-            <T variant="h2">📦 Plugin importieren</T>
-            <T variant="muted">Vorlagen-Pakete von Freunden. Sie enthalten keinen Code.</T>
-          </Card>
-          <Card>
-            <Row style={{ justifyContent: 'space-between' }}>
-              <T variant="h2">🧩 Puzzle-Editor</T>
-              <Pill text="bald" color={t.textMuted} />
-            </Row>
-            <T variant="muted">Eigene Regeln aus Bausteinen zusammenstecken.</T>
-          </Card>
-          <Card>
-            <Row style={{ justifyContent: 'space-between' }}>
-              <T variant="h2">✨ Regel aus einem Satz</T>
-              <Pill text="bald" color={t.textMuted} />
-            </Row>
-            <T variant="muted">Schreib, was passieren soll. Du bestätigst jede Regel, bevor sie aktiv wird.</T>
-          </Card>
+        <Section title="Plugins" action={<SmallAction label="Importieren" color={t.accent} onPress={() => router.push('/plugin')} />}>
+          {plugins.length === 0 ? (
+            <Card onPress={() => router.push('/plugin')} label="Plugin importieren">
+              <Row>
+                <Text style={{ fontSize: 22 }} accessible={false}>
+                  📦
+                </Text>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <T variant="h2">Plugin importieren</T>
+                  <T variant="small">Vorlagen-Pakete von Freunden. Sie enthalten keinen Code, und wen sie betreffen, wählst du.</T>
+                </View>
+              </Row>
+            </Card>
+          ) : (
+            <Card style={{ padding: 0, gap: 0, overflow: 'hidden' }}>
+              {plugins.map((p, i) => (
+                <Row key={p.id} gap={spacing.md} style={{ paddingHorizontal: spacing.lg, paddingVertical: spacing.sm, minHeight: TOUCH + 12, borderTopWidth: i ? 1 : 0, borderTopColor: t.border }}>
+                  <Text style={{ fontSize: 22 }} accessible={false}>
+                    📦
+                  </Text>
+                  <View style={{ flex: 1, gap: 2 }}>
+                    <T style={{ fontWeight: '700' }}>{p.name}</T>
+                    <T variant="small">{`von ${p.author} · ${p.templates.length} ${p.templates.length === 1 ? 'Vorlage' : 'Vorlagen'}`}</T>
+                  </View>
+                  <SmallAction label="Entfernen" a11y={`Plugin ${p.name} entfernen`} color={t.danger} onPress={() => void removePlugin(p)} />
+                </Row>
+              ))}
+            </Card>
+          )}
         </Section>
-      )}
+
+        <Section title="Tipp">
+          <Hint>{TIPS[tipIndex] ?? ''}</Hint>
+          <Row style={{ justifyContent: 'space-between' }}>
+            <T variant="small" style={{ flex: 1 }}>
+              {LIMITS_TEXT}
+            </T>
+          </Row>
+          <Button title="Nächster Tipp" kind="ghost" compact onPress={() => setTipIndex((i) => (i + 1) % TIPS.length)} style={{ alignSelf: 'flex-start' }} />
+        </Section>
+      </Narrow>
     </Screen>
-  );
-}
-
-function TemplateCard({ template }: { template: RuleTemplate }) {
-  const t = useTheme();
-  const sentence = template.sentence.replace(/\{([a-z][a-z0-9_]*)\}/g, (_, n: string) => {
-    const slot = template.slots.find((s) => s.name === n);
-    return `[${slot?.label ?? n}]`;
-  });
-  return (
-    <Card onPress={() => router.push(`/template/${encodeURIComponent(template.id)}`)} label={template.title}>
-      <Row style={{ justifyContent: 'space-between' }}>
-        <T variant="h2">{template.title}</T>
-        {!template.id.startsWith('core.') && <Pill text="Plugin" color={t.info} />}
-      </Row>
-      <View>
-        <T variant="muted">{sentence}</T>
-      </View>
-    </Card>
   );
 }

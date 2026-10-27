@@ -1,7 +1,36 @@
+import { CHECKIN_LABELS, PING_LABELS } from '../features/labels';
+import type { CheckinKind, PingKind } from '../protocol/messages';
 import type { Action, Condition, Rule, Trigger } from './schema';
 
+export const PING_TRIGGER_TEXT: Record<PingKind, string> = {
+  'help-carry': 'um Hilfe beim Tragen bittet',
+  'pickup-request': 'abgeholt werden möchte',
+  'call-me': 'um einen Anruf bittet',
+  'dinner-ready': '„Essen ist fertig“ schickt',
+  'running-late': 'sich verspätet',
+  'on-my-way': '„bin unterwegs“ schickt',
+  'thinking-of-you': 'ein Herz schickt',
+  custom: 'dich anstupst',
+};
+
+const PING_ACTION_TEXT: Record<PingKind, string> = Object.fromEntries(
+  Object.entries(PING_LABELS).map(([k, v]) => [k, `${v.text} ${v.emoji}`]),
+) as Record<PingKind, string>;
+
+export const CHECKIN_TEXT: Record<CheckinKind, string> = Object.fromEntries(
+  Object.entries(CHECKIN_LABELS).map(([k, v]) => [k, v.text]),
+) as Record<CheckinKind, string>;
+
+export function durationText(minutes: number): string {
+  if (minutes % 60 === 0) return minutes === 60 ? '1 Stunde' : `${minutes / 60} Stunden`;
+  return `${minutes} Minuten`;
+}
+
 export interface DescribeNames {
+  /** How I see someone (my nickname for them, if I gave one). */
   contactName: (key: string) => string;
+  /** The name they chose, which is what messages to others say. Defaults to `contactName`. */
+  sentName?: (key: string) => string;
   placeName: (placeId: string) => string;
 }
 
@@ -40,15 +69,14 @@ function describeTrigger(t: Trigger, n: DescribeNames): string {
         : `Wenn ${who(t.contact, n)} das Teilen beendet`;
     case 'contact.message':
       return `Wenn ${who(t.contact, n)} schreibt${t.contains ? ` und „${t.contains}“ darin vorkommt` : ''}`;
-    case 'contact.ping': {
-      const what =
-        t.kind === 'help-carry'
-          ? 'um Hilfe beim Tragen bittet'
-          : t.kind === 'pickup-request'
-            ? 'abgeholt werden möchte'
-            : 'dich anstupst';
-      return `Wenn ${who(t.contact, n)} ${what}`;
-    }
+    case 'contact.ping':
+      return `Wenn ${who(t.contact, n)} ${PING_TRIGGER_TEXT[t.kind ?? 'custom']}`;
+    case 'contact.checkin':
+      return t.kind
+        ? `Wenn ${who(t.contact, n)} „${CHECKIN_TEXT[t.kind]}“ meldet`
+        : `Wenn ${who(t.contact, n)} sich meldet`;
+    case 'contact.sos':
+      return `Wenn ${who(t.contact, n)} einen Notruf sendet`;
     case 'me.arrive':
       return `Wenn ich bei „${n.placeName(t.place)}“ ankomme`;
     case 'me.leave':
@@ -69,10 +97,14 @@ function describeCondition(c: Condition, n: DescribeNames): string {
   }
 }
 
-/** Shows `{{contact}}` etc. the way they will read when the rule fires. */
-function fillVariables(text: string, t: Trigger, n: DescribeNames): string {
+/**
+ * Shows `{{contact}}` etc. the way they will read when the rule fires. `out`: the text goes to
+ * other people, so it names the person the way they named themselves, never by my nickname.
+ */
+function fillVariables(text: string, t: Trigger, n: DescribeNames, out = true): string {
+  const person = out ? (n.sentName ?? n.contactName) : n.contactName;
   return text.replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (_, name: string) => {
-    if (name === 'contact' && 'contact' in t) return t.contact === 'any' ? '[Person]' : n.contactName(t.contact);
+    if (name === 'contact' && 'contact' in t) return t.contact === 'any' ? '[Person]' : person(t.contact);
     if (name === 'place' && 'place' in t && t.place) return t.on.startsWith('me.') ? n.placeName(t.place) : t.place;
     if (name === 'eta') return 'in X min';
     const label: Record<string, string> = { place: 'Ort', destination: 'Ziel', text: 'Nachricht' };
@@ -83,13 +115,21 @@ function fillVariables(text: string, t: Trigger, n: DescribeNames): string {
 function describeAction(a: Action, n: DescribeNames, t: Trigger): string {
   switch (a.do) {
     case 'notify':
-      return `zeige „${fillVariables(a.title, t, n)}“ an`;
+      return `zeige „${fillVariables(a.title, t, n, false)}“ an`;
     case 'send_ping': {
       const to = n.contactName(a.to);
-      if (a.kind === 'help-carry') return `bitte ${to} um Hilfe beim Tragen`;
-      if (a.kind === 'pickup-request') return `bitte ${to}, dich abzuholen`;
-      return `schicke ${to} „${fillVariables(a.text ?? '👋', t, n)}“`;
+      // Its own text replaces the label for every kind of ping (see `pingText`): it is what they read.
+      if (a.text?.trim()) return `schicke ${to} „${PING_LABELS[a.kind].emoji} ${fillVariables(a.text, t, n)}“`;
+      return `schicke ${to} „${PING_ACTION_TEXT[a.kind]}“`;
     }
+    case 'send_message':
+      return `schreibe ${n.contactName(a.to)} „${fillVariables(a.text, t, n)}“`;
+    case 'send_checkin':
+      return `melde ${a.to.map(n.contactName).join(', ')} „${a.text ? fillVariables(a.text, t, n) : CHECKIN_TEXT[a.kind]}“`;
+    case 'set_dnd':
+      return a.minutes === 0 ? 'schalte den Ruhemodus aus' : `schalte den Ruhemodus für ${durationText(a.minutes)} an`;
+    case 'set_status':
+      return `setze deinen Status auf „${[a.emoji, fillVariables(a.text, t, n)].filter(Boolean).join(' ')}“`;
     case 'start_trip':
       return `teile deine Ankunftszeit nach „${n.placeName(a.destination)}“ mit ${a.to.map(n.contactName).join(', ')}`;
   }

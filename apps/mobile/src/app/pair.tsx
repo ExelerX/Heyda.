@@ -1,153 +1,269 @@
-import { INVITE_TTL_MS, type Contact } from '@heyda/core';
+import { decodeInvite, INVITE_TTL_MS } from '@heyda/core';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { router } from 'expo-router';
+import * as Clipboard from 'expo-clipboard';
+import { router, Stack } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { Platform, TextInput, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, useWindowDimensions, View } from 'react-native';
+import { errorText } from '../components/social/format';
+import { Field, Narrow, Segmented } from '../components/social/kit';
+import { LIMITS } from '../components/social/limits';
 import { QrCode } from '../components/QrCode';
-import { Button, Card, Chip, Hint, Row, Screen, T } from '../components/ui';
-import { timeLeft } from '../lib/format';
-import { useRuntime, useSnapshot, useTick } from '../lib/store';
+import { Button, Card, Hint, Row, Screen, T } from '../components/ui';
+import { isDesktop, isNative } from '../lib/platform';
+import { useRuntime, useSnapshot } from '../lib/store';
+import { useNow } from '../components/social/useNow';
 import { radius, spacing, useTheme } from '../lib/theme';
 
-type Mode = 'show' | 'scan';
+type Tab = 'show' | 'scan';
+
+const openContact = (key: string) => router.replace({ pathname: '/contact/[key]', params: { key, added: '1' } });
 
 export default function Pair() {
-  const runtime = useRuntime();
-  const { state } = useSnapshot();
-  const [mode, setMode] = useState<Mode>('show');
-  const [added, setAdded] = useState<Contact>();
+  const { state, isDemo } = useSnapshot();
+  const [tab, setTab] = useState<Tab>('show');
   const known = useRef(new Set(state.contacts.map((c) => c.key)));
 
-  // Someone scanned my code: their hello arrives and they show up as a new contact.
+  // Someone scanned my code: their confirmation arrives and they show up as a new contact.
   useEffect(() => {
     const fresh = state.contacts.find((c) => !known.current.has(c.key));
-    if (fresh) setAdded(fresh);
-  }, [state.contacts]);
-
-  if (added) return <Added contact={added} safety={runtime.safetyNumberWith(added.key)} />;
+    if (fresh && tab === 'show') openContact(fresh.key);
+    state.contacts.forEach((c) => known.current.add(c.key));
+  }, [state.contacts, tab]);
 
   return (
     <Screen edges={['bottom']}>
-      <Row>
-        <Chip label="Mein Code" icon="📱" selected={mode === 'show'} onPress={() => setMode('show')} />
-        <Chip label="Code scannen" icon="📷" selected={mode === 'scan'} onPress={() => setMode('scan')} />
-      </Row>
-      {mode === 'show' ? <ShowCode /> : <ScanCode onAdded={setAdded} />}
+      <Stack.Screen options={{ title: 'Freund hinzufügen' }} />
+      <Narrow>
+        <Segmented
+          options={[
+            { key: 'show', label: '📱 Mein Code' },
+            { key: 'scan', label: '📷 Code scannen' },
+          ]}
+          value={tab}
+          onChange={setTab}
+        />
+        <Hint>
+          So geht’s: Einer zeigt seinen Code, der andere scannt ihn – das reicht. Wer scannt, hat den anderen sofort in den
+          Kontakten; beim Handy mit dem Code kommt die Bestätigung ein paar Sekunden später an (es braucht Internet). Jeder Code
+          gilt 10 Minuten und nur einmal.
+        </Hint>
+        {isDemo ? (
+          <T variant="small">🧪 Im Demo-Modus sind Lisa, Max und Oma Ilse schon da. Hier kannst du dir den Ablauf ansehen.</T>
+        ) : null}
+        {tab === 'show' ? <ShowCode /> : <ScanCode />}
+      </Narrow>
     </Screen>
   );
 }
 
 function ShowCode() {
+  const t = useTheme();
   const runtime = useRuntime();
-  const now = useTick(1000);
-  const [invite, setInvite] = useState(() => ({ text: runtime.createInvite(), expiresAt: Date.now() + INVITE_TTL_MS }));
-  const expired = now >= invite.expiresAt;
+  const { width } = useWindowDimensions();
+  const now = useNow(1000);
+  const [invite, setInvite] = useState(() => ({ text: runtime.node.createInvite(), expiresAt: Date.now() + INVITE_TTL_MS }));
+  const [copied, setCopied] = useState(false);
+  const left = invite.expiresAt - now;
+  const expired = left <= 0;
+  const size = Math.max(180, Math.min(280, width - 96));
+
+  const renew = () => {
+    setInvite({ text: runtime.node.createInvite(), expiresAt: Date.now() + INVITE_TTL_MS });
+    setCopied(false);
+  };
+
+  async function copy() {
+    try {
+      await Clipboard.setStringAsync(invite.text);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  const mmss = `${Math.floor(Math.max(0, left) / 60_000)}:${String(Math.floor((Math.max(0, left) % 60_000) / 1000)).padStart(2, '0')}`;
 
   return (
-    <View style={{ gap: spacing.lg, marginTop: spacing.md }}>
-      <T variant="muted">Lass die andere Person diesen Code mit ihrer App scannen. Am besten, wenn ihr nebeneinander steht.</T>
+    <View style={{ gap: spacing.md }}>
+      <T variant="muted">Lass deinen Freund diesen Code mit Heyda. scannen. Am besten, wenn ihr nebeneinander steht.</T>
       {expired ? (
-        <Card style={{ alignItems: 'center' }}>
-          <T variant="h2">Code abgelaufen</T>
+        <Card style={{ alignItems: 'center', gap: spacing.md, paddingVertical: spacing.xl }}>
+          <T variant="h2">⌛ Code abgelaufen</T>
+          <T variant="small" style={{ textAlign: 'center' }}>
+            Aus Sicherheitsgründen gilt jeder Code nur 10 Minuten.
+          </T>
+          <Button title="Neuen Code zeigen" onPress={renew} />
         </Card>
       ) : (
-        <QrCode value={invite.text} label="Dein Einladungs-Code" />
+        <>
+          <QrCode value={invite.text} size={size} label={`Dein Kontakt-Code für Heyda., noch ${mmss} Minuten gültig`} />
+          <Row style={{ justifyContent: 'center' }} gap={spacing.sm}>
+            <ActivityIndicator color={t.accent} size="small" />
+            <T variant="small">{`Warte auf den Scan … noch ${mmss} gültig`}</T>
+          </Row>
+        </>
       )}
-      <T variant="small" style={{ textAlign: 'center' }}>
-        {expired ? 'Aus Sicherheitsgründen gilt jeder Code nur 10 Minuten.' : `Nur einmal gültig · ${timeLeft(invite.expiresAt, now)}`}
+      <Row gap={spacing.sm} style={{ flexWrap: 'wrap' }}>
+        {!expired ? <Button title="Neuer Code" icon="🔄" kind="secondary" compact onPress={renew} style={{ flexGrow: 1 }} /> : null}
+        {!expired ? (
+          <Button
+            title={copied ? 'Kopiert ✓' : 'Als Text kopieren'}
+            icon="📋"
+            kind="secondary"
+            compact
+            onPress={() => void copy()}
+            style={{ flexGrow: 1 }}
+          />
+        ) : null}
+      </Row>
+      <T variant="small">
+        Den Text brauchst du nur, wenn dein Freund den Code nicht scannen kann (z. B. am Computer). Schick ihn nur direkt an diese
+        Person – wer den Text hat, kann sich einmal als Kontakt eintragen.
       </T>
-      <Button
-        title="Neuer Code"
-        kind="secondary"
-        onPress={() => setInvite({ text: runtime.createInvite(), expiresAt: Date.now() + INVITE_TTL_MS })}
-      />
     </View>
   );
 }
 
-function ScanCode({ onAdded }: { onAdded: (c: Contact) => void }) {
+function ScanCode() {
   const t = useTheme();
   const runtime = useRuntime();
-  const [permission, requestPermission] = useCameraPermissions();
+  const [text, setText] = useState('');
   const [error, setError] = useState<string>();
-  const [pasted, setPasted] = useState('');
-  const busy = useRef(false);
-  const web = Platform.OS === 'web';
+  const [busy, setBusy] = useState(false);
+  const [paste, setPaste] = useState(!isNative);
+  const last = useRef<{ data: string; at: number }>({ data: '', at: 0 });
 
-  async function accept(text: string) {
-    if (busy.current) return;
-    busy.current = true;
+  async function accept(raw: string, fromCamera = false) {
+    const code = raw.trim();
+    if (!code || busy) return;
+    // The camera reports the same code many times per second.
+    if (fromCamera && last.current.data === code && Date.now() - last.current.at < 3000) return;
+    last.current = { data: code, at: Date.now() };
+    setBusy(true);
     setError(undefined);
     try {
-      onAdded(await runtime.acceptInvite(text.trim()));
+      const decoded = decodeInvite(code);
+      const already = decoded.ok && runtime.getSnapshot().state.contacts.some((c) => c.key === decoded.invite.key);
+      // Also for someone already added: it sends the confirmation again, in case they lost me.
+      const contact = await runtime.node.acceptInvite(code);
+      if (already) router.replace({ pathname: '/contact/[key]', params: { key: contact.key } });
+      else openContact(contact.key);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unbekannter Code');
-      setTimeout(() => (busy.current = false), 1500);
+      setError(errorText(e));
+      setBusy(false);
     }
   }
 
-  if (web) {
-    return (
-      <View style={{ gap: spacing.md, marginTop: spacing.md }}>
-        <Hint>Im Browser gibt es keinen Scanner. Füge den Code-Text ein (beginnt mit „heyda:1:“).</Hint>
-        <TextInput
-          value={pasted}
-          onChangeText={setPasted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          placeholder="heyda:1:…"
-          placeholderTextColor={t.textMuted}
-          accessibilityLabel="Einladungs-Code"
-          style={{ backgroundColor: t.surface, borderColor: t.border, borderWidth: 1, borderRadius: radius.md, color: t.text, padding: spacing.md }}
-        />
-        {error && <T color={t.danger}>{error}</T>}
-        <Button title="Hinzufügen" onPress={() => void accept(pasted)} disabled={!pasted.trim()} />
-      </View>
-    );
-  }
-
-  if (!permission?.granted) {
-    return (
-      <View style={{ gap: spacing.md, marginTop: spacing.md }}>
-        <T variant="muted">Die Kamera wird nur zum Scannen des Codes benutzt. Es werden keine Bilder gespeichert.</T>
-        <Button title="Kamera erlauben" icon="📷" onPress={() => void requestPermission()} />
-      </View>
-    );
+  async function pasteFromClipboard() {
+    try {
+      const s = await Clipboard.getStringAsync();
+      if (s) {
+        setText(s.slice(0, LIMITS.invite));
+        void accept(s);
+      }
+    } catch {
+      setError('Die Zwischenablage konnte nicht gelesen werden. Füge den Text von Hand ein.');
+    }
   }
 
   return (
-    <View style={{ gap: spacing.md, marginTop: spacing.md }}>
-      <View style={{ borderRadius: radius.lg, overflow: 'hidden', aspectRatio: 1, borderWidth: 2, borderColor: t.accent }}>
+    <View style={{ gap: spacing.md }}>
+      {isNative ? <NativeScanner onCode={(d) => void accept(d, true)} onDenied={() => setPaste(true)} busy={busy} /> : null}
+      {!isNative ? (
+        <Hint>
+          {isDesktop
+            ? 'Am Computer gibt es keinen Scanner. Lass dir den Code als Text schicken („Als Text kopieren“ beim anderen) und füge ihn hier ein.'
+            : 'Hier gibt es keinen Scanner. Füge den Code als Text ein (beginnt mit „heyda:1:“).'}
+        </Hint>
+      ) : null}
+
+      {error ? (
+        <Card style={{ borderColor: t.danger }}>
+          <T color={t.danger}>{`⚠️ ${error}`}</T>
+        </Card>
+      ) : null}
+
+      {paste ? (
+        <View style={{ gap: spacing.sm }}>
+          <Field
+            label="Code als Text"
+            value={text}
+            onChangeText={(v) => {
+              setText(v);
+              setError(undefined);
+            }}
+            maxLength={LIMITS.invite}
+            placeholder="heyda:1:…"
+            autoCapitalize="none"
+            autoCorrect={false}
+            multiline
+          />
+          <Row gap={spacing.sm} style={{ flexWrap: 'wrap' }}>
+            <Button title="Hinzufügen" icon="🤝" onPress={() => void accept(text)} disabled={!text.trim()} busy={busy} style={{ flexGrow: 1 }} />
+            <Button title="Einfügen" icon="📋" kind="secondary" onPress={() => void pasteFromClipboard()} style={{ flexGrow: 1 }} />
+          </Row>
+        </View>
+      ) : (
+        <Button title="Code stattdessen als Text einfügen" kind="ghost" compact onPress={() => setPaste(true)} />
+      )}
+    </View>
+  );
+}
+
+function NativeScanner({ onCode, onDenied, busy }: { onCode: (data: string) => void; onDenied: () => void; busy: boolean }) {
+  const t = useTheme();
+  const [permission, requestPermission] = useCameraPermissions();
+  const denied = permission && !permission.granted && !permission.canAskAgain;
+
+  useEffect(() => {
+    if (denied) onDenied();
+  }, [denied]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!permission) return <ActivityIndicator color={t.accent} />;
+  if (!permission.granted) {
+    return (
+      <Card style={{ gap: spacing.md }}>
+        <T variant="h2">📷 Kamera zum Scannen</T>
+        <T variant="muted">Die Kamera wird nur zum Lesen des Codes benutzt. Es werden keine Bilder gespeichert oder verschickt.</T>
+        {denied ? (
+          <T variant="small">Der Kamerazugriff ist in den Einstellungen deines Handys ausgeschaltet. Du kannst den Code unten auch als Text einfügen.</T>
+        ) : (
+          <Button title="Kamera erlauben" icon="📷" onPress={() => void requestPermission()} />
+        )}
+      </Card>
+    );
+  }
+  return (
+    <View style={{ gap: spacing.sm }}>
+      <View
+        style={{
+          borderRadius: radius.lg,
+          overflow: 'hidden',
+          aspectRatio: 1,
+          width: '100%',
+          maxWidth: 420,
+          alignSelf: 'center',
+          borderWidth: 2,
+          borderColor: t.accent,
+        }}
+      >
         <CameraView
           style={{ flex: 1 }}
           facing="back"
           barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
-          onBarcodeScanned={({ data }) => void accept(data)}
+          onBarcodeScanned={busy ? undefined : ({ data }) => onCode(data)}
+          accessibilityLabel="Kamera-Vorschau zum Scannen des Codes"
         />
+        {busy ? (
+          <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}>
+            <View style={[StyleSheet.absoluteFill, { backgroundColor: t.bg, opacity: 0.5 }]} />
+            <ActivityIndicator color={t.accent} size="large" />
+          </View>
+        ) : null}
       </View>
-      {error ? <T color={t.danger}>{error}</T> : <T variant="small">Halte die Kamera auf den Code der anderen Person.</T>}
-    </View>
-  );
-}
-
-function Added({ contact, safety }: { contact: Contact; safety: string }) {
-  const t = useTheme();
-  return (
-    <Screen edges={['bottom']}>
-      <T variant="title">🎉 {contact.name} ist dabei</T>
-      <T variant="muted">
-        Vergleicht jetzt kurz eure Sicherheitsnummer. Stimmt sie auf beiden Handys überein, kann sich niemand dazwischen
-        geschaltet haben.
+      <T variant="small" style={{ textAlign: 'center' }}>
+        Halte die Kamera auf den Code deines Freundes.
       </T>
-      <Card style={{ alignItems: 'center' }}>
-        <T style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 22, letterSpacing: 2, textAlign: 'center' }} color={t.text}>
-          {safety}
-        </T>
-      </Card>
-      <View style={{ gap: spacing.md, marginTop: spacing.lg }}>
-        <Button title="Zum Kontakt" onPress={() => router.replace(`/contact/${contact.key}`)} />
-        <Button title="Fertig" kind="secondary" onPress={() => router.back()} />
-      </View>
-    </Screen>
+    </View>
   );
 }

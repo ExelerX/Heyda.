@@ -1,0 +1,324 @@
+# Builds and tests every part of Heyda. Called by ci.yml (pull requests, main) and release.yml (tags).
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      ios:
+        description: Also build the iPhone app (macOS runner, expensive)
+        type: boolean
+        default: false
+      ref:
+        description: Git ref to build, e.g. refs/tags/v1.0.0 (empty = the commit that triggered the run)
+        type: string
+        default: ''
+    # Only release.yml passes these; pull request and main builds are signed with the test key.
+    secrets:
+      HEYDA_ANDROID_KEYSTORE_BASE64:
+        required: false
+      HEYDA_ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      HEYDA_ANDROID_KEY_ALIAS:
+        required: false
+      HEYDA_ANDROID_KEY_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  EXPO_NO_TELEMETRY: '1'
+  # Electron is only needed on Windows; skip its download elsewhere.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  test:
+    name: Typecheck, tests, web
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: bash scripts/ci-run.sh "Typecheck" npm run typecheck
+      - run: bash scripts/ci-run.sh "Tests" npm test
+      - name: Web export
+        run: bash scripts/ci-run.sh "Web export" npm run export:web -w mobile
+      - name: Web smoke test (demo mode in Chromium)
+        run: |
+          npx playwright install --with-deps chromium
+          bash scripts/ci-run.sh "Web smoke test" npm run smoke:web -w mobile -- --out web-smoke
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: web-smoke
+          path: apps/mobile/web-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - run: npm ci
+      - name: Version
+        id: version
+        run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
+      - name: Signing key (only if the repository has one)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.HEYDA_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.HEYDA_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.HEYDA_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.HEYDA_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::notice::No signing key configured: the APK is signed with the public test key."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/heyda-release.keystore"
+          {
+            echo "HEYDA_ANDROID_KEYSTORE=$RUNNER_TEMP/heyda-release.keystore"
+            echo "HEYDA_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "HEYDA_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "HEYDA_ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+      - name: Generate the native project
+        working-directory: apps/mobile
+        env:
+          HEYDA_VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          bash ../../scripts/ci-run.sh "Android native project" npx expo prebuild --platform android --no-install
+          # More memory for Gradle; ABIs: phones (arm) plus x86_64 for the emulator test.
+          sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g/' android/gradle.properties
+          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86_64/' android/gradle.properties
+      - name: Build
+        working-directory: apps/mobile/android
+        run: bash ../../../scripts/ci-run.sh "Android build" ./gradlew assembleRelease --no-daemon --stacktrace
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk "out/Heyda-${{ steps.version.outputs.version }}-android.apk"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+  android-smoke:
+    name: Android emulator test
+    needs: android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: android-apk
+          path: apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Start the app on an emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash scripts/ci-run.sh "Android emulator test" bash scripts/android-smoke.sh apk android-smoke
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: android-smoke
+          path: android-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  windows:
+    name: Windows installer
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: ''
+      # No code signing certificate: build unsigned instead of searching for one.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    # The repository name ends in a dot, so the workspace (D:\a\Heyda.\Heyda.) is a path Windows
+    # cannot use: it drops the trailing dot and actions/checkout fails with "Directory ... does not
+    # exist". Everything on Windows therefore happens in a plain folder of its own.
+    defaults:
+      run:
+        working-directory: C:\heyda
+    steps:
+      - name: Check out into C:\heyda
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          REF: ${{ inputs.ref || github.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q /c/heyda
+          cd /c/heyda
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          # The token is passed for this one fetch only and never written to the git config.
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git -c http.extraheader="$AUTH" fetch -q --depth 1 --no-tags origin "$REF"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='Building %H'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # No npm cache here: setup-node looks for package-lock.json in the unusable workspace.
+          node-version: ${{ env.NODE_VERSION }}
+      - name: npm ci
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows npm ci" npm ci
+      - name: Version
+        id: version
+        shell: bash
+        run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
+      - name: Web export
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows web export" npm run export:web -w mobile
+      - name: Prepare the web app for the desktop app
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows prepare-web" npm run prepare-web -w desktop
+      - name: Build the desktop app
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows desktop build" npm run build -w desktop
+      - name: Package the installer
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows installer" npm run dist:win -w desktop
+      # The setup.exe that is published, not just the files it contains: install it silently for the
+      # current user, check the installed app and its Start menu shortcut, then uninstall it again.
+      - name: Install the setup, start the installed app and check it, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path "apps/desktop/dist/Heyda-Setup-${{ steps.version.outputs.version }}.exe").Path
+          $p = Start-Process -FilePath $setup -ArgumentList '/S', '/currentuser' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Setup failed with exit code $($p.ExitCode)" }
+          $exe = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Filter 'Heyda.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "The setup did not install Heyda.exe for the current user" }
+          $dir = Split-Path -Parent $exe
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Heyda.lnk'
+          if (-not (Test-Path $shortcut)) { throw "The setup did not create the Start menu shortcut" }
+          npm run smoke -w desktop -- --exe "$exe" --out ../../windows-smoke/smoke.png
+          if ($LASTEXITCODE -ne 0) { throw "The installed app failed its smoke test" }
+          Get-Process -Name Heyda -ErrorAction SilentlyContinue | Stop-Process -Force
+          # _?= runs the uninstaller in place, so -Wait waits for the real work (NSIS otherwise copies it to %TEMP% and returns at once).
+          $uninstaller = Get-ChildItem -Path $dir -Filter 'Uninstall*.exe' | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $uninstaller) { throw "The setup installed no uninstaller" }
+          $u = Start-Process -FilePath $uninstaller -ArgumentList '/S', '/currentuser', "_?=$dir" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "Uninstall failed with exit code $($u.ExitCode)" }
+          if (Test-Path $exe) { throw "The uninstaller left $exe behind" }
+          if (Test-Path $shortcut) { throw "The uninstaller left the Start menu shortcut behind" }
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "apps/desktop/dist/Heyda-Setup-${{ steps.version.outputs.version }}.exe" "out/Heyda-${{ steps.version.outputs.version }}-windows-setup.exe"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-installer
+          path: C:/heyda/out/*.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-smoke
+          path: C:/heyda/windows-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ios:
+    name: iPhone app (unsigned)
+    if: inputs.ios
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Newest stable Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_[0-9]*.app | grep -vi beta | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+      - run: npm ci
+      - name: Version
+        id: version
+        run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
+      - name: Generate the native project
+        working-directory: apps/mobile
+        run: |
+          bash ../../scripts/ci-run.sh "iPhone native project" npx expo prebuild --platform ios --no-install
+          cd ios && bash ../../../scripts/ci-run.sh "CocoaPods" pod install
+      - name: Build for the simulator
+        working-directory: apps/mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild -workspace Heyda.xcworkspace -scheme Heyda -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/dd-sim" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            build > "$RUNNER_TEMP/xcode-sim.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-sim.log"; bash ../../../scripts/ci-annotate.sh "$RUNNER_TEMP/xcode-sim.log" "iPhone simulator build"; exit 1; }
+      - name: Start the app on a simulator
+        run: bash scripts/ci-run.sh "iPhone simulator test" bash scripts/ios-smoke.sh "$RUNNER_TEMP/dd-sim/Build/Products/Release-iphonesimulator/Heyda.app" ios-smoke
+      - name: Build for iPhone (unsigned)
+        working-directory: apps/mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild -workspace Heyda.xcworkspace -scheme Heyda -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Heyda.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive > "$RUNNER_TEMP/xcode-device.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-device.log"; bash ../../../scripts/ci-annotate.sh "$RUNNER_TEMP/xcode-device.log" "iPhone device build"; exit 1; }
+      - name: Package IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/ipa/Payload" out
+          cp -R "$RUNNER_TEMP/Heyda.xcarchive/Products/Applications/Heyda.app" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/out/Heyda-${{ steps.version.outputs.version }}-iphone-unsigned.ipa" Payload)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ipa
+          path: out/*.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: ios-smoke
+          path: |
+            ios-smoke
+            ${{ runner.temp }}/xcode-*.log
+          if-no-files-found: ignore
+          retention-days: 14

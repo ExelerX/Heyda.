@@ -258,20 +258,33 @@ export function Toggle({ label, detail, value, onChange }: {
   onChange: (v: boolean) => void;
 }) {
   const t = useTheme();
+  const set = (v: boolean) => {
+    tap();
+    onChange(v);
+  };
   return (
-    <Row style={{ justifyContent: 'space-between', minHeight: TOUCH }} gap={spacing.md}>
-      <View style={{ flex: 1, gap: 2 }}>
+    <Row style={{ minHeight: TOUCH }} gap={0}>
+      {/* Tapping the text switches too: the switch alone is a small target. It is a sibling, not a
+          parent of the switch (a tap there must not count twice), and screen readers and the
+          keyboard keep using the switch itself, which carries the label. */}
+      <Pressable
+        onPress={() => set(!value)}
+        accessible={false}
+        tabIndex={-1}
+        style={{ flex: 1, gap: 2, minHeight: TOUCH, justifyContent: 'center', paddingRight: spacing.md }}
+      >
         <T>{label}</T>
         {detail ? <T variant="small">{detail}</T> : null}
-      </View>
+      </Pressable>
       <Switch
         value={value}
-        onValueChange={(v) => {
-          tap();
-          onChange(v);
-        }}
+        onValueChange={set}
+        // react-native-web draws it 40×20 by default (also in the Windows app); the phones' own are bigger.
+        style={Platform.OS === 'web' ? { height: 28 } : undefined}
         trackColor={{ true: t.accent, false: t.border }}
         thumbColor="#FFFFFF"
+        // react-native-web colours the "on" thumb separately (not in the native types).
+        {...((Platform.OS === 'web' ? { activeThumbColor: '#FFFFFF' } : {}) as object)}
         accessibilityLabel={label}
       />
     </Row>
@@ -327,5 +340,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
   },
   buttonCompact: { minHeight: TOUCH, paddingHorizontal: spacing.md },
-  chip: { minHeight: 40, borderRadius: radius.pill, borderWidth: 1, paddingHorizontal: 14, justifyContent: 'center' },
+  chip: { minHeight: TOUCH, borderRadius: radius.pill, borderWidth: 1, paddingHorizontal: 14, justifyContent: 'center' },
 });

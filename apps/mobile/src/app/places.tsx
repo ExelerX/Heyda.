@@ -1,134 +1,114 @@
-import { randomId } from '@heyda/core';
-import { useState } from 'react';
-import { Pressable, Text, TextInput, View } from 'react-native';
-import { Button, Card, Chip, Empty, Hint, Row, Screen, Section, T, Wrap } from '../components/ui';
-import { currentPosition, locationSupported, MAX_REGIONS, requestLocationAccess } from '../lib/location';
-import { useRuntime, useSnapshot } from '../lib/store';
-import { radius, spacing, TOUCH, useTheme } from '../lib/theme';
-
-const RADII = [100, 200, 400];
-const NAMES = ['Zuhause', 'Arbeit', 'Schule', 'Supermarkt', 'Sport'];
-/** Demo places sit around a made-up spot; the real location is never used in demo mode. */
-const DEMO_CENTER = { lat: 52.5208, lon: 13.4094 };
+import { contactLabel } from '@heyda/core';
+import { router, Stack } from 'expo-router';
+import { useEffect, useState } from 'react';
+import { Text, View } from 'react-native';
+import { Banner, Narrow } from '../components/setup/kit';
+import { TileMap } from '../components/TileMap';
+import { Button, Card, Empty, Hint, Row, Screen, Section, T } from '../components/ui';
+import { notice } from '../lib/confirm';
+import { currentLocationAccess, locationSupported, MAX_REGIONS, requestLocationAccess, type LocationAccess } from '../lib/location';
+import { isDesktop } from '../lib/platform';
+import { useSnapshot } from '../lib/store';
+import { spacing, useTheme } from '../lib/theme';
 
 export default function Places() {
   const t = useTheme();
-  const runtime = useRuntime();
-  const { state, isDemo } = useSnapshot();
-  const [name, setName] = useState('');
-  const [radiusM, setRadiusM] = useState(RADII[0]!);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string>();
+  const { state, settings, isDemo } = useSnapshot();
+  const [access, setAccess] = useState<LocationAccess>();
   const full = state.places.length >= MAX_REGIONS;
 
-  async function addHere() {
-    setBusy(true);
-    setMessage(undefined);
+  useEffect(() => {
+    if (locationSupported && !isDemo) void currentLocationAccess().then(setAccess).catch(() => {});
+  }, [isDemo]);
+
+  async function askAlways() {
     try {
-      let center = { lat: DEMO_CENTER.lat + state.places.length * 0.004, lon: DEMO_CENTER.lon };
-      if (locationSupported && !isDemo) {
-        const access = await requestLocationAccess();
-        if (access === 'denied') {
-          setMessage('Ohne Standortzugriff kann die App den Ort nicht speichern.');
-          return;
-        }
-        if (access === 'while-using') {
-          setMessage('Gespeichert. Für Ankunft und Abfahrt bei geschlossener App braucht es „Immer erlauben“.');
-        }
-        const pos = await currentPosition();
-        center = { lat: pos.lat, lon: pos.lon };
-      }
-      runtime.savePlace({ id: randomId(10), name: name.trim(), center, radiusM });
-      setName('');
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+      const a = await requestLocationAccess();
+      setAccess(a);
+      if (a !== 'always') notice('Noch nicht „Immer“', 'Öffne die Einstellungen deines Handys → Heyda. → Standort und wähle „Immer erlauben“.');
+    } catch {
+      notice('Das hat nicht geklappt', 'Öffne die Einstellungen deines Handys → Heyda. → Standort.');
     }
   }
 
+  const viewersOf = (placeId: string) =>
+    state.contacts.filter((c) => state.grants.some((g) => g.contactKey === c.key && g.placeIds.includes(placeId)));
+
   return (
     <Screen edges={['bottom']}>
-      <Hint>Orte bleiben auf deinem Handy. Freunde, denen du einen Ort freigibst, sehen nur den Namen, nie die Koordinaten.</Hint>
+      <Stack.Screen options={{ title: 'Meine Orte' }} />
+      <Narrow>
+        <Hint>
+          Deine Orte bleiben auf deinem Gerät. Freunde, denen du einen Ort freigibst, bekommen nur „ist angekommen“ oder „ist losgegangen“ mit dem Namen. Nie die Koordinaten.
+        </Hint>
 
-      {state.places.length === 0 ? (
-        <Empty icon="📍" title="Noch keine Orte" text="Speichere z. B. Zuhause oder die Arbeit, um Ankunft und Abfahrt zu teilen." />
-      ) : (
-        state.places.map((p) => {
-          const viewers = state.contacts.filter((c) =>
-            state.grants.some((g) => g.contactKey === c.key && g.placeIds.includes(p.id)),
-          );
-          return (
-            <Card key={p.id}>
-              <Row style={{ justifyContent: 'space-between' }}>
-                <T variant="h2">📍 {p.name}</T>
-                <T variant="small">{p.radiusM} m</T>
-              </Row>
-              <T variant="small">Wer sieht Ankunft und Abfahrt hier?</T>
-              <Wrap>
-                {state.contacts.map((c) => {
-                  const on = viewers.includes(c);
-                  const current = state.grants.find((g) => g.contactKey === c.key)?.placeIds ?? [];
-                  return (
-                    <Chip
-                      key={c.key}
-                      label={c.name}
-                      selected={on}
-                      onPress={() =>
-                        runtime.setPlaceGrant(c.key, on ? current.filter((id) => id !== p.id) : [...current, p.id])
-                      }
-                    />
-                  );
-                })}
-                {!state.contacts.length && <T variant="small">Noch keine Kontakte.</T>}
-              </Wrap>
-              <Row style={{ justifyContent: 'flex-end' }}>
-                <Pressable
-                  onPress={() => runtime.removePlace(p.id)}
-                  accessibilityRole="button"
-                  accessibilityLabel={`${p.name} löschen`}
-                  style={{ minHeight: TOUCH, justifyContent: 'center', paddingHorizontal: spacing.sm }}
-                >
-                  <Text style={{ color: t.danger, fontWeight: '600' }}>Löschen</Text>
-                </Pressable>
-              </Row>
-            </Card>
-          );
-        })
-      )}
+        {isDemo && <Banner tone="info" icon="🎮">Demo: Die Orte liegen um einen erfundenen Punkt in Berlin. Dein echter Standort wird nicht benutzt.</Banner>}
+        {!isDemo && isDesktop && (
+          <Banner tone="info" icon="💻">
+            Am PC gibt es kein GPS. Anlegen und Bearbeiten geht hier trotzdem: Deine Orte gleichen sich mit deinem Handy ab, und das Handy erkennt Ankunft und Abfahrt.
+          </Banner>
+        )}
+        {access && access !== 'always' && state.places.length > 0 && (
+          <Banner tone="warn" title="Ankunft wird noch nicht erkannt">
+            <T variant="small" color={t.text}>
+              Damit dein Handy Ankunft und Abfahrt auch bei geschlossener App bemerkt, braucht Heyda. den Standort „Immer erlauben“.
+            </T>
+            <Button title="Standort erlauben" kind="ghost" compact onPress={() => void askAlways()} style={{ alignSelf: 'flex-start' }} />
+          </Banner>
+        )}
 
-      <Section title="Neuer Ort an meiner Position">
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          placeholder="Name, z. B. Zuhause"
-          placeholderTextColor={t.textMuted}
-          maxLength={60}
-          accessibilityLabel="Name des Ortes"
-          style={{ backgroundColor: t.surface, borderColor: t.border, borderWidth: 1, borderRadius: radius.md, color: t.text, fontSize: 16, padding: spacing.md }}
-        />
-        <Wrap>
-          {NAMES.map((n) => (
-            <Chip key={n} label={n} selected={name === n} onPress={() => setName(n)} />
-          ))}
-        </Wrap>
-        <T variant="small">Größe</T>
-        <Wrap>
-          {RADII.map((r) => (
-            <Chip key={r} label={`${r} m`} selected={radiusM === r} onPress={() => setRadiusM(r)} />
-          ))}
-        </Wrap>
-        <View style={{ gap: spacing.sm }}>
-          {message && <T variant="small" color={t.accent}>{message}</T>}
-          <Button
-            title={full ? `Höchstens ${MAX_REGIONS} Orte` : 'Hier speichern'}
-            icon="📍"
-            onPress={() => void addHere()}
-            disabled={!name.trim() || full}
-            busy={busy}
+        {settings.mapEnabled && state.places.length > 0 && (
+          <TileMap
+            height={220}
+            markers={state.places.map((p) => ({ id: p.id, lat: p.center.lat, lon: p.center.lon, label: p.name, kind: 'place' as const, accuracyM: p.radiusM }))}
           />
-        </View>
-      </Section>
+        )}
+
+        {state.places.length === 0 ? (
+          <Empty
+            icon="📍"
+            title="Noch keine Orte"
+            text="Speichere z. B. Zuhause, die Arbeit oder die Schule. Dann können Freunde, die du auswählst, „ist angekommen“ bekommen, und deine Automationen reagieren darauf."
+            action={<Button title="Ersten Ort anlegen" icon="📍" onPress={() => router.push('/place/new')} />}
+          />
+        ) : (
+          state.places.map((p) => {
+            const viewers = viewersOf(p.id);
+            return (
+              <Card key={p.id} onPress={() => router.push(`/place/${encodeURIComponent(p.id)}`)} label={`${p.name}, ${p.radiusM} Meter, bearbeiten`}>
+                <Row gap={spacing.md}>
+                  <Text style={{ fontSize: 24 }} accessible={false}>
+                    📍
+                  </Text>
+                  <View style={{ flex: 1, gap: 2 }}>
+                    <T variant="h2">{p.name}</T>
+                    <T variant="small">{`Umkreis ${p.radiusM} m`}</T>
+                    <T variant="small" color={viewers.length ? t.text : t.textMuted}>
+                      {viewers.length ? `🔔 Bescheid bekommen: ${viewers.map(contactLabel).join(', ')}` : '🔕 Niemand bekommt Bescheid'}
+                    </T>
+                  </View>
+                  <Text style={{ color: t.textMuted, fontSize: 22 }} accessible={false}>
+                    ›
+                  </Text>
+                </Row>
+              </Card>
+            );
+          })
+        )}
+
+        {state.places.length > 0 && (
+          <Section title="Neuer Ort">
+            {full ? (
+              <Banner tone="warn" title={`Höchstens ${MAX_REGIONS} Orte`}>
+                {`Dein Handy kann nur ${MAX_REGIONS} Orte gleichzeitig überwachen. Lösche einen, um einen neuen anzulegen.`}
+              </Banner>
+            ) : (
+              <Button title="Neuen Ort anlegen" icon="➕" onPress={() => router.push('/place/new')} />
+            )}
+            <T variant="small">{`${state.places.length} von ${MAX_REGIONS} Orten. Mehr kann ein Handy nicht gleichzeitig überwachen.`}</T>
+          </Section>
+        )}
+      </Narrow>
     </Screen>
   );
 }

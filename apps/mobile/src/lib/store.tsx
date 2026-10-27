@@ -1,11 +1,12 @@
+import { contactLabel } from '@heyda/core';
 import { createContext, useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { AppState } from 'react-native';
-import { registerGeofences } from './location';
+import { registerBackgroundSync } from './background';
 import { getRuntime, resetRuntime, type AppRuntime, type Snapshot } from './runtime';
 
 interface RuntimeContextValue {
   runtime: AppRuntime;
-  /** Rebuilds the runtime from storage, e.g. after switching demo mode or wiping. */
+  /** Rebuilds the runtime from storage, e.g. after switching demo mode, linking or restoring. */
   restart: () => Promise<void>;
 }
 
@@ -28,8 +29,7 @@ export function RuntimeProvider({
     try {
       const r = await getRuntime();
       setRuntime(r);
-      // Re-register on every start: Android forgets geofences after a reboot.
-      if (!r.isDemo) void registerGeofences(r.getSnapshot().state.places).catch(() => {});
+      if (!r.isDemo) void registerBackgroundSync().catch(() => {});
     } catch (e) {
       resetRuntime();
       setError(e instanceof Error ? e.message : String(e));
@@ -43,16 +43,19 @@ export function RuntimeProvider({
   useEffect(() => {
     if (!runtime) return;
     const sub = AppState.addEventListener('change', (state) => {
-      if (state !== 'active') void runtime.flush().catch(() => {});
+      if (state === 'active') void runtime.tick();
+      else void runtime.flush().catch(() => {});
     });
     return () => sub.remove();
   }, [runtime]);
 
   const restart = useCallback(async () => {
+    const old = runtime;
     resetRuntime();
     setRuntime(undefined);
+    await old?.shutdown(false).catch(() => {});
     await load();
-  }, [load]);
+  }, [load, runtime]);
 
   if (error) return <>{failed(error, () => void load())}</>;
   if (!runtime) return <>{loading}</>;
@@ -73,10 +76,34 @@ export function useSnapshot(): Snapshot {
   return useSyncExternalStore(r.subscribe, r.getSnapshot, r.getSnapshot);
 }
 
-/** Display name for a contact key, or a fallback for unknown keys. */
+/** Display name for a contact key (my nickname for them first), a group member, or "Jemand". */
 export function useContactName(): (key: string) => string {
   const { state } = useSnapshot();
-  return (key) => (key === 'any' ? 'Jemand' : state.contacts.find((c) => c.key === key)?.name ?? 'Unbekannt');
+  return (key) => {
+    if (key === 'any') return 'Jemand';
+    if (key === state.self.key) return 'Ich';
+    const c = state.contacts.find((x) => x.key === key);
+    if (c) return contactLabel(c);
+    for (const g of state.groups) {
+      const m = g.members.find((x) => x.key === key);
+      if (m) return m.name;
+    }
+    return 'Unbekannt';
+  };
+}
+
+/** The name someone chose for themselves, as automations write it to others (never my nickname for them). */
+export function useSentName(): (key: string) => string {
+  const { state } = useSnapshot();
+  const shown = useContactName();
+  return (key) => state.contacts.find((x) => x.key === key)?.name ?? shown(key);
+}
+
+/** Name of a chat thread: a contact or a group ("g:" + id). */
+export function useThreadName(): (thread: string) => string {
+  const { state } = useSnapshot();
+  const name = useContactName();
+  return (thread) => (thread.startsWith('g:') ? state.groups.find((g) => `g:${g.id}` === thread)?.name ?? 'Gruppe' : name(thread));
 }
 
 /** Re-renders every `ms` so relative times ("vor 3 min") stay fresh. */

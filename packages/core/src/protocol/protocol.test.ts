@@ -25,6 +25,13 @@ describe('protocol', () => {
     }
   });
 
+  it('ends an SOS for someone who was removed, and still reads the ends older versions send', () => {
+    for (const reason of ['safe', 'cancelled', 'removed'] as const) {
+      const m = composeMessage({ type: 'sos.end', sosId: 'sos-abcdefgh', reason }, 1);
+      expect(parseAppMessage(serializeAppMessage(m))).toEqual({ ok: true, message: m });
+    }
+  });
+
   it('rejects unknown types and extra fields', () => {
     const m = composeMessage({ type: 'chat.text', text: 'hi' });
     expect(parseAppMessage(JSON.stringify({ ...m, type: 'exec' })).ok).toBe(false);
@@ -33,6 +40,28 @@ describe('protocol', () => {
 
   it('rejects oversized payloads before parsing', () => {
     expect(parseAppMessage('"' + 'x'.repeat(MAX_MESSAGE_BYTES) + '"')).toEqual({ ok: false, error: 'message too large' });
+  });
+
+  it('accepts device-link hello and reveal only with a proper nonce and exactly 32 random bytes', () => {
+    const r32 = base64urlEncode(new Uint8Array(32).fill(0xab));
+    const hello = composeMessage({ type: 'link.hello', nonce: 'n'.repeat(20), rE: r32, relays: ['wss://relay.example.org'] }, 1);
+    const reveal = composeMessage({ type: 'link.reveal', nonce: 'n'.repeat(20), rN: r32 }, 1);
+    expect(parseAppMessage(serializeAppMessage(hello))).toEqual({ ok: true, message: hello });
+    expect(parseAppMessage(serializeAppMessage(reveal))).toEqual({ ok: true, message: reveal });
+    const bad = [
+      { ...reveal, rN: base64urlEncode(new Uint8Array(31)) },
+      { ...reveal, rN: base64urlEncode(new Uint8Array(33)) },
+      // 43 characters, but not the canonical encoding of 32 bytes.
+      { ...reveal, rN: r32.slice(0, 42) + 'B' },
+      { ...reveal, rN: r32.slice(0, 42) + '+' },
+      { ...reveal, nonce: 'short' },
+      { ...reveal, nonce: 'n'.repeat(19) + ':' },
+      { ...reveal, extra: 1 },
+      { ...hello, rE: 'x' },
+      { ...hello, relays: ['ws://plain.example'] },
+      { ...hello, relays: Array(9).fill('wss://relay.example.org') },
+    ];
+    for (const m of bad) expect(parseAppMessage(JSON.stringify(m)).ok).toBe(false);
   });
 
   it('refuses non-TLS relays', () => {

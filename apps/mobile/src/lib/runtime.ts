@@ -1,181 +1,471 @@
 import {
+  BUILTIN_TEMPLATES,
+  alarmAlert,
+  backupState,
   MemoryNetwork,
   SocialNode,
+  createInitialState,
+  decryptBackup,
+  encryptBackup,
   importPlugin,
+  normalizeState,
   randomId,
+  restoredState,
+  safetyNumber,
+  storedPlugins,
+  type Alarm,
+  type BackupContents,
+  type Alert,
+  type ChatEntry,
   type ContactKey,
   type ContactStatus,
+  type LinkStatus,
+  type LocationNeeds,
   type NodeState,
   type Place,
   type PlaceGrant,
   type Plugin,
   type Rule,
   type RuleTemplate,
-  type SessionLevel,
   type SharingSession,
-  BUILTIN_TEMPLATES,
-  safetyNumber,
 } from '@heyda/core';
-import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport } from '@heyda/transport-nostr';
+import { DEFAULT_RELAYS, MemorySeenStore, NostrTransport, type SeenSnapshot } from '@heyda/transport-nostr';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey } from 'nostr-tools/pure';
-import { Platform } from 'react-native';
 import { DEMO_KEYS, startDemoFriends } from './demo';
+import {
+  alarmsRang,
+  cancelAlarm,
+  clearNotifications,
+  deliverAlert,
+  onAlarmDone,
+  pruneAlarms,
+  scheduleAlarm,
+  setBadge,
+  setOpenThread as setNotificationThread,
+  showToast,
+} from './notifications';
+import { desktop, deviceLabel, isBrowserPreview, isDesktop } from './platform';
 import type { Appearance } from './theme';
-import { EncryptedFileVault, MemoryVault, type Vault } from './vault';
+import { DesktopVault, EncryptedFileVault, MemoryVault, type Vault } from './vault';
 
-export interface ChatMessage {
-  id: string;
-  from: 'me' | ContactKey;
-  text: string;
-  at: number;
-  kind: 'text' | 'ping';
-}
+export type { ChatEntry };
 
 export interface Settings {
-  displayName: string;
-  /** Demo mode: simulated friends in memory, nothing leaves the phone. */
-  demo: boolean;
   onboarded: boolean;
+  /** Demo mode: simulated friends in memory, nothing leaves the device. */
+  demo: boolean;
   /** Dark unless the person picks otherwise. */
   appearance?: Appearance;
+  /** Android: keep the connection open in the background (foreground service). */
+  keepAlive: boolean;
+  /** Show maps. Map tiles come from OpenStreetMap, which then sees the viewed area. */
+  mapEnabled: boolean;
+  /** After an SOS, also open an SMS to the emergency contacts' phone numbers. */
+  smsFallback: boolean;
+}
+
+/** `os`: the phone's OS has it, so it rings even with the app closed (see `deliverAlert`). */
+type SavedAlarm = Alarm & { os?: boolean };
+
+/** An alarm the phone's OS rang, or that was opened or swiped away, for the deadline due at `at`. */
+interface AlarmDone {
+  id: string;
+  at: number;
 }
 
 interface Persisted {
+  v: 2;
   state: NodeState;
-  chats: Record<ContactKey, ChatMessage[]>;
+  statuses: Record<ContactKey, ContactStatus>;
+  /** Per thread: a contact key, or "g:" plus a group id. */
+  chats: Record<string, ChatEntry[]>;
+  unread: Record<string, number>;
+  activity: Alert[];
+  /** Alarms scheduled with the OS, so they can be re-armed or cancelled later. */
+  alarms: SavedAlarm[];
   plugins: Plugin[];
   settings: Settings;
-  seen: { sync: number; ids: string[] };
+  /**
+   * What the seen store took in since its own file (`SEEN_FILE`) was last written (see
+   * `MemorySeenStore.journal`): small, saved with every change, so that file can be written rarely.
+   */
+  seenRecent?: SeenSnapshot;
   /** The running trip, so it survives the OS killing and relaunching the app. */
   trip?: SharingSession;
+  /** Set on a freshly linked device until my other devices were told about it. */
+  announceLinked?: boolean;
+  /** Phone alarms that rang or were opened or swiped away: they never ring again (see `noteAlarmDone`). */
+  alarmsDone?: AlarmDone[];
+  /**
+   * While the demo runs: the account as it was when the demo started. Ending the demo brings it
+   * back as it was, so nothing done in the demo (a watch or SOS for a real contact, a message, a
+   * group) ever reaches the real account.
+   */
+  beforeDemo?: Persisted;
 }
 
 export interface Snapshot {
   version: number;
   state: NodeState;
   statuses: Record<ContactKey, ContactStatus>;
-  chats: Record<ContactKey, ChatMessage[]>;
+  chats: Record<string, ChatEntry[]>;
+  unread: Record<string, number>;
+  unreadTotal: number;
+  activity: Alert[];
   activeTrip: SharingSession | undefined;
+  /** Minutes to the destination of my running trip, once known. */
+  activeTripEta: number | undefined;
   templates: RuleTemplate[];
+  plugins: Plugin[];
   settings: Settings;
   isDemo: boolean;
+  dndActive: boolean;
+  dndEndsAt: number | undefined;
+  locationNeeds: LocationNeeds;
+  /** Linking a new device from here: waiting for it, or the 6 digits to compare. */
+  linkStatus: LinkStatus | undefined;
+  /** False while another of my devices sends what automations send (they only notify here). */
+  automationsActHere: boolean;
+  /** The device chosen in "Automationen senden von", if it is still in the list; else the usual rule. */
+  automationDevice: string | undefined;
+  /** How far this device's clock runs ahead of GPS time (negative: behind), once off by more than 5 minutes. */
+  clockAheadMs: number | undefined;
 }
 
-export interface NotifySink {
-  (title: string, body: string, from?: ContactKey): void;
+/** Hooks the platform layer (location, geofences) sets when a runtime is created. */
+export interface PlatformHooks {
+  onLocationNeeds: (needs: LocationNeeds) => void;
+  onPlacesChange: (places: Place[]) => void;
+  /** Gets one fresh location fix into the node, e.g. before an SOS. Resolves when done or given up. */
+  freshFix: () => Promise<void>;
 }
 
 type CreatedHook = (runtime: AppRuntime) => void;
 const createdHooks: CreatedHook[] = [];
 
-/** Lets platform glue (location, notifications) attach before anything can happen. */
+/** Lets platform glue attach before anything can happen. */
 export function onRuntimeCreated(hook: CreatedHook): void {
   createdHooks.push(hook);
 }
 
-const MAX_CHAT_PER_CONTACT = 500;
+const MAX_CHAT_PER_THREAD = 500;
+/**
+ * Character budgets for stored chats (UTF-16 units; emoji count double). Messages may be 4000
+ * characters and contacts can create many groups, so without a budget a chatty or hostile
+ * contact could grow the saved file until saving fails. The oldest messages go first.
+ */
+const MAX_CHAT_CHARS_PER_THREAD = 400_000;
+const MAX_CHAT_CHARS_TOTAL = 3_000_000;
+const MAX_ACTIVITY = 300;
+const MAX_ALARMS = 100;
+const MAX_ALARMS_DONE = 200;
+/** A Windows alarm whose time passed while the PC was off still rings this long after it: as long as the core keeps a watch. */
+const MISSED_ALARM_KEEP_MS = 12 * 3600_000;
+const MAX_ACTIVITY_TITLE = 200;
+const MAX_ACTIVITY_BODY = 600;
 const DATA_FILE = 'app-data';
+/**
+ * The transport's seen store (handled ids, held messages, relay sync times), about 3 MB when full.
+ * Written apart from the app data and at most every SEEN_SAVE_MS, plus when the app goes to the
+ * background or stops; what came in meanwhile is in the app data (`seenRecent`).
+ */
+const SEEN_FILE = 'transport-data';
+const SEEN_SAVE_MS = 30_000;
+/** A journal this long (a big catch-up) is worth a full save before the time is up. */
+const SEEN_JOURNAL_MAX = 2_000;
+const TICK_MS = 20_000;
+
+export const DEFAULT_SETTINGS: Settings = {
+  onboarded: false,
+  demo: false,
+  appearance: 'dark',
+  keepAlive: false,
+  mapEnabled: false,
+  smsFallback: true,
+};
+
+/** The storage for this platform. */
+export function createVault(): Vault {
+  if (desktop) return new DesktopVault(desktop);
+  if (isBrowserPreview) return new MemoryVault();
+  return new EncryptedFileVault();
+}
+
+let sharedVault: Vault | undefined;
+export function getVault(): Vault {
+  sharedVault ??= createVault();
+  return sharedVault;
+}
+
+function newDeviceId(): string {
+  return randomId(16);
+}
+
+/** Brings data saved by older versions up to date. */
+function migrate(raw: unknown, selfKey: string): Persisted | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const old = raw as Partial<Persisted> & { settings?: Partial<Settings> & { displayName?: string } };
+  if (!old.state?.self) return undefined;
+  const self = {
+    ...old.state.self,
+    key: selfKey,
+    deviceId: old.state.self.deviceId || newDeviceId(),
+    deviceName: old.state.self.deviceName || deviceLabel(),
+  };
+  const state = normalizeState({ ...old.state, self });
+  return {
+    v: 2,
+    state,
+    statuses: old.statuses ?? {},
+    chats: old.chats ?? {},
+    // Counts of chats that are gone (saved before they were cleaned up) would keep the badge up.
+    unread: liveUnread(old.unread ?? {}, state),
+    activity: Array.isArray(old.activity) ? old.activity : [],
+    alarms: Array.isArray(old.alarms) ? old.alarms : [],
+    // Checked again like an import: a plugin saved before a check existed is dropped.
+    plugins: storedPlugins(old.plugins),
+    settings: { ...DEFAULT_SETTINGS, ...old.settings },
+    seenRecent: old.seenRecent,
+    trip: old.trip,
+    announceLinked: old.announceLinked,
+    alarmsDone: Array.isArray(old.alarmsDone) ? old.alarmsDone.filter((d) => typeof d?.id === 'string' && Number.isFinite(d.at)).slice(-MAX_ALARMS_DONE) : [],
+    // Checked when the demo ends (see `setDemo`).
+    beforeDemo: old.beforeDemo,
+  };
+}
+
+export function freshData(selfKey: string, name = 'Ich', demo = false): Persisted {
+  return {
+    v: 2,
+    state: createInitialState({ key: selfKey, name, relays: DEFAULT_RELAYS, deviceId: newDeviceId(), deviceName: deviceLabel() }),
+    statuses: {},
+    chats: {},
+    unread: {},
+    activity: [],
+    alarms: [],
+    plugins: [],
+    settings: { ...DEFAULT_SETTINGS, demo },
+  };
+}
+
+/** The seen store's file: for this account's key only, so another account's never counts. */
+interface SeenFile {
+  key: string;
+  seen: SeenSnapshot;
+}
+
+/** Writes app data for an account (after linking or restoring) before the runtime starts. */
+export async function writeAccount(secretKey: Uint8Array, state: NodeState, extra: Partial<Persisted> = {}): Promise<void> {
+  const vault = getVault();
+  await vault.setSecretKey(secretKey);
+  const key = getPublicKey(secretKey);
+  const data: Persisted = { ...freshData(key), ...extra, state, v: 2 };
+  data.settings = { ...DEFAULT_SETTINGS, ...extra.settings, onboarded: true, demo: false };
+  // Nothing of what the account this one replaces handled or held may carry over.
+  await vault.save(SEEN_FILE, { key, seen: { sync: 0, ids: [] } } satisfies SeenFile);
+  await vault.save(DATA_FILE, data);
+  // Alarms and notifications of the account (or demo) this one replaces: nothing in the new data
+  // could cancel them, and they would ring or show names later.
+  await clearNotifications();
+}
 
 /**
  * Owns the SocialNode for the whole app: building it from storage, saving changes
- * (encrypted, debounced) and exposing a snapshot for React. Background location
- * tasks use the same instance through `getRuntime()`.
+ * (encrypted, debounced), turning node events into chats, notifications and alarms,
+ * and exposing a snapshot for React. Background tasks use the same instance.
  */
 export class AppRuntime {
   private version = 0;
   private snapshotCache: Snapshot | undefined;
   private readonly listeners = new Set<() => void>();
-  private readonly statuses: Record<ContactKey, ContactStatus> = {};
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When `SEEN_FILE` was last written. */
+  private seenSavedAt = 0;
+  /** The last write started (see `write`): they run one at a time, and `shutdown` waits for it. */
+  private writing: Promise<void> = Promise.resolve();
+  private tickTimer: ReturnType<typeof setInterval> | undefined;
   private stopDemo: (() => void) | undefined;
-  notify: NotifySink = () => {};
-  onTripChange: (trip: SharingSession | undefined) => void = () => {};
-  onPlacesChange: (places: Place[]) => void = () => {};
+  private openThread: string | undefined;
+  private started = false;
+  private firstRoundDone: Promise<void> = Promise.resolve();
+  /** Set by shutdown(): late events and timers must not write over what replaced this instance. */
+  private disposed = false;
+  hooks: PlatformHooks = { onLocationNeeds: () => {}, onPlacesChange: () => {}, freshFix: async () => {} };
 
   private constructor(
     readonly node: SocialNode,
     private readonly vault: Vault,
     private data: Persisted,
     private readonly seen: MemorySeenStore,
+    private readonly startDemo: ((node: SocialNode) => () => void) | undefined,
+    /** Keeps a copy of the identity key in memory while running; shutdown() wipes it. */
+    private readonly transport: NostrTransport | undefined,
   ) {
     node.on((e) => {
       switch (e.type) {
-        case 'state':
+        case 'state': {
+          const prev = this.data.state;
+          const placesChanged = e.state.places !== prev.places;
           this.data.state = e.state;
+          if (e.state.contacts !== prev.contacts || e.state.groups !== prev.groups) this.dropGoneThreads(prev);
+          if (placesChanged && !this.isDemo) this.hooks.onPlacesChange(e.state.places);
           this.changed();
           break;
+        }
         case 'status':
-          this.statuses[e.contact] = e.status;
-          this.changed(false);
+          this.data.statuses = { ...this.data.statuses, [e.contact]: e.status };
+          this.changed();
+          break;
+        case 'chat':
+          this.appendChat(e.thread, e.entry);
+          break;
+        case 'alert': {
+          const id = e.alert.id;
+          const watch = id.startsWith('watch:');
+          const ringAt = watch ? this.watchRingAt(e.alert) : undefined;
+          // On Windows the alarm timer may have rung for this deadline already; the core's overdue check reports it again.
+          const rang = isDesktop && watch && this.rangSince(id, ringAt);
+          // On a phone the OS rang it already (and it may have been swiped away since): no second notification.
+          const shown = !isDesktop && watch && this.alarmDone(id, ringAt);
+          this.addActivity(e.alert);
+          // On a phone the OS has an alarm with the same id, which may have rung already.
+          if (!rang) deliverAlert(e.alert, watch ? () => this.data.alarms.find((a) => a.id === id && a.os)?.at : undefined, shown);
+          if (watch && !isDesktop && ringAt !== undefined) this.noteAlarmDone(id, ringAt);
+          break;
+        }
+        case 'alarm.schedule': {
+          const alarm: SavedAlarm = { ...e.alarm };
+          this.data.alarms = [...this.data.alarms.filter((a) => a.id !== alarm.id), alarm].slice(-MAX_ALARMS);
+          const handedOver = () => {
+            // Not if it was moved or cancelled meanwhile: that entry is no longer this one.
+            if (this.disposed || !this.data.alarms.includes(alarm)) return;
+            alarm.os = true;
+            this.changed();
+          };
+          void scheduleAlarm(alarm, (a) => this.fireDesktopAlarm(a), handedOver).catch(() => {});
+          this.changed();
+          break;
+        }
+        case 'alarm.cancel':
+          if (this.data.alarms.some((a) => a.id === e.id)) {
+            this.data.alarms = this.data.alarms.filter((a) => a.id !== e.id);
+            this.changed();
+          }
+          void cancelAlarm(e.id);
           break;
         case 'trip':
           this.data.trip = e.session;
-          this.onTripChange(e.session);
           this.changed();
           break;
-        case 'notify':
-          this.notify(e.intent.title, e.intent.body);
+        case 'location':
+          if (!this.isDemo) this.hooks.onLocationNeeds(e.needs);
+          this.changed(false);
           break;
-        case 'message': {
-          const m = e.message;
-          if (m.type === 'chat.text' || m.type === 'ping') {
-            const text = m.type === 'chat.text' ? m.text : (m.text ?? pingLabel(m.kind));
-            this.appendChat(e.from, { id: m.id, from: e.from, text, at: Date.now(), kind: m.type === 'ping' ? 'ping' : 'text' });
-            this.notify(this.contactName(e.from), text, e.from);
-          }
+        case 'link':
+        case 'clock':
+          // Only in memory: nothing to save.
+          this.changed(false);
           break;
-        }
+        case 'contact.added':
+          break;
       }
     });
   }
 
   static async create(): Promise<AppRuntime> {
-    const web = Platform.OS === 'web';
-    const vault: Vault = web ? new MemoryVault() : new EncryptedFileVault();
+    const vault = getVault();
     const secretKey = await vault.secretKey();
     const selfKey = getPublicKey(secretKey);
-    const stored = await vault.load<Persisted>(DATA_FILE);
-    const data: Persisted = stored ?? {
-      state: {
-        self: { key: selfKey, name: 'Ich', relays: DEFAULT_RELAYS },
-        contacts: [],
-        places: [],
-        grants: [],
-        rules: [],
-        ghost: false,
-      },
-      chats: {},
-      plugins: [],
-      settings: { displayName: 'Ich', demo: web, onboarded: false, appearance: 'dark' },
-      seen: { sync: 0, ids: [] },
-    };
-    const seen = MemorySeenStore.restore(data.seen);
+    const stored = migrate(await vault.load<unknown>(DATA_FILE), selfKey);
+    const data = stored ?? freshData(selfKey, 'Ich', isBrowserPreview);
+    // The browser preview can only ever run the demo: it has no safe place for keys. It keeps
+    // nothing between page loads, so it skips onboarding (still reachable at /welcome) and every
+    // screen can be opened directly by its address.
+    if (isBrowserPreview) data.settings = { ...data.settings, demo: true, onboarded: stored ? data.settings.onboarded : true };
+    const seenFile = await vault.load<Partial<SeenFile>>(SEEN_FILE);
+    const seen = MemorySeenStore.restore(seenFile?.key === selfKey ? seenFile.seen : undefined);
+    // What came in after that file was written, saved with the app data.
+    seen.merge(data.seenRecent);
 
     let node: SocialNode;
-    let demoStarter: ((node: SocialNode) => () => void) | undefined;
+    let startDemo: ((node: SocialNode) => () => void) | undefined;
+    let transport: NostrTransport | undefined;
+    const common = { initialState: data.state, initialStatuses: data.statuses, deviceKind: isDesktop ? ('computer' as const) : ('phone' as const) };
     if (data.settings.demo) {
       const network = new MemoryNetwork();
-      node = new SocialNode({ transport: network.createTransport(selfKey), initialState: data.state });
-      demoStarter = (n) => startDemoFriends(network, n);
+      node = new SocialNode({ ...common, transport: network.createTransport(selfKey) });
+      startDemo = (n) => startDemoFriends(network, n);
     } else {
-      const transport = new NostrTransport({
+      // Keeps its own copy of the key, so this array can be wiped below.
+      transport = new NostrTransport({
         secretKey,
-        ownRelays: data.state.self.relays,
-        relaysFor: (k) => node.getState().contacts.find((c) => c.key === k)?.relays ?? [],
+        ownRelays: data.state.self.relays.length ? data.state.self.relays : DEFAULT_RELAYS,
+        relaysFor: (k) => node.relaysFor(k),
+        // Strangers' messages are dropped before they take room in the saved seen store; a
+        // contact's message that waits for something (a group's roster) is held there.
+        accept: (from, message) => node.judgeMessage(from, message),
         seen,
       });
-      node = new SocialNode({ transport, initialState: data.state });
+      node = new SocialNode({ ...common, transport });
     }
-
-    const runtime = new AppRuntime(node, vault, data, seen);
+    secretKey.fill(0);
+    const runtime = new AppRuntime(node, vault, data, seen, startDemo, transport);
     for (const hook of createdHooks) hook(runtime);
-    await node.start();
-    if (data.trip && !node.resumeTrip(data.trip)) data.trip = undefined;
-    if (demoStarter) runtime.stopDemo = demoStarter(node);
     return runtime;
   }
 
-  // ---- React glue ---------------------------------------------------------------------
+  /** Connects to the network and starts the timers. Safe to call more than once. */
+  async ensureStarted(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+    await this.node.start();
+    if (this.data.trip && !this.node.resumeTrip(this.data.trip)) this.data.trip = undefined;
+    if (this.startDemo) this.stopDemo = this.startDemo(this.node);
+    // Alarms of the Windows app only live while it runs: re-arm them.
+    if (isDesktop) this.rearmDesktopAlarms();
+    // Phone alarms the OS kept from before (a restore, a link, the demo) that this data no longer
+    // knows would ring for nothing. A full list may have lost old entries: then none are touched.
+    else void pruneAlarms(() => (this.disposed || this.data.alarms.length >= MAX_ALARMS ? undefined : this.data.alarms)).catch(() => {});
+    this.tickTimer = setInterval(() => void this.tick(), TICK_MS);
+    // Not awaited: sending what waited in the outbox can take a while on a slow network, and the
+    // screens (the SOS button too) and background tasks such as an iOS geofence wake must not wait.
+    this.firstRoundDone = this.firstRound().catch(() => {});
+    if (!this.isDemo) {
+      this.hooks.onLocationNeeds(this.node.locationNeeds());
+      this.hooks.onPlacesChange(this.data.state.places);
+    }
+  }
+
+  private async firstRound(): Promise<void> {
+    if (this.data.announceLinked) {
+      this.data.announceLinked = false;
+      await this.node.announceLinked().catch(() => {});
+      this.changed();
+    }
+    if (!this.disposed) await this.tick();
+  }
+
+  /** Resolves once the first round after starting (sending what waited in the outbox) is over. */
+  whenFirstRoundDone(): Promise<void> {
+    return this.firstRoundDone;
+  }
+
+  /** Housekeeping: expiring shares, overdue alarms, outbox retries. Also called when the app wakes up. */
+  async tick(): Promise<void> {
+    // First, so an overdue alert of this round already knows which alarms the OS rang meanwhile.
+    await this.noteRangAlarms().catch(() => {});
+    await this.node.tick().catch(() => {});
+    const now = Date.now();
+    const alarms = this.data.alarms.filter((a) => a.at > now - 24 * 3600_000);
+    if (alarms.length !== this.data.alarms.length) {
+      this.data.alarms = alarms;
+      this.changed();
+    }
+    this.changed(false);
+  }
+
+  // ---- React glue ------------------------------------------------------------------------
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -183,23 +473,41 @@ export class AppRuntime {
   };
 
   getSnapshot = (): Snapshot => {
-    this.snapshotCache ??= {
-      version: this.version,
-      state: this.data.state,
-      statuses: { ...this.statuses },
-      chats: this.data.chats,
-      activeTrip: this.node.activeTrip,
-      isDemo: this.data.settings.demo,
-      templates: [...BUILTIN_TEMPLATES, ...this.data.plugins.flatMap((p) => p.templates)],
-      settings: this.data.settings,
-    };
+    if (!this.snapshotCache) {
+      this.snapshotCache = {
+        version: this.version,
+        state: this.data.state,
+        statuses: this.data.statuses,
+        chats: this.data.chats,
+        unread: this.data.unread,
+        unreadTotal: unreadTotal(this.data.unread),
+        activity: this.data.activity,
+        activeTrip: this.node.activeTrip,
+        activeTripEta: this.node.activeTripEta,
+        isDemo: this.data.settings.demo,
+        templates: [...BUILTIN_TEMPLATES, ...this.data.plugins.flatMap((p) => p.templates)],
+        plugins: this.data.plugins,
+        settings: this.data.settings,
+        dndActive: this.node.isDndActive(),
+        dndEndsAt: this.node.dndEndsAt(),
+        locationNeeds: this.node.locationNeeds(),
+        linkStatus: this.node.linkStatus,
+        automationsActHere: this.node.runsAutomationActions,
+        automationDevice: this.node.automationDevice,
+        clockAheadMs: this.node.clockAheadMs,
+      };
+    }
     return this.snapshotCache;
   };
 
-  // ---- actions ----------------------------------------------------------------------
+  // ---- small helpers for screens -------------------------------------------------------------
 
   get isDemo(): boolean {
     return this.data.settings.demo;
+  }
+
+  get settings(): Settings {
+    return this.data.settings;
   }
 
   /** Numbers both people compare in person to rule out a swapped QR code. */
@@ -207,74 +515,53 @@ export class AppRuntime {
     return safetyNumber(this.data.state.self.key, key);
   }
 
-  markVerified(key: ContactKey): void {
-    this.node.markVerified(key);
+  /** The chat on screen: its messages count as read and need no banner. */
+  setOpenThread(thread: string | undefined): void {
+    this.openThread = thread;
+    setNotificationThread(thread);
+    if (thread) this.markRead(thread);
   }
 
-  contactName(key: ContactKey): string {
-    return this.data.state.contacts.find((c) => c.key === key)?.name ?? 'Unbekannt';
+  markRead(thread: string): void {
+    if (!this.data.unread[thread]) return;
+    const { [thread]: _read, ...rest } = this.data.unread;
+    this.data.unread = rest;
+    this.changed();
   }
 
-  async sendChat(to: ContactKey, text: string): Promise<void> {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    await this.node.sendChat(to, trimmed);
-    this.appendChat(to, { id: randomId(), from: 'me', text: trimmed, at: Date.now(), kind: 'text' });
+  clearActivity(): void {
+    this.data.activity = [];
+    this.changed();
   }
 
-  async sendPing(to: ContactKey, kind: 'help-carry' | 'pickup-request'): Promise<void> {
-    await this.node.sendPing(to, kind);
-    this.appendChat(to, { id: randomId(), from: 'me', text: pingLabel(kind), at: Date.now(), kind: 'ping' });
-  }
-
-  startTrip(input: {
-    recipients: ContactKey[];
-    destinationName: string;
-    destination?: { lat: number; lon: number };
-    level: SessionLevel;
-    durationMs?: number;
-  }): Promise<SharingSession> {
-    return this.node.startTrip(input);
-  }
-
-  stopTrip(): Promise<void> {
-    return this.node.stopTrip();
-  }
-
-  setGhost(on: boolean): void {
-    this.node.setGhost(on);
-  }
-
-  async setDisplayName(name: string): Promise<void> {
-    const clean = name.trim().slice(0, 40) || 'Ich';
-    this.data.settings = { ...this.data.settings, displayName: clean };
-    await this.node.setProfileName(clean);
+  updateSettings(patch: Partial<Settings>): void {
+    this.data.settings = { ...this.data.settings, ...patch };
+    this.changed();
   }
 
   setAppearance(appearance: Appearance): void {
-    this.data.settings = { ...this.data.settings, appearance };
-    this.changed();
+    this.updateSettings({ appearance });
   }
 
   finishOnboarding(): void {
-    this.data.settings = { ...this.data.settings, onboarded: true };
-    this.changed();
+    this.updateSettings({ onboarded: true });
   }
 
-  savePlace(place: Omit<Place, 'id'> & { id?: string }): void {
+  async setDisplayName(name: string): Promise<void> {
+    await this.node.setProfileName(name.trim().slice(0, 40) || 'Ich');
+  }
+
+  // ---- places, grants, rules, plugins ---------------------------------------------------------
+
+  savePlace(place: Omit<Place, 'id'> & { id?: string }): string {
     const id = place.id ?? randomId(10);
-    const places = [...this.data.state.places.filter((p) => p.id !== id), { ...place, id }];
-    this.node.setPlaces(places);
-    this.onPlacesChange(places);
+    this.node.setPlaces([...this.data.state.places.filter((p) => p.id !== id), { ...place, id }]);
+    return id;
   }
 
   removePlace(id: string): void {
-    const places = this.data.state.places.filter((p) => p.id !== id);
-    this.node.setPlaces(places);
-    this.node.setGrants(
-      this.data.state.grants.map((g) => ({ ...g, placeIds: g.placeIds.filter((p) => p !== id) })),
-    );
-    this.onPlacesChange(places);
+    this.node.setPlaces(this.data.state.places.filter((p) => p.id !== id));
+    this.node.setGrants(this.data.state.grants.map((g) => ({ ...g, placeIds: g.placeIds.filter((p) => p !== id) })));
   }
 
   /** Which of my places a contact may hear arrive/leave events for. */
@@ -299,110 +586,549 @@ export class AppRuntime {
   installPlugin(raw: string): ReturnType<typeof importPlugin> {
     const result = importPlugin(raw);
     if (result.ok) {
-      this.data.plugins = [...this.data.plugins.filter((p) => p.id !== result.plugin.id), result.plugin];
+      this.data.plugins = [...this.data.plugins.filter((p) => p.id !== result.plugin.id), result.plugin].slice(-50);
       this.changed();
     }
     return result;
   }
 
-  createInvite(): string {
-    return this.node.createInvite();
+  removePlugin(id: string): void {
+    this.data.plugins = this.data.plugins.filter((p) => p.id !== id);
+    this.changed();
   }
 
-  acceptInvite(text: string) {
-    return this.node.acceptInvite(text);
+  async removeContact(key: ContactKey): Promise<void> {
+    const { [key]: _chat, ...chats } = this.data.chats;
+    const { [key]: _unread, ...unread } = this.data.unread;
+    const { [key]: _status, ...statuses } = this.data.statuses;
+    this.data.chats = chats;
+    this.data.unread = unread;
+    this.data.statuses = statuses;
+    // Their messages, places and answers live on in the activity list too: the chat is meant to be gone.
+    this.data.activity = this.data.activity.filter((a) => a.from !== key && a.thread !== key && a.ref?.sosOwner !== key);
+    this.changed();
+    await this.node.removeContact(key);
   }
 
-  removeContact(key: ContactKey): void {
-    const { [key]: _removed, ...rest } = this.data.chats;
-    this.data.chats = rest;
-    this.node.removeContact(key);
+  // ---- SOS --------------------------------------------------------------------------------
+
+  /**
+   * Starts (or renews) an SOS. Tries to get a fresh location first, but never waits longer
+   * than a few seconds: getting help out matters more than a perfect position.
+   */
+  async triggerSos(input: { text?: string; recipients?: ContactKey[] } = {}): Promise<void> {
+    if (!this.isDemo) {
+      await Promise.race([this.hooks.freshFix().catch(() => {}), new Promise((r) => setTimeout(r, 6000))]);
+    }
+    await this.node.startSos(input);
+    this.flushSoon();
   }
 
-  /** Switches between demo and real mode. The caller rebuilds the runtime afterwards. */
-  async setDemo(demo: boolean): Promise<void> {
-    this.data.settings = { ...this.data.settings, demo };
-    await this.shutdown(false);
-    if (!demo) this.removeDemoData();
-    await this.flush();
+  // ---- own devices and backups -------------------------------------------------------------------
+
+  /** The account key as hex, for sending it to a device being linked. Handle with care. */
+  async secretKeyHex(): Promise<string> {
+    const key = await this.vault.secretKey();
+    const hex = bytesToHex(key);
+    key.fill(0);
+    return hex;
   }
 
-  async wipeEverything(): Promise<void> {
-    await this.shutdown(false);
-    await this.vault.wipe([DATA_FILE]);
+  /** Starts linking the new device that shows this code. The digits then appear in `linkStatus`. */
+  async startLink(code: string): Promise<void> {
+    if (this.isDemo) throw new Error('Im Demo-Modus kann kein Gerät verbunden werden.');
+    await this.node.startLink(code);
+  }
+
+  /** The digits matched: sends the account. The account key is read only now. */
+  async confirmLink(): Promise<void> {
+    if (this.isDemo) throw new Error('Im Demo-Modus kann kein Gerät verbunden werden.');
+    if (this.node.linkStatus?.phase !== 'compare') throw new Error('Vergleiche zuerst die Zahlen auf beiden Geräten.');
+    await this.node.confirmLink(await this.secretKeyHex());
+  }
+
+  cancelLink(): void {
+    this.node.cancelLink();
+  }
+
+  /** A password-protected file with the account and settings, for moving to a new phone. */
+  async exportBackup(password: string, onProgress?: (f: number) => void): Promise<Uint8Array> {
+    if (this.isDemo) throw new Error('Im Demo-Modus gibt es nichts zu sichern.');
+    const chats = Object.fromEntries(Object.entries(this.data.chats).map(([k, v]) => [k, v.slice(-100)]));
+    // Without running live shares and SOS: restored weeks later, they would start again by themselves.
+    const state = backupState(this.data.state);
+    return encryptBackup(
+      {
+        format: 'heyda.backup',
+        v: 1,
+        createdAt: Date.now(),
+        identity: await this.secretKeyHex(),
+        data: { state, plugins: this.data.plugins, settings: this.data.settings, chats },
+      },
+      password,
+      { onProgress },
+    );
   }
 
   /** Stops everything; with `save`, writes the latest state first. */
   async shutdown(save = true): Promise<void> {
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    this.tickTimer = undefined;
     this.stopDemo?.();
     this.stopDemo = undefined;
-    if (this.node.activeTrip) await this.node.stopTrip();
-    await this.node.stop();
+    if (this.started) await this.node.stop().catch(() => {});
+    this.started = false;
+    // Wipes the key copy and closes the relay connections; this instance never sends again.
+    await this.transport?.dispose().catch(() => {});
     if (save) await this.flush();
-    else if (this.saveTimer) clearTimeout(this.saveTimer);
-  }
-
-  /** Persist now, e.g. when the app goes to the background. */
-  async flush(): Promise<void> {
+    // From here on nothing saves any more (also a save scheduled while the node was stopping):
+    // a restore, a link or a wipe may be about to replace the data on disk.
+    this.disposed = true;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
-    this.data.seen = this.seen.snapshot();
+    // A save already under way ends first: neither file may be written again after the wipe, or
+    // over what a restore or link writes next (on Windows a save takes several steps).
+    await this.writing;
+  }
+
+  /**
+   * Switches between demo and real mode. The caller rebuilds the runtime afterwards. Starting the
+   * demo keeps a copy of the account; ending it brings that copy back unchanged, with only the
+   * settings of this device the person just chose (set up, keep-alive, look) taken along.
+   */
+  async setDemo(demo: boolean): Promise<void> {
+    if (demo === this.isDemo) return;
+    if (this.node.activeTrip) await this.node.stopTrip();
+    await this.shutdown(false);
+    this.data.statuses = this.node.exportStatuses();
+    if (demo) {
+      const { beforeDemo: _none, ...real } = this.data;
+      this.data.beforeDemo = JSON.parse(JSON.stringify(real)) as Persisted;
+      this.data.settings = { ...this.data.settings, demo: true };
+    } else {
+      this.leaveDemo();
+    }
+    await this.write(true);
+  }
+
+  async wipeEverything(): Promise<void> {
+    await this.shutdown(false);
+    await this.vault.wipe([DATA_FILE, SEEN_FILE]);
+    // Also every alarm with the OS (the app's own list may have lost some) and the notifications
+    // on screen, which show names and message previews.
+    await clearNotifications();
+  }
+
+  /** Persist now, the seen store too, e.g. when the app goes to the background. */
+  async flush(): Promise<void> {
+    await this.save(true);
+  }
+
+  private async save(allSeen: boolean): Promise<void> {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    if (this.disposed) return;
+    await this.write(allSeen);
+  }
+
+  /**
+   * One write at a time, in order: two at once could finish the wrong way round and leave an older
+   * copy of the seen store's file on disk after a newer one let the journal forget its ids.
+   */
+  private write(allSeen = false): Promise<void> {
+    const run = this.writing.then(() => this.writeNow(allSeen));
+    this.writing = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * Writes the app data, and the seen store's own file when `allSeen` or due (see `SEEN_FILE`).
+   * That file is taken before the app data and written after it, so it never knows of a message
+   * whose effects the app data lacks: a crash in between can only make the journal repeat ids.
+   */
+  private async writeNow(allSeen: boolean): Promise<void> {
+    const now = Date.now();
+    const due = allSeen || now - this.seenSavedAt >= SEEN_SAVE_MS || now < this.seenSavedAt || this.seen.journalSize() > SEEN_JOURNAL_MAX;
+    const full = due ? this.seen.snapshot() : undefined;
+    const mark = this.seen.journalMark();
+    this.data.seenRecent = this.seen.journal();
+    this.data.statuses = this.node.exportStatuses();
     await this.vault.save(DATA_FILE, this.data);
+    if (!full) return;
+    await this.vault.save(SEEN_FILE, { key: this.data.state.self.key, seen: full } satisfies SeenFile);
+    this.seen.saved(mark);
+    this.seenSavedAt = now;
   }
 
   /** For background tasks: persist only if something changed, before the OS suspends us. */
   async flushIfDirty(): Promise<void> {
-    if (this.saveTimer) await this.flush();
+    if (this.saveTimer) await this.save(false);
   }
 
-  // ---- internals -------------------------------------------------------------------
+  // ---- internals ---------------------------------------------------------------------------
 
+  /**
+   * Those still to come ring on time. Those whose time passed while the PC was off wait until what
+   * the relays kept meanwhile has arrived, since the end of a watch or a check-in may be among it,
+   * and do not ring at all once older than the core keeps a watch.
+   */
+  private rearmDesktopAlarms(): void {
+    const fire = (a: Alarm) => this.fireDesktopAlarm(a);
+    // Late on purpose, after the relays caught up: no second wait.
+    const fireCaughtUp = (a: Alarm) => this.fireDesktopAlarm(a, true);
+    const now = Date.now();
+    const missed = this.data.alarms.filter((a) => a.at <= now);
+    for (const a of this.data.alarms) if (a.at > now) void scheduleAlarm(a, fire);
+    // "Denk dran, dich zu melden" is pointless once the deadline itself has passed too.
+    const pastDue = new Set(missed.filter((a) => a.id.endsWith(':due')).map((a) => a.id.slice(0, -':due'.length)));
+    const late = missed.filter((a) => !(a.id.endsWith(':remind') && pastDue.has(a.id.slice(0, -':remind'.length))));
+    if (!late.length) return;
+    void this.node.whenCaughtUp().then(() => {
+      const oldest = Date.now() - MISSED_ALARM_KEEP_MS;
+      // Not one cancelled or moved meanwhile: that entry is gone from the list.
+      for (const a of late) if (!this.disposed && this.data.alarms.includes(a) && a.at >= oldest) void scheduleAlarm(a, fireCaughtUp);
+    });
+  }
+
+  /**
+   * A Windows alarm timer fired. It rings at once only if the PC was awake and connected at its
+   * time (see `SocialNode.awakeAt`). Otherwise, however late it fired, the check-in or end that
+   * calls it off may be waiting on the relays: it rings only once they handed over what they kept
+   * (or after a short wait), and not at all if the node cancelled or moved it meanwhile.
+   */
+  private fireDesktopAlarm(alarm: Alarm, caughtUp = false): void {
+    if (this.disposed || !this.data.alarms.some((a) => a.id === alarm.id && a.at === alarm.at)) return;
+    if (!caughtUp && !this.node.awakeAt(alarm.at)) {
+      void this.node.catchUpAgain().then(() => this.fireDesktopAlarm(alarm, true));
+      return;
+    }
+    // Rung once: without this, every restart within 24 h re-arms it with delay 0 and it rings again.
+    this.data.alarms = this.data.alarms.filter((a) => a.id !== alarm.id);
+    // The core's overdue check may have reported this deadline a moment earlier; ring only once.
+    if (this.rangSince(alarm.id, alarm.at)) {
+      this.changed();
+      return;
+    }
+    // Never stamped before its time (a timer may fire a moment early by the clock), so the check
+    // above and the one for the core's alert recognize this ring.
+    const alert = alarmAlert(alarm, Math.max(Date.now(), alarm.at));
+    this.addActivity(alert);
+    deliverAlert(alert);
+  }
+
+  /**
+   * Remembers that a phone alarm rang for the deadline due at `at`, or was opened or swiped away:
+   * the core's overdue alert for it (on a later wake, say) then posts no second notification.
+   */
+  noteAlarmDone(id: string, at: number): void {
+    if (this.disposed || this.alarmDone(id, at)) return;
+    const done = (this.data.alarmsDone ?? []).filter((d) => d.id !== id);
+    this.data.alarmsDone = [...done, { id, at }].slice(-MAX_ALARMS_DONE);
+    this.changed();
+  }
+
+  /** Whether the phone alarm with this id rang (or was opened or swiped away) for the deadline due at `at`, not an earlier one. */
+  private alarmDone(id: string, at: number | undefined): boolean {
+    return at !== undefined && (this.data.alarmsDone ?? []).some((d) => d.id === id && d.at >= at - 5_000);
+  }
+
+  /** Records the alarms handed to the phone's OS that it rang meanwhile, before it is swiped away and nothing tells any more. */
+  private async noteRangAlarms(): Promise<void> {
+    if (isDesktop) return;
+    const now = Date.now();
+    const open = this.data.alarms.filter((a) => a.os && a.at <= now && !this.alarmDone(a.id, a.at));
+    if (!open.length) return;
+    for (const a of await alarmsRang(open)) this.noteAlarmDone(a.id, a.at);
+  }
+
+  /**
+   * Whether the alarm with this id already rang for the time `at` it is due now. A ring for an
+   * earlier time does not count: a watch whose deadline moved after it rang rings again, and so
+   * do my own watch's reminders after I gave myself more time.
+   */
+  private rangSince(id: string, at: number | undefined): boolean {
+    return at !== undefined && this.data.activity.some((a) => a.id === id && a.at >= at);
+  }
+
+  /** When the core's overdue alert for a contact's watch was due: its deadline, or later for one that came late. */
+  private watchRingAt(alert: Alert): number | undefined {
+    const watchId = alert.ref?.watchId;
+    const w = alert.from && watchId ? this.data.statuses[alert.from]?.watches?.find((x) => x.watchId === watchId) : undefined;
+    return w ? Math.max(w.dueAt, w.ringAt ?? 0) : undefined;
+  }
+
+  private addActivity(alert: Alert): void {
+    const stored = { ...alert, title: clip(alert.title, MAX_ACTIVITY_TITLE), body: clip(alert.body, MAX_ACTIVITY_BODY) };
+    this.data.activity = [stored, ...this.data.activity.filter((a) => a.id !== alert.id)].slice(0, MAX_ACTIVITY);
+    this.changed();
+  }
+
+  /** Ending the demo: the account as it was before comes back (see `beforeDemo`). */
+  private leaveDemo(): void {
+    const settings = this.data.settings;
+    const real = this.data.beforeDemo && migrate(this.data.beforeDemo, this.data.state.self.key);
+    if (!real) {
+      // Saved by a version before the copy existed.
+      this.data.settings = { ...settings, demo: false };
+      this.removeDemoData();
+      return;
+    }
+    // Alarms the demo handed to the OS (my watches, quiet mode changed) that the account does not
+    // have like this: they would ring for nothing. The next start schedules those still due again.
+    for (const a of this.data.alarms) {
+      if (!real.alarms.some((r) => r.id === a.id && r.at === a.at && r.level === a.level)) void cancelAlarm(a.id).catch(() => {});
+    }
+    const { onboarded, keepAlive, appearance } = settings;
+    this.data = { ...real, settings: { ...real.settings, onboarded, keepAlive, appearance, demo: false }, beforeDemo: undefined };
+  }
+
+  /**
+   * Leaving a demo started by an older version, which kept no copy: removes Lisa, Max and Oma Ilse
+   * and what belongs to them (also groups, watches and an SOS made with them in the demo), nothing
+   * else. Statuses need nothing here: the next start keeps only those of contacts.
+   */
   private removeDemoData(): void {
-    const isDemo = (k: string) => DEMO_KEYS.includes(k);
+    const demo = new Set(DEMO_KEYS);
     const mentionsDemo = (r: Rule) => DEMO_KEYS.some((k) => JSON.stringify(r).includes(k));
     const s = this.data.state;
+    const groups = s.groups.flatMap((g) => {
+      if (demo.has(g.owner)) return [];
+      if (!g.members.some((m) => demo.has(m.key))) return [g];
+      const members = g.members.filter((m) => !demo.has(m.key));
+      return members.some((m) => m.key !== s.self.key) ? [{ ...g, members }] : [];
+    });
+    const goneThreads = new Set([...DEMO_KEYS, ...s.groups.filter((g) => !groups.some((x) => x.id === g.id)).map((g) => `g:${g.id}`)]);
+    const watches = s.watches.filter((w) => !w.recipients.some((k) => demo.has(k)));
+    const goneWatches = s.watches.filter((w) => !watches.includes(w)).map((w) => w.watchId);
     this.data.state = {
       ...s,
-      contacts: s.contacts.filter((c) => !isDemo(c.key)),
-      grants: s.grants.filter((g) => !isDemo(g.contactKey)),
+      contacts: s.contacts.filter((c) => !demo.has(c.key)),
+      grants: s.grants.filter((g) => !demo.has(g.contactKey)),
       rules: s.rules.filter((r) => !mentionsDemo(r)),
+      groups,
+      liveShares: s.liveShares.filter((l) => !demo.has(l.contactKey)),
+      watches,
+      sos: s.sos?.recipients.some((k) => demo.has(k)) ? undefined : s.sos,
+      outbox: s.outbox.filter((e) => !demo.has(e.to)),
+      whereInbox: s.whereInbox.filter((w) => !demo.has(w.from)),
+      whereAsked: s.whereAsked.filter((w) => !demo.has(w.from)),
+      places: s.places.filter((p) => !p.id.startsWith('demo-')),
     };
-    this.data.chats = Object.fromEntries(Object.entries(this.data.chats).filter(([k]) => !isDemo(k)));
+    this.data.chats = Object.fromEntries(Object.entries(this.data.chats).filter(([t]) => !goneThreads.has(t)));
+    this.data.unread = Object.fromEntries(Object.entries(this.data.unread).filter(([t]) => !goneThreads.has(t)));
+    this.data.activity = this.data.activity.filter(
+      (a) => !(a.from && demo.has(a.from)) && !(a.thread && goneThreads.has(a.thread)) && !(a.ref?.sosOwner && demo.has(a.ref.sosOwner)),
+    );
+    const goneAlarm = (id: string) => DEMO_KEYS.some((k) => id.startsWith(`watch:${k}:`)) || goneWatches.some((w) => id.startsWith(`mywatch:${w}:`));
+    for (const a of this.data.alarms) if (goneAlarm(a.id)) void cancelAlarm(a.id).catch(() => {});
+    this.data.alarms = this.data.alarms.filter((a) => !goneAlarm(a.id));
     this.data.trip = undefined;
   }
 
-  private appendChat(contact: ContactKey, message: ChatMessage): void {
-    const list = [...(this.data.chats[contact] ?? []), message].slice(-MAX_CHAT_PER_CONTACT);
-    this.data.chats = { ...this.data.chats, [contact]: list };
+  private appendChat(thread: string, entry: ChatEntry): void {
+    const list = this.data.chats[thread] ?? [];
+    if (list.some((m) => m.id === entry.id)) return;
+    this.data.chats = trimChats({ ...this.data.chats, [thread]: trimThread([...list, entry].slice(-MAX_CHAT_PER_THREAD)) });
+    if (entry.from !== 'me' && thread !== this.openThread) {
+      this.data.unread = { ...this.data.unread, [thread]: (this.data.unread[thread] ?? 0) + 1 };
+      void setBadge(unreadTotal(this.data.unread));
+    }
     this.changed();
   }
+
+  /**
+   * A contact removed (also on my other device) or a group gone for me (dissolved, taken off, left)
+   * has no chat row to open any more: its messages, unread count and activity go, as when I remove
+   * a contact here. Otherwise its unread count would keep the badge up for good. Only chats that
+   * had a row before go: my own messages synced for a chat this device doesn't know yet stay.
+   */
+  private dropGoneThreads(prev: NodeState): void {
+    const live = liveThreads(this.data.state);
+    const gone = new Set([...liveThreads(prev)].filter((t) => !live.has(t)));
+    const goneContacts = new Set(prev.contacts.map((c) => c.key).filter((k) => gone.has(k)));
+    const unread = liveUnread(this.data.unread, this.data.state);
+    if (!gone.size && unread === this.data.unread) return;
+    const before = unreadTotal(this.data.unread);
+    this.data.unread = unread;
+    if (gone.size) {
+      this.data.chats = Object.fromEntries(Object.entries(this.data.chats).filter(([t]) => !gone.has(t)));
+      this.data.statuses = Object.fromEntries(Object.entries(this.data.statuses).filter(([k]) => !goneContacts.has(k)));
+      this.data.activity = this.data.activity.filter(
+        (a) => !(a.thread && gone.has(a.thread)) && !(a.from && goneContacts.has(a.from)) && !(a.ref?.sosOwner && goneContacts.has(a.ref.sosOwner)),
+      );
+    }
+    if (unreadTotal(unread) !== before) void setBadge(unreadTotal(unread));
+  }
+
+  private flushSoon(): void {
+    void this.flush().catch(this.reportSaveError);
+  }
+
+  private lastSaveError = 0;
+  /** A failed save must not go unnoticed (full storage, a broken file); at most every 10 minutes. */
+  private reportSaveError = (): void => {
+    const now = Date.now();
+    if (this.disposed || now - this.lastSaveError < 10 * 60_000) return;
+    this.lastSaveError = now;
+    showToast({
+      id: 'save-failed',
+      title: 'Speichern hat nicht geklappt',
+      body: 'Heyda. konnte deine Daten gerade nicht sichern. Ist der Speicher voll? Neue Nachrichten könnten nach einem Neustart fehlen.',
+      level: 'normal',
+    });
+  };
 
   private changed(persist = true): void {
     this.version++;
     this.snapshotCache = undefined;
-    for (const l of this.listeners) l();
-    if (persist) {
+    for (const l of [...this.listeners]) l();
+    if (persist && !this.disposed) {
       if (this.saveTimer) clearTimeout(this.saveTimer);
-      this.saveTimer = setTimeout(() => void this.flush(), 400);
+      this.saveTimer = setTimeout(() => void this.save(false).catch(this.reportSaveError), 500);
     }
   }
 }
 
-export function pingLabel(kind: 'help-carry' | 'pickup-request' | 'custom'): string {
-  if (kind === 'help-carry') return '🛍️ Kannst du beim Tragen helfen?';
-  if (kind === 'pickup-request') return '🚗 Kannst du mich abholen?';
-  return '👋';
+/** Reads a backup and, if the password is right, makes it this device's account. */
+export async function restoreBackup(file: Uint8Array, password: string, onProgress?: (f: number) => void): Promise<{ ok: true } | { ok: false; error: string }> {
+  const r = await decryptBackup(file, password, onProgress);
+  if (!r.ok) return r;
+  return restoreBackupContents(r.contents);
+}
+
+/**
+ * Saves already decrypted backup contents as this device's account (no second, slow password
+ * check). Stop the running runtime first and restart it afterwards.
+ */
+export async function restoreBackupContents(contents: BackupContents): Promise<{ ok: true } | { ok: false; error: string }> {
+  const data = contents.data as Partial<Persisted> | undefined;
+  if (!data?.state?.self || !/^[0-9a-f]{64}$/.test(contents.identity)) return { ok: false, error: 'Die Sicherung enthält keine App-Daten.' };
+  const secret = hexToBytes(contents.identity);
+  const key = getPublicKey(secret);
+  // Live shares and SOS from older backup files end instead of starting again; messages still on
+  // relays from before now fill in chats and statuses without ringing (see core `restoredState`).
+  const state = restoredState({ ...data.state, self: { ...data.state.self, key, deviceId: newDeviceId(), deviceName: deviceLabel() } }, Date.now());
+  await writeAccount(secret, state, {
+    plugins: storedPlugins(data.plugins),
+    settings: { ...DEFAULT_SETTINGS, ...data.settings, onboarded: true, demo: false },
+    chats: cleanChats(data.chats),
+  });
+  secret.fill(0);
+  return { ok: true };
+}
+
+/** Keeps only well-formed chat entries from a backup, within the usual limits. */
+function cleanChats(input: unknown): Record<string, ChatEntry[]> {
+  if (!input || typeof input !== 'object') return {};
+  const out: Record<string, ChatEntry[]> = {};
+  for (const [thread, list] of Object.entries(input as Record<string, unknown>).slice(0, 1000)) {
+    if (!/^([0-9a-f]{64}|g:[A-Za-z0-9_-]{1,64})$/.test(thread) || !Array.isArray(list)) continue;
+    const entries = list.filter(
+      (m): m is ChatEntry =>
+        !!m &&
+        typeof m === 'object' &&
+        typeof m.id === 'string' &&
+        typeof m.text === 'string' &&
+        Number.isFinite(m.at) &&
+        (m.from === 'me' || (typeof m.from === 'string' && /^[0-9a-f]{64}$/.test(m.from))) &&
+        (m.kind === 'text' || m.kind === 'ping' || m.kind === 'system'),
+    );
+    if (entries.length) out[thread] = trimThread(entries.slice(-MAX_CHAT_PER_THREAD));
+  }
+  return trimChats(out);
 }
 
 let runtime: Promise<AppRuntime> | undefined;
 
-/** The single runtime, created on first use (also from background tasks). */
+// A phone alarm opened or swiped away (iOS reports that too, also with the app closed): saved at
+// once, so it never rings again on a later wake.
+onAlarmDone((id, at) => {
+  void getRuntime()
+    .then(async (r) => {
+      r.noteAlarmDone(id, at);
+      await r.flushIfDirty();
+    })
+    .catch(() => {});
+});
+
+// Windows: the page never goes to the background (it keeps running in the tray), so the shell asks
+// for a save when the window goes to the tray, before quitting and when Windows shuts down. The
+// seen store's own file is written then too. Only a runtime that exists saves; none is made for it.
+desktop?.onSaveRequest(async () => {
+  await runtime?.then((r) => r.flush()).catch(() => {});
+});
+
+/** The single runtime, created and started on first use (also from background tasks). */
 export function getRuntime(): Promise<AppRuntime> {
-  runtime ??= AppRuntime.create();
-  return runtime;
+  if (runtime) return runtime;
+  const created = AppRuntime.create().then(async (r) => {
+    await r.ensureStarted();
+    return r;
+  });
+  runtime = created;
+  // Only forget this attempt; a reset may already have put a newer one in its place.
+  created.catch(() => {
+    if (runtime === created) runtime = undefined;
+  });
+  return created;
 }
 
 /** Drops the instance so the next `getRuntime()` rebuilds it, e.g. after leaving demo mode. */
 export function resetRuntime(): void {
   runtime = undefined;
+}
+
+/** The chats that have a row in the chat list: my contacts and the groups I am in. */
+function liveThreads(state: NodeState): Set<string> {
+  return new Set([...state.contacts.map((c) => c.key), ...state.groups.filter((g) => !g.dissolved).map((g) => `g:${g.id}`)]);
+}
+
+/** Unread counts of those chats only; the same object when nothing is dropped. */
+function liveUnread(unread: Record<string, number>, state: NodeState): Record<string, number> {
+  const live = liveThreads(state);
+  const kept = Object.entries(unread).filter(([t]) => live.has(t));
+  return kept.length === Object.keys(unread).length ? unread : Object.fromEntries(kept);
+}
+
+function unreadTotal(unread: Record<string, number>): number {
+  return Object.values(unread).reduce((n, x) => n + x, 0);
+}
+
+/** Shortens text for storage without splitting an emoji. */
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max - 1;
+  const code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--;
+  return `${text.slice(0, end)}…`;
+}
+
+function chars(list: ChatEntry[]): number {
+  return list.reduce((n, m) => n + m.text.length, 0);
+}
+
+/** Drops the oldest messages of one chat until it fits its budget (the newest always stays). */
+export function trimThread(list: ChatEntry[]): ChatEntry[] {
+  let total = chars(list);
+  let start = 0;
+  while (total > MAX_CHAT_CHARS_PER_THREAD && start < list.length - 1) total -= list[start++]!.text.length;
+  return start ? list.slice(start) : list;
+}
+
+/** Drops the oldest messages across all chats until everything fits the overall budget. */
+export function trimChats(chats: Record<string, ChatEntry[]>): Record<string, ChatEntry[]> {
+  let total = Object.values(chats).reduce((n, l) => n + chars(l), 0);
+  if (total <= MAX_CHAT_CHARS_TOTAL) return chats;
+  const out = { ...chats };
+  while (total > MAX_CHAT_CHARS_TOTAL) {
+    let oldest: string | undefined;
+    for (const [thread, list] of Object.entries(out)) {
+      if (list.length > 1 && (oldest === undefined || list[0]!.at < out[oldest]![0]!.at)) oldest = thread;
+    }
+    if (oldest === undefined) break;
+    const [dropped, ...rest] = out[oldest]!;
+    out[oldest] = rest;
+    total -= dropped!.text.length;
+  }
+  return out;
 }
