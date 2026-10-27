@@ -169,15 +169,34 @@ jobs:
       ELECTRON_SKIP_BINARY_DOWNLOAD: ''
       # No code signing certificate: build unsigned instead of searching for one.
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    # The repository name ends in a dot, so the workspace (D:\a\Heyda.\Heyda.) is a path Windows
+    # cannot use: it drops the trailing dot and actions/checkout fails with "Directory ... does not
+    # exist". Everything on Windows therefore happens in a plain folder of its own.
+    defaults:
+      run:
+        working-directory: C:\heyda
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ inputs.ref }}
-          persist-credentials: false
+      - name: Check out into C:\heyda
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          REF: ${{ inputs.ref || github.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q /c/heyda
+          cd /c/heyda
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          # The token is passed for this one fetch only and never written to the git config.
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git -c http.extraheader="$AUTH" fetch -q --depth 1 --no-tags origin "$REF"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='Building %H'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
+          cache-dependency-path: C:/heyda/package-lock.json
       - run: npm ci
       - name: Version
         id: version
@@ -219,13 +238,13 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-installer
-          path: out/*.exe
+          path: C:/heyda/out/*.exe
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: windows-smoke
-          path: windows-smoke
+          path: C:/heyda/windows-smoke
           if-no-files-found: ignore
           retention-days: 14
 
