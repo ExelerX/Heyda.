@@ -15,7 +15,7 @@ Privat, ohne Server, Ende-zu-Ende-verschlüsselt. Für Freunde und Familie.
 ## Installieren
 
 **Android:** APK auf dem Handy öffnen und „Aus dieser Quelle installieren“ erlauben. Für zuverlässige Benachrichtigungen in der App unter *Ich → Ruhe & Benachrichtigungen* „Im Hintergrund verbunden bleiben“ einschalten.
-> ⚠️ Diese Version ist mit einem öffentlichen **Test-Schlüssel** signiert. Installiere Heyda. nur von dieser Seite. Später wechseln wir auf einen eigenen Schlüssel; dann muss die App einmal neu installiert werden (vorher eine Sicherung machen).
+> ⚠️ Diese Version ist mit einem öffentlichen **Test-Schlüssel** signiert. Den kann jeder benutzen: Eine gefälschte APK könnte sich deshalb als „Update“ über Heyda. installieren und deine Daten lesen. Installiere Heyda. und Updates nur von dieser Seite und vergleiche die Prüfsumme. Später wechseln wir auf einen eigenen Schlüssel; dann muss die App einmal neu installiert werden (vorher eine Sicherung machen).
 
 **Windows:** Setup starten. Windows zeigt eventuell „Der Computer wurde durch Windows geschützt“, weil das Programm (noch) kein bezahltes Zertifikat hat: *Weitere Informationen → Trotzdem ausführen*. Heyda. läuft danach im Infobereich weiter, damit Notrufe und Erinnerungen ankommen. Damit das auch nach einem Neustart klappt, lass „Beim Windows-Start öffnen“ an (beim Einrichten, unter „Ruhe“ oder per Rechtsklick auf das Symbol im Infobereich).
 
