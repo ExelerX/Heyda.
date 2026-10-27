@@ -1,9 +1,9 @@
-# Push a tag like v1.0.0 to build Android, Windows and iPhone and publish a GitHub release.
+# Push a tag like v1.0.0 (or 1.0.0) to build Android, Windows and iPhone and publish a GitHub release.
 name: release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', '[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
@@ -50,7 +50,7 @@ jobs:
         run: |
           node scripts/version.mjs >> "$GITHUB_OUTPUT"
           VERSION="$(node scripts/version.mjs | sed -n 's/^version=//p')"
-          if [ "$TAG" != "v$VERSION" ]; then
+          if [ "$TAG" != "v$VERSION" ] && [ "$TAG" != "$VERSION" ]; then
             echo "::error::Tag $TAG does not match the app version $VERSION (apps/mobile/app.json, apps/desktop/package.json)."
             exit 1
           fi
