@@ -47,14 +47,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - run: bash scripts/ci-run.sh "Typecheck" npm run typecheck
+      - run: bash scripts/ci-run.sh "Tests" npm test
       - name: Web export
-        run: npm run export:web -w mobile
+        run: bash scripts/ci-run.sh "Web export" npm run export:web -w mobile
       - name: Web smoke test (demo mode in Chromium)
         run: |
           npx playwright install --with-deps chromium
-          npm run smoke:web -w mobile -- --out web-smoke
+          bash scripts/ci-run.sh "Web smoke test" npm run smoke:web -w mobile -- --out web-smoke
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -108,13 +108,13 @@ jobs:
         env:
           HEYDA_VERSION_CODE: ${{ steps.version.outputs.code }}
         run: |
-          npx expo prebuild --platform android --no-install
+          bash ../../scripts/ci-run.sh "Android native project" npx expo prebuild --platform android --no-install
           # More memory for Gradle; ABIs: phones (arm) plus x86_64 for the emulator test.
           sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g/' android/gradle.properties
           sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86_64/' android/gradle.properties
       - name: Build
         working-directory: apps/mobile/android
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: bash ../../../scripts/ci-run.sh "Android build" ./gradlew assembleRelease --no-daemon --stacktrace
       - name: Collect
         run: |
           mkdir -p out
@@ -152,7 +152,7 @@ jobs:
           target: google_apis
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
-          script: bash scripts/android-smoke.sh apk android-smoke
+          script: bash scripts/ci-run.sh "Android emulator test" bash scripts/android-smoke.sh apk android-smoke
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -194,18 +194,27 @@ jobs:
           git log -1 --format='Building %H'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
+          # No npm cache here: setup-node looks for package-lock.json in the unusable workspace.
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: C:/heyda/package-lock.json
-      - run: npm ci
+      - name: npm ci
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows npm ci" npm ci
       - name: Version
         id: version
         shell: bash
         run: node scripts/version.mjs >> "$GITHUB_OUTPUT"
-      - run: npm run export:web -w mobile
-      - run: npm run prepare-web -w desktop
-      - run: npm run build -w desktop
-      - run: npm run dist:win -w desktop
+      - name: Web export
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows web export" npm run export:web -w mobile
+      - name: Prepare the web app for the desktop app
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows prepare-web" npm run prepare-web -w desktop
+      - name: Build the desktop app
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows desktop build" npm run build -w desktop
+      - name: Package the installer
+        shell: bash
+        run: bash scripts/ci-run.sh "Windows installer" npm run dist:win -w desktop
       # The setup.exe that is published, not just the files it contains: install it silently for the
       # current user, check the installed app and its Start menu shortcut, then uninstall it again.
       - name: Install the setup, start the installed app and check it, uninstall
@@ -274,8 +283,8 @@ jobs:
       - name: Generate the native project
         working-directory: apps/mobile
         run: |
-          npx expo prebuild --platform ios --no-install
-          cd ios && pod install
+          bash ../../scripts/ci-run.sh "iPhone native project" npx expo prebuild --platform ios --no-install
+          cd ios && bash ../../../scripts/ci-run.sh "CocoaPods" pod install
       - name: Build for the simulator
         working-directory: apps/mobile/ios
         run: |
@@ -283,9 +292,9 @@ jobs:
           xcodebuild -workspace Heyda.xcworkspace -scheme Heyda -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/dd-sim" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
-            build > "$RUNNER_TEMP/xcode-sim.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-sim.log"; exit 1; }
+            build > "$RUNNER_TEMP/xcode-sim.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-sim.log"; bash ../../../scripts/ci-annotate.sh "$RUNNER_TEMP/xcode-sim.log" "iPhone simulator build"; exit 1; }
       - name: Start the app on a simulator
-        run: bash scripts/ios-smoke.sh "$RUNNER_TEMP/dd-sim/Build/Products/Release-iphonesimulator/Heyda.app" ios-smoke
+        run: bash scripts/ci-run.sh "iPhone simulator test" bash scripts/ios-smoke.sh "$RUNNER_TEMP/dd-sim/Build/Products/Release-iphonesimulator/Heyda.app" ios-smoke
       - name: Build for iPhone (unsigned)
         working-directory: apps/mobile/ios
         run: |
@@ -293,7 +302,7 @@ jobs:
           xcodebuild -workspace Heyda.xcworkspace -scheme Heyda -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Heyda.xcarchive" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            archive > "$RUNNER_TEMP/xcode-device.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-device.log"; exit 1; }
+            archive > "$RUNNER_TEMP/xcode-device.log" 2>&1 || { tail -n 150 "$RUNNER_TEMP/xcode-device.log"; bash ../../../scripts/ci-annotate.sh "$RUNNER_TEMP/xcode-device.log" "iPhone device build"; exit 1; }
       - name: Package IPA
         run: |
           mkdir -p "$RUNNER_TEMP/ipa/Payload" out
